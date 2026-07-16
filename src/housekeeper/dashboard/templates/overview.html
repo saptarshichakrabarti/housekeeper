@@ -1,0 +1,8 @@
+<p>Local query and review surface. Database integrity: {{ model.integrity }}. File movement is CLI-only.</p>
+<div class="cards">
+{% for metric in model.metrics %}<section class="card"><strong>{{ metric.label }}</strong><b>{{ metric.value }}</b></section>{% endfor %}
+</div>
+<section hx-get="/fragments/jobs" hx-trigger="load, every 5s">Loading job status…</section>
+{% for chart in model.charts %}
+<section><h2>{{ chart.title }}</h2><table><thead><tr>{% for column in chart.columns %}<th>{{ column }}</th>{% endfor %}</tr></thead><tbody>{% for row in chart.rows %}<tr>{% for value in row %}<td>{{ value }}</td>{% endfor %}</tr>{% else %}<tr><td colspan="99">No data</td></tr>{% endfor %}</tbody></table></section>
+{% endfor %}

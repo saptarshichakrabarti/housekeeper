@@ -1,0 +1,19 @@
+<section class="detail">
+  <h2>{{ entry.name }}</h2>
+  <dl>
+    <dt>Path</dt><dd>{{ entry.relative_path }}</dd>
+    <dt>Size</dt><dd>{{ entry.size_bytes }}</dd>
+    <dt>Classification</dt><dd>{{ entry.classification or '' }}</dd>
+    <dt>Full hash</dt><dd><code>{{ entry.full_hash or '' }}</code></dd>
+    <dt>Hash status</dt><dd>{{ entry.hash_status or '' }}</dd>
+  </dl>
+  <h3>Analysis artifacts</h3>
+  <ul>{% for artifact in artifacts %}<li>{{ artifact.analyzer_name }} {{ artifact.status }} — {{ artifact.completed_at or '' }}</li>{% else %}<li>No artifacts</li>{% endfor %}</ul>
+  <form hx-post="/fragments/review/decision" hx-target="#detail-drawer">
+    <input type="hidden" name="entry_id" value="{{ entry.id }}">
+    <label>Session <input type="number" name="session_id" min="1" required></label>
+    <label>Decision <select name="decision"><option>DEFER</option><option>MARK_KEEP</option><option>MARK_PROTECTED</option><option>NEEDS_MORE_ANALYSIS</option><option>APPROVE_FOR_REVIEW</option><option>REJECT_RECOMMENDATION</option></select></label>
+    <label>Note <input name="note" maxlength="2000"></label>
+    <button type="submit">Record decision</button>
+  </form>
+</section>

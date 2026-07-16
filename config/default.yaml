@@ -18,3 +18,20 @@ documents: {max_text_characters: 2000000, store_full_text: false, store_normaliz
 images: {enable_perceptual_hashing: true, max_pixels: 200000000, create_contact_sheets: true}
 directory_overlap: {minimum_files: 5, minimum_bytes: 1048576, containment_threshold: 0.90, high_containment_threshold: 0.98}
 reporting: {large_file_threshold_bytes: 1073741824, redact_source_root_in_reports: false}
+incremental: {enabled: true, reuse_verified_content_links: true, reuse_unchanged_entry_hashes: true, detect_renames: true, require_full_hash_for_content_reuse: true}
+content_store: {store_normalized_text: true, compress_text: true, compression: gzip, store_image_thumbnails: true, thumbnail_max_dimension: 512}
+dashboard: {enabled: true, host: 127.0.0.1, port: 8765, open_browser: true, read_only: false, page_size: 100, maximum_page_size: 500, allow_non_loopback: false, csrf_enabled: true, show_document_excerpts: false, maximum_excerpt_characters: 5000}
+graph: {enabled: true, default_projection: universe, default_max_nodes: 500, hard_max_nodes: 5000, default_max_edges: 2000, hard_max_edges: 20000, minimum_edge_confidence: 0.70, cache_layouts: true, allow_raw_file_nodes: false}
+performance:
+  storage_profile: auto
+  profiles:
+    hdd: {scan_workers: 1, full_hash_workers: 1, quick_hash_workers: 1, parser_workers: 2}
+    ssd: {scan_workers: 2, full_hash_workers: 4, quick_hash_workers: 2, parser_workers: 4}
+    network: {scan_workers: 1, full_hash_workers: 1, quick_hash_workers: 1, parser_workers: 2}
+  batch_size: 1000
+  database_writer_queue_size: 10000
+  parser_workers: 2
+  parser_timeout_seconds: 60
+  full_hash_workers: 1
+  quick_hash_workers: 2
+  progress_interval_seconds: 5

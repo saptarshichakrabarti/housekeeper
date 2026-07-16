@@ -1,0 +1,1 @@
+{"$schema":"https://json-schema.org/draft/2020-12/schema","type":"object","required":["protocol_version","request_id","operation"],"properties":{"protocol_version":{"const":"1"},"request_id":{"type":"string"},"operation":{"type":"string"},"arguments":{"type":"object"}}}

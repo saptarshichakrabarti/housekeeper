@@ -59,9 +59,10 @@ def classify_high_level_type(signature: FileSignature) -> str:
             if m.startswith("audio/")
             else (
                 "document"
-                if m.startswith("text/")
-                or t in {"pdf", "docx", "xlsx", "pptx", "md", "csv"}
-                else "archive" if t in {"zip", "tar", "gz", "bz2", "xz"} else "other"
+                if m.startswith("text/") or t in {"pdf", "docx", "xlsx", "pptx", "md", "csv"}
+                else "archive"
+                if t in {"zip", "tar", "gz", "bz2", "xz"}
+                else "other"
             )
         )
     )

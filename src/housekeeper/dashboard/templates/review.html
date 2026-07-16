@@ -1,0 +1,5 @@
+<p>Cursor-paginated review queue. Decisions are recorded only with a review session; this page cannot move files.</p>
+<aside id="detail-drawer" aria-live="polite">Select an entry for details.</aside>
+<table><thead><tr><th>ID</th><th>Name</th><th>Path</th><th>Source</th><th>Top level</th><th>Classification</th><th>Decision</th><th>Reasons</th><th>Notes</th><th>Bytes</th><th>Flags</th></tr></thead>
+<tbody>{% for row in rows %}<tr><td><button hx-get="/fragments/entry/{{ row.entry_id }}" hx-target="#detail-drawer">{{ row.entry_id }}</button></td><td>{{ row.name }}</td><td>{{ row.relative_path }}</td><td>{{ row.source_root }}</td><td>{{ row.top_level_directory }}</td><td>{{ row.classification or '' }}</td><td>{{ row.decision or '' }}</td><td>{{ row.reason_codes }}</td><td>{{ row.notes }}</td><td>{{ row.size_bytes }}</td><td>{% if row.duplicate_member %}duplicate {% endif %}{% if row.project_member %}project {% endif %}{% if row.stale %}stale{% endif %}</td></tr>{% else %}<tr><td colspan="11">No results</td></tr>{% endfor %}</tbody></table>
+{% if next_id %}<p><a href="{{ next_url }}">Next page</a></p>{% endif %}

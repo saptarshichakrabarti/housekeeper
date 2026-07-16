@@ -35,7 +35,7 @@ class MoveStatus(StrEnum):
     PARTIAL = "PARTIAL"
 
 
-SCHEMA_VERSION = 1
+SCHEMA_VERSION = 4
 PROTECTED_SUFFIXES = {
     ".pem",
     ".key",

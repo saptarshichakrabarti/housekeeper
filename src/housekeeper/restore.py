@@ -1,11 +1,12 @@
 import json
+import os
 import shutil
 from pathlib import Path
 
 from .hashing import compute_full_hash
 
 
-def restore_transaction(manifest: Path, dry_run=False):
+def restore_transaction(manifest: Path, dry_run=False, yes=False):
     results = []
     for line in manifest.read_text(encoding="utf-8").splitlines():
         r = json.loads(line)
@@ -19,14 +20,22 @@ def restore_transaction(manifest: Path, dry_run=False):
         elif dst.exists():
             r["restore_status"] = (
                 "DESTINATION_EXISTS"
-                if compute_full_hash(dst, "sha256", 8_388_608).digest
-                != r["expected_hash"]
+                if compute_full_hash(dst, "sha256", 8_388_608).digest != r["expected_hash"]
                 else "ALREADY_SATISFIED"
             )
+        elif not dry_run and not yes:
+            r["restore_status"] = "CONFIRMATION_REQUIRED"
         elif not dry_run:
             dst.parent.mkdir(parents=True, exist_ok=True)
-            shutil.move(src, dst)
-            r["restore_status"] = "RESTORED"
+            # Copy, verify, then remove the review copy; never replace an existing path.
+            shutil.copy2(src, dst)
+            restored = compute_full_hash(dst, "sha256", 8_388_608)
+            if restored.digest != r["expected_hash"]:
+                dst.unlink(missing_ok=True)
+                r["restore_status"] = "DESTINATION_VERIFICATION_FAILED"
+            else:
+                os.unlink(src)
+                r["restore_status"] = "RESTORED"
         else:
             r["restore_status"] = "DRY_RUN"
         results.append(r)

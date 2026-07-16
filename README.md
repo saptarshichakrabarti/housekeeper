@@ -18,8 +18,40 @@ housekeeper report all
 housekeeper export-review --output workspace/manifests/review_candidates.csv
 housekeeper validate-manifest workspace/manifests/review_candidates.csv
 housekeeper move-to-review workspace/manifests/review_candidates.csv /tmp/drive-review --dry-run
+housekeeper move-to-review workspace/manifests/review_candidates.csv /tmp/drive-review --yes
 ```
 
-Edit `approved` to `true` only after manual review. Keep the database and review root off the source drive, and back up the database before long runs. Reports are static HTML containing paths and metadata, so protect the workspace. The current foundation includes scanner, streamed stable hashing, exact duplicate analysis, baseline policies, manifests, verified movement/restore safeguards, and report skeletons. Rich archive/document/image/project analyzers are intentionally conservative follow-up stages; there is no OCR, extraction, macro execution, embedding, video comparison, or directory-wide movement.
+Edit `approved` to `true` only after manual review. Keep the database and review root off the source drive, and back up the database before long runs. `--yes` is required for an actual move or restore; destination collisions are refused. Reports are static HTML containing paths and metadata, so protect the workspace. Optional archive/document/image/media/project analyzers are bounded and conservative: no macros are executed, no archives are extracted, no OCR or embeddings are run, and similarity never becomes an automatic movement recommendation.
 
 Run `pytest`, `ruff check .`, and `mypy src`. Python 3.11+ is supported on Linux, macOS, and Windows where filesystem permissions and mount behavior allow it. Estimated reviewable bytes are not guaranteed reclaimable space.
+
+## Second-generation platform
+
+Known sources are scanned incrementally by default. Verified full hashes are deduplicated into content objects, and analyzer artifacts are reused only when content identity, analyzer version, and configuration fingerprint match.
+
+```bash
+housekeeper sources list
+housekeeper scan /path/to/source --incremental --changed-only
+housekeeper diff 1 2
+housekeeper analyze all --changed-only
+housekeeper jobs list
+housekeeper database migrate --dry-run
+housekeeper database backup workspace/backups/inventory.sqlite
+housekeeper graph build universe
+housekeeper benchmark scan /tmp/synthetic-fixture
+```
+
+Create a persistent review session, record decisions, and export an immutable, hash-backed manifest. The dashboard can record decisions and inspect manifest status but cannot move files:
+
+```bash
+housekeeper review create "April review"
+housekeeper review decision SESSION_ID ENTRY ENTRY_ID MARK_KEEP
+housekeeper review export SESSION_ID --output workspace/manifests/april.jsonl --format jsonl
+housekeeper review validate SESSION_ID
+housekeeper validate-manifest workspace/manifests/april.jsonl
+housekeeper dashboard --no-open-browser
+```
+
+Install the optional local dashboard with `pip install -e '.[dashboard]'`. It binds to loopback, serves local assets only, escapes filenames, enforces bounded pagination/graph requests, and requires CSRF tokens for state-changing decisions. It never exposes arbitrary SQL, paths, file contents, or movement endpoints. See `docs/architecture.md`, `docs/dashboard.md`, `docs/graph_model.md`, and `docs/performance.md`.
+
+The dashboard graph is rendered solely with the vendored Cytoscape.js distribution at `/static/vendor/cytoscape.min.js`; no CDN or Node.js runtime is required. Local declarative fragment refreshes keep job tables current without exposing a remote dependency. The optional analysis extra enables conservative DOCX, XLSX, PPTX, PDF, image, and archive metadata/text extraction. Parser failures and unavailable optional parsers remain protected artifacts.

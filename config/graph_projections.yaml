@@ -1,0 +1,10 @@
+graph:
+  default_projection: universe
+  default_max_nodes: 500
+  hard_max_nodes: 5000
+  default_max_edges: 2000
+  hard_max_edges: 20000
+  minimum_edge_confidence: 0.70
+  aggregate_below_file_count: 50
+  cache_layouts: true
+  allow_raw_file_nodes: false

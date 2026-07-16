@@ -1,5 +1,6 @@
 import copy
 import json
+import time
 from dataclasses import dataclass
 from hashlib import sha256
 from pathlib import Path
@@ -60,6 +61,75 @@ DEFAULTS: dict[str, Any] = {
         "large_file_threshold_bytes": 1073741824,
         "redact_source_root_in_reports": False,
     },
+    "incremental": {
+        "enabled": True,
+        "reuse_verified_content_links": True,
+        "reuse_unchanged_entry_hashes": True,
+        "detect_renames": True,
+        "require_full_hash_for_content_reuse": True,
+    },
+    "content_store": {
+        "store_normalized_text": True,
+        "compress_text": True,
+        "compression": "gzip",
+        "store_image_thumbnails": True,
+        "thumbnail_max_dimension": 512,
+    },
+    "dashboard": {
+        "enabled": True,
+        "host": "127.0.0.1",
+        "port": 8765,
+        "open_browser": True,
+        "read_only": False,
+        "page_size": 100,
+        "maximum_page_size": 500,
+        "allow_non_loopback": False,
+        "csrf_enabled": True,
+        "show_document_excerpts": False,
+        "maximum_excerpt_characters": 5000,
+    },
+    "graph": {
+        "enabled": True,
+        "default_projection": "universe",
+        "default_max_nodes": 500,
+        "hard_max_nodes": 5000,
+        "default_max_edges": 2000,
+        "hard_max_edges": 20000,
+        "minimum_edge_confidence": 0.70,
+        "cache_layouts": True,
+        "allow_raw_file_nodes": False,
+    },
+    "performance": {
+        "storage_profile": "auto",
+        "profiles": {
+            "hdd": {
+                "scan_workers": 1,
+                "full_hash_workers": 1,
+                "quick_hash_workers": 1,
+                "parser_workers": 2,
+            },
+            "ssd": {
+                "scan_workers": 2,
+                "full_hash_workers": 4,
+                "quick_hash_workers": 2,
+                "parser_workers": 4,
+            },
+            "network": {
+                "scan_workers": 1,
+                "full_hash_workers": 1,
+                "quick_hash_workers": 1,
+                "parser_workers": 2,
+            },
+        },
+        "batch_size": 1000,
+        "database_writer_queue_size": 10000,
+        "parser_workers": 2,
+        "parser_timeout_seconds": 60,
+        "parser_memory_limit_mb": 1024,
+        "full_hash_workers": 1,
+        "quick_hash_workers": 2,
+        "progress_interval_seconds": 5,
+    },
 }
 
 
@@ -95,17 +165,20 @@ def validate_config(config: dict) -> None:
         if isinstance(section, dict):
             for key, value in section.items():
                 if (
-                    (
-                        "bytes" in key
-                        or "seconds" in key
-                        or key in {"max_members", "batch_size"}
-                    )
+                    ("bytes" in key or "seconds" in key or key in {"max_members", "batch_size"})
                     and isinstance(value, int)
                     and value < 0
                 ):
                     raise ValueError(f"negative limit: {key}")
     if config["hashing"]["algorithm"].lower() not in {"sha256", "sha512", "blake2b"}:
         raise ValueError("unsupported hash algorithm")
+    if (
+        config["graph"]["default_max_nodes"] > config["graph"]["hard_max_nodes"]
+        or config["graph"]["default_max_edges"] > config["graph"]["hard_max_edges"]
+    ):
+        raise ValueError("graph defaults exceed hard limits")
+    if config["dashboard"]["page_size"] > config["dashboard"]["maximum_page_size"]:
+        raise ValueError("dashboard page size exceeds maximum")
 
 
 def resolve_workspace_paths(config: AppConfig) -> AppConfig:
@@ -125,6 +198,47 @@ def load_config(
 
 
 def config_fingerprint(config: AppConfig) -> str:
-    return sha256(
-        json.dumps(config.data, sort_keys=True, default=str).encode()
-    ).hexdigest()
+    return sha256(json.dumps(config.data, sort_keys=True, default=str).encode()).hexdigest()
+
+
+def performance_profile(config: AppConfig, source_root: Path | None = None) -> dict[str, int | str]:
+    """Return a measured conservative worker profile without modifying the source."""
+    performance = config.section("performance")
+    profile = str(performance.get("storage_profile", "auto")).lower()
+    if profile == "auto":
+        profile = _measure_storage_profile(source_root) if source_root else "hdd"
+    if profile not in performance["profiles"]:
+        raise ValueError(f"unknown storage profile: {profile}")
+    selected = dict(performance["profiles"][profile])
+    for key in ("full_hash_workers", "quick_hash_workers", "parser_workers"):
+        selected[key] = int(performance.get(key, selected[key]))
+    selected["scan_workers"] = int(selected["scan_workers"])
+    selected["profile_name"] = profile
+    return selected
+
+
+def _measure_storage_profile(source_root: Path | None) -> str:
+    if source_root is None:
+        return "hdd"
+    root_text = str(source_root).lower()
+    if root_text.startswith(("//", "\\\\", "/net/", "/nfs/", "/smb/")):
+        return "network"
+    # Sample at most 8 MiB from existing files. Errors and small samples retain the
+    # conservative HDD profile; this must never write a benchmark file to the source.
+    read_bytes = 0
+    started = time.perf_counter()
+    try:
+        for candidate in source_root.rglob("*"):
+            if not candidate.is_file():
+                continue
+            with candidate.open("rb") as handle:
+                data = handle.read(min(2 * 1024 * 1024, candidate.stat().st_size))
+            read_bytes += len(data)
+            if read_bytes >= 8 * 1024 * 1024:
+                break
+    except OSError:
+        return "hdd"
+    elapsed = time.perf_counter() - started
+    if read_bytes < 1_024 * 1_024 or elapsed <= 0:
+        return "hdd"
+    return "ssd" if read_bytes / elapsed >= 150 * 1024 * 1024 else "hdd"
