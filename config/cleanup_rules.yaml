@@ -1,0 +1,10 @@
+rules:
+  - id: exact-duplicate-noncanonical
+    classification: REVIEW_SAFE
+    confidence: 1.0
+    requires_manual_approval: true
+    requires_canonical: true
+  - id: parser-failure
+    classification: ERROR
+    confidence: 1.0
+    requires_manual_approval: true

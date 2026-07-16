@@ -1,0 +1,4 @@
+extensions: [.pem, .key, .kdbx, .wallet, .db, .sqlite, .sqlite3, .gpg]
+filenames: [id_rsa, credentials, passwords]
+directory_names: [.git, .ssh]
+categories: [email_archives, password_databases, private_keys, certificates, wallets, databases, datasets, notebooks, disk_images, encrypted_archives, source_files, legal_records, unknown_binary]

@@ -1,0 +1,20 @@
+workspace:
+  database: workspace/inventory.sqlite
+  logs_dir: workspace/logs
+  reports_dir: workspace/reports
+  manifests_dir: workspace/manifests
+scanner:
+  follow_symlinks: false
+  include_hidden: true
+  stay_on_filesystem: false
+  batch_size: 500
+  checkpoint_interval_seconds: 30
+  max_file_size_for_content_analysis: 1073741824
+  excluded_paths: []
+  excluded_names: []
+hashing: {algorithm: sha256, quick_hash_chunk_bytes: 1048576, quick_hash_middle_samples: 2, full_hash_block_bytes: 8388608, verify_bytewise_before_move: false}
+archives: {max_members: 100000, max_declared_uncompressed_bytes: 536870912000, max_nested_depth: 1, timeout_seconds: 60}
+documents: {max_text_characters: 2000000, store_full_text: false, store_normalized_text: true, content_analysis_timeout_seconds: 60}
+images: {enable_perceptual_hashing: true, max_pixels: 200000000, create_contact_sheets: true}
+directory_overlap: {minimum_files: 5, minimum_bytes: 1048576, containment_threshold: 0.90, high_containment_threshold: 0.98}
+reporting: {large_file_threshold_bytes: 1073741824, redact_source_root_in_reports: false}

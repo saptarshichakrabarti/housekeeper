@@ -1,0 +1,30 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "drive-housekeeper"
+version = "0.1.0"
+description = "Conservative, auditable inventory and review tooling for disorganized drives"
+readme = "README.md"
+requires-python = ">=3.11"
+license = {file = "LICENSE"}
+dependencies = ["PyYAML>=6", "Jinja2>=3"]
+
+[project.optional-dependencies]
+analysis = ["puremagic>=1.16", "rapidfuzz>=3", "Pillow>=10", "ImageHash>=4", "exifread>=3", "mutagen>=1.47", "PyMuPDF>=1.23", "python-docx>=1", "openpyxl>=3", "python-pptx>=0.6"]
+dev = ["pytest>=8", "pytest-cov>=5", "ruff>=0.5", "mypy>=1.10", "types-PyYAML"]
+
+[project.scripts]
+housekeeper = "housekeeper.cli:main"
+
+[tool.setuptools.packages.find]
+where = ["src"]
+
+[tool.ruff]
+line-length = 100
+target-version = "py311"
+
+[tool.pytest.ini_options]
+pythonpath = ["src"]
+testpaths = ["tests"]
