@@ -7,11 +7,11 @@ Scanning is read-only, does not follow symbolic links by default, never executes
 ## Quickstart (one command)
 
 The fastest way to point the tool at a drive and get a full picture. This is entirely read-only —
-it scans, analyzes, classifies, and writes reports; it never moves or deletes anything.
+it scans, analyses, classifies, and writes reports; it never moves or deletes anything.
 
 ```bash
 make install                       # create .venv and install with all optional features
-make quickstart SOURCE=/mnt/drive  # scan + analyze + classify + reports, then print a summary
+make quickstart SOURCE=/mnt/drive  # scan + analyse + classify + reports, then print a summary
 make dashboard                     # browse results locally (loopback only)
 ```
 
@@ -37,7 +37,7 @@ pip install -e ".[dev,analysis]"
 housekeeper init-workspace
 python scripts/create_test_fixture.py --output /tmp/housekeeper-fixture --clean
 housekeeper scan /tmp/housekeeper-fixture
-housekeeper analyze exact-duplicates
+housekeeper analyse exact-duplicates
 housekeeper classify
 housekeeper report all
 housekeeper export-review --output workspace/manifests/review_candidates.csv
@@ -46,19 +46,19 @@ housekeeper move-to-review workspace/manifests/review_candidates.csv /tmp/drive-
 housekeeper move-to-review workspace/manifests/review_candidates.csv /tmp/drive-review --yes
 ```
 
-Edit `approved` to `true` only after manual review. Keep the database and review root off the source drive, and back up the database before long runs. `--yes` is required for an actual move or restore; destination collisions are refused. Reports are static HTML containing paths and metadata, so protect the workspace. Optional archive/document/image/media/project analyzers are bounded and conservative: no macros are executed, no archives are extracted, no OCR or embeddings are run, and similarity never becomes an automatic movement recommendation.
+Edit `approved` to `true` only after manual review. Keep the database and review root off the source drive, and back up the database before long runs. `--yes` is required for an actual move or restore; destination collisions are refused. Reports are static HTML containing paths and metadata, so protect the workspace. Optional archive/document/image/media/project analysers are bounded and conservative: no macros are executed, no archives are extracted, no OCR or embeddings are run, and similarity never becomes an automatic movement recommendation.
 
 Run `pytest`, `ruff check .`, and `mypy src`. Python 3.11+ is supported on Linux, macOS, and Windows where filesystem permissions and mount behavior allow it. Estimated reviewable bytes are not guaranteed reclaimable space.
 
 ## Second-generation platform
 
-Known sources are scanned incrementally by default. Verified full hashes are deduplicated into content objects, and analyzer artifacts are reused only when content identity, analyzer version, and configuration fingerprint match.
+Known sources are scanned incrementally by default. Verified full hashes are deduplicated into content objects, and analyser artifacts are reused only when content identity, analyser version, and configuration fingerprint match.
 
 ```bash
 housekeeper sources list
 housekeeper scan /path/to/source --incremental --changed-only
 housekeeper diff 1 2
-housekeeper analyze all --changed-only
+housekeeper analyse all --changed-only
 housekeeper jobs list
 housekeeper database migrate --dry-run
 housekeeper database backup workspace/backups/inventory.sqlite

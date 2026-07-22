@@ -31,7 +31,7 @@ install-dev: $(BIN)/python ## Install everything plus the test/lint toolchain
 	$(BIN)/pip install -e '.[analysis,dashboard,dev]'
 
 .PHONY: quickstart
-quickstart: ## One command: scan+analyze+classify+report a drive (read-only). Needs SOURCE=<path>
+quickstart: ## One command: scan+analyse+classify+report a drive (read-only). Needs SOURCE=<path>
 	@test -n "$(SOURCE)" || { echo "error: set SOURCE=<drive path>, e.g. make quickstart SOURCE=/mnt/drive" >&2; exit 2; }
 	@test -x "$(BIN)/housekeeper" || { echo "error: entrypoint missing at $(BIN)/housekeeper — run 'make install' first" >&2; exit 2; }
 	$(BIN)/housekeeper --workspace $(WORKSPACE) quickstart "$(SOURCE)"

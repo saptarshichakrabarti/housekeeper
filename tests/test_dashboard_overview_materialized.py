@@ -34,7 +34,7 @@ def test_refresh_stores_charts_and_folded_counts(database, config, fixture_root)
         "classification_bytes",
         "top_level",
         "scan_history",
-        "analyzer_completion",
+        "analyser_completion",
     }
     overview = json.loads(
         database.fetch_one(

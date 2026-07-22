@@ -106,7 +106,7 @@ def mark_stale_for_entry(database: Database, entry_id: int) -> int:
 
 
 def mark_stale_for_targets(database: Database, target_type: str, target_ids: list[int] | None = None) -> int:
-    """Invalidate decisions when an analyzer, policy, or relationship group is recomputed."""
+    """Invalidate decisions when an analyser, policy, or relationship group is recomputed."""
     conn = database.connect()
     if target_ids:
         marks = ",".join("?" for _ in target_ids)
@@ -125,7 +125,7 @@ def export_snapshot(
         (session_id,),
     )
     run = database.fetch_one("SELECT id,config_hash,completed_at FROM scan_runs WHERE status='COMPLETE' ORDER BY id DESC LIMIT 1")
-    artifacts = database.fetch_all("SELECT analyzer_name,analyzer_version,configuration_fingerprint,COUNT(*) AS count FROM analysis_artifacts WHERE status='COMPLETED' GROUP BY analyzer_name,analyzer_version,configuration_fingerprint")
+    artifacts = database.fetch_all("SELECT analyser_name,analyser_version,configuration_fingerprint,COUNT(*) AS count FROM analysis_artifacts WHERE status='COMPLETED' GROUP BY analyser_name,analyser_version,configuration_fingerprint")
     payload = {
         "session_id": session_id,
         "schema_version": database.database_stats(check_integrity=False)["schema_version"],

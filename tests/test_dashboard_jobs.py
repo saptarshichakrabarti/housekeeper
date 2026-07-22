@@ -101,6 +101,28 @@ def test_jobs_fragment_reaps_orphan_on_poll(client, database):
     assert database.fetch_one("SELECT status FROM jobs WHERE id=?", (job_id,))["status"] == "INTERRUPTED"
 
 
+def test_operational_jobs_page_has_a_launcher(client):
+    # With the runner active, the Jobs page embeds the control panel so work can be started here.
+    html = client.get("/jobs").text
+    assert "id='control-panel'" in html or 'id="control-panel"' in html
+    assert "folder-picker.js" in html
+    # The panel's four operations are served by /fragments/control.
+    fragment = client.get("/fragments/control").text
+    for action in ("/control/scan", "/control/analyse", "/control/classify", "/control/report"):
+        assert action in fragment
+
+
+def test_plain_jobs_page_has_no_launcher(database):
+    # A viewer dashboard (no runner) shows the jobs list only — no way to start work.
+    from fastapi.testclient import TestClient
+    from housekeeper.dashboard.app import create_app
+
+    viewer = TestClient(create_app(database))
+    html = viewer.get("/jobs").text
+    assert "control-panel" not in html
+    assert "folder-picker.js" not in html
+
+
 def test_read_only_dashboard_does_not_reconcile(config, database):
     """A read-only dashboard observes without mutating — it must not reap jobs."""
     from fastapi.testclient import TestClient

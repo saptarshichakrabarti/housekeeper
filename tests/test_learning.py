@@ -31,7 +31,7 @@ def _train_scenario(config, database, tmp_path, decisions=30):
         (root / f"dup{i}.bin").write_bytes(b"same-payload")
         (root / f"keep{i}.txt").write_text(f"unique document {i}", encoding="utf-8")
     DriveScanner(database, config).scan(root, incremental=False)
-    from housekeeper.analyzers.exact_duplicates import run_exact_duplicate_analysis
+    from housekeeper.analysers.exact_duplicates import run_exact_duplicate_analysis
     from housekeeper.policies import classify_all_entries
 
     run_exact_duplicate_analysis(database, config)

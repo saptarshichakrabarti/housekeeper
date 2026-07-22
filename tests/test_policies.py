@@ -13,7 +13,7 @@ from housekeeper.policies import (
     load_policy_files,
     resolve_rule_conflicts,
 )
-from tests.conftest import analyze_and_classify
+from tests.conftest import analyse_and_classify
 
 
 def _protected() -> ProtectedConfig:
@@ -125,7 +125,7 @@ def test_old_installer_requires_duplicate_not_only_age():
 
 def test_classify_integration_over_fixture(scanned):
     database, config, _ = scanned
-    counts = analyze_and_classify(database, config)
+    counts = analyse_and_classify(database, config)
     assert counts  # non-empty distribution
     rows = {
         r["relative_path"]: (r["classification"], r["primary_reason_code"])
@@ -144,6 +144,6 @@ def test_classify_integration_over_fixture(scanned):
 
 def test_classification_is_deterministic(scanned):
     database, config, _ = scanned
-    first = analyze_and_classify(database, config)
+    first = analyse_and_classify(database, config)
     second = classify_all_entries(database, config)
     assert first == second

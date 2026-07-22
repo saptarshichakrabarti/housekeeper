@@ -1,6 +1,6 @@
 """Background single-worker runner for GUI-triggered operations.
 
-At most one operation (scan/analyze/classify/report) runs at a time per workspace. The worker
+At most one operation (scan/analyse/classify/report) runs at a time per workspace. The worker
 thread opens its own database connection — SQLite connections must never be shared across
 threads, and WAL mode makes that one writer safe alongside the dashboard's own reader and any
 concurrent CLI reader.
@@ -18,9 +18,9 @@ from ..config import AppConfig, config_fingerprint
 from ..database import Database
 from ..jobs import JobCancelled, JobPaused, tracked_job
 
-# The GUI's Analyze control is a curated, common-path subset of the CLI's full ~25-kind matrix
+# The GUI's analyse control is a curated, common-path subset of the CLI's full ~25-kind matrix
 # (scope filters like --under/--mime stay CLI-only). "all" runs every kind below in sequence.
-ANALYZE_KINDS = (
+analyse_KINDS = (
     "exact-duplicates",
     "directory-overlap",
     "documents",
@@ -100,15 +100,15 @@ class OperationRunner:
                 run_quickstart(
                     database, self._config, Path(kwargs["source"]), progress=self._on_progress
                 )
-            elif operation == "analyze":
-                self._run_analyze(database, kwargs["kind"])
+            elif operation == "analyse":
+                self._run_analyse(database, kwargs["kind"])
             elif operation == "classify":
                 self._run_classify(database)
             elif operation == "report":
                 self._run_report(database, kwargs["kind"])
             else:
                 raise ValueError(f"unknown operation: {operation}")
-            # Analyze/classify change the counts and charts the overview shows, so refresh the
+            # analyse/classify change the counts and charts the overview shows, so refresh the
             # materialized summaries here too (scan already did its own), then settle the WAL and
             # planner stats so the next dashboard load stays fast on a large inventory.
             database.refresh_materialized_summaries()
@@ -137,16 +137,16 @@ class OperationRunner:
         ) as job_id:
             return callback(job_id)
 
-    def _run_analyze(self, database: Database, kind: str) -> None:
-        from ..analyzers.directory_overlap import run_directory_overlap_analysis
-        from ..analyzers.exact_duplicates import run_exact_duplicate_analysis
-        from ..analyzers.projects import run_project_analysis
-        from ..analyzers.registry import run_content_analysis
-        from ..analyzers.scope import AnalyzerScope
+    def _run_analyse(self, database: Database, kind: str) -> None:
+        from ..analysers.directory_overlap import run_directory_overlap_analysis
+        from ..analysers.exact_duplicates import run_exact_duplicate_analysis
+        from ..analysers.projects import run_project_analysis
+        from ..analysers.registry import run_content_analysis
+        from ..analysers.scope import analyserScope
 
-        # Standalone Analyze runs unscoped over all scan history; restrict it to the current
+        # Standalone analyse runs unscoped over all scan history; restrict it to the current
         # inventory so re-scanning the same drive never makes a unique file look duplicated.
-        inventory = AnalyzerScope(current_inventory=True)
+        inventory = analyserScope(current_inventory=True)
 
         def content_analysis_step(name: str) -> Callable[[int], object]:
             # Named factory (rather than a lambda default-arg trick) so each closure captures its
@@ -174,8 +174,8 @@ class OperationRunner:
         for name in ("documents", "images", "media", "archives"):
             dispatch[name] = ("CONTENT_ANALYSIS", content_analysis_step(name))
         if kind != "all" and kind not in dispatch:
-            raise ValueError(f"unknown analyze kind: {kind}")
-        for name in ANALYZE_KINDS if kind == "all" else [kind]:
+            raise ValueError(f"unknown analyse kind: {kind}")
+        for name in analyse_KINDS if kind == "all" else [kind]:
             job_type, callback = dispatch[name]
             self._tracked(database, job_type, name, callback)
 

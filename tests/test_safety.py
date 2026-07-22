@@ -1,6 +1,6 @@
 from pathlib import Path
 
-from housekeeper.analyzers.document_versions import normalize_version_filename
+from housekeeper.analysers.document_versions import normalize_version_filename
 from housekeeper.hashing import compute_full_hash
 from housekeeper.path_utils import safe_destination_path
 

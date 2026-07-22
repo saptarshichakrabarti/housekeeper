@@ -1,8 +1,8 @@
-"""Document analyzer tests, including the plaintext-via-registry regression."""
+"""Document analyser tests, including the plaintext-via-registry regression."""
 
 import pytest
 
-from housekeeper.analyzers.documents import (
+from housekeeper.analysers.documents import (
     compute_normalized_text_hash,
     extract_document,
     normalize_document_text,

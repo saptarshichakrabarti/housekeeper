@@ -1,6 +1,6 @@
 """Operational GUI: the background runner and the /control/* endpoints it powers.
 
-Every operation here is read-only w.r.t. the source drive (scan/analyze/classify/report) — there
+Every operation here is read-only w.r.t. the source drive (scan/analyse/classify/report) — there
 is no move/delete endpoint, mirroring the CLI's own safety split (moving stays a separate,
 explicit, manifest-verified flow: export-review -> validate-manifest -> move-to-review).
 """
@@ -142,11 +142,11 @@ def test_control_scan_validates_and_requires_csrf(operational_client, tmp_path):
     _wait_idle_via_http(client)
 
 
-def test_control_analyze_classify_report_reject_bad_kind(operational_client):
+def test_control_analyse_classify_report_reject_bad_kind(operational_client):
     client = operational_client
     headers = {"X-CSRF-Token": _csrf(client)}
     assert (
-        client.post("/control/analyze", data={"kind": "not-a-kind"}, headers=headers).status_code
+        client.post("/control/analyse", data={"kind": "not-a-kind"}, headers=headers).status_code
         == 422
     )
     assert (
@@ -165,7 +165,7 @@ def test_control_routes_absent_under_read_only(config, database):
     client = TestClient(create_app(database, read_only=True, config=config))
     headers = {"X-CSRF-Token": client.get("/api/csrf").json()["token"]}
     assert client.post("/control/scan", data={"path": "/"}, headers=headers).status_code == 404
-    assert client.post("/control/analyze", data={"kind": "all"}, headers=headers).status_code == 404
+    assert client.post("/control/analyse", data={"kind": "all"}, headers=headers).status_code == 404
     assert client.post("/control/classify", headers=headers).status_code == 404
     assert client.post("/control/report", data={"kind": "all"}, headers=headers).status_code == 404
     # The control page itself is gone, and nothing links to it.

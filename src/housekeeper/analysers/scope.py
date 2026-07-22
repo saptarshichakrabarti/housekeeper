@@ -1,4 +1,4 @@
-"""Shared, parameterized analyzer scope resolution."""
+"""Shared, parameterized analyser scope resolution."""
 
 from __future__ import annotations
 
@@ -7,7 +7,7 @@ from datetime import datetime
 
 
 @dataclass(frozen=True)
-class AnalyzerScope:
+class analyserScope:
     under: str | None = None
     source_id: int | None = None
     scan_run_id: int | None = None
@@ -78,7 +78,7 @@ class AnalyzerScope:
         return " AND ".join(clauses), tuple(params)
 
 
-def scoped_entry_ids(database, scope: AnalyzerScope, entry_type: str = "file") -> set[int]:
+def scoped_entry_ids(database, scope: analyserScope, entry_type: str = "file") -> set[int]:
     where, params = scope.entry_query(entry_type)
     rows = database.fetch_all(
         f"""SELECT DISTINCT e.id FROM filesystem_entries e

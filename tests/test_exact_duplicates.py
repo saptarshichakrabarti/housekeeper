@@ -1,6 +1,6 @@
 """Exact-duplicate detection: grouping, canonical selection, cross-root, last-copy safety."""
 
-from housekeeper.analyzers.exact_duplicates import run_exact_duplicate_analysis
+from housekeeper.analysers.exact_duplicates import run_exact_duplicate_analysis
 from housekeeper.scanner import DriveScanner
 
 

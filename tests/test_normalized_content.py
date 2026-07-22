@@ -4,7 +4,7 @@ import zipfile
 
 import pytest
 
-from housekeeper.analyzers.normalized_content import run_normalized_content_analysis
+from housekeeper.analysers.normalized_content import run_normalized_content_analysis
 from housekeeper.normalization.archives import normalize_archive_content
 from housekeeper.normalization.office_xml import normalize_office
 from housekeeper.normalization.registry import IMAGE_PIXEL_PROFILE, get_or_create_profile_id
@@ -175,7 +175,7 @@ def test_representative_path_fallback(config, database, tmp_path):
     _make_docx(root / "a.docx")
     shutil.copy2(root / "a.docx", root / "sub" / "a-copy.docx")  # byte-identical: one content object
     DriveScanner(database, config).scan(root, incremental=False)
-    from housekeeper.analyzers.exact_duplicates import run_exact_duplicate_analysis
+    from housekeeper.analysers.exact_duplicates import run_exact_duplicate_analysis
 
     run_exact_duplicate_analysis(database, config)  # link both paths to one content object
     (root / "a.docx").unlink()  # remove the first representative

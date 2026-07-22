@@ -22,7 +22,7 @@ import json
 from pathlib import Path
 
 from ..jobs import check_cancelled, update_job
-from .scope import AnalyzerScope, scoped_entry_ids
+from .scope import analyserScope, scoped_entry_ids
 
 _BACKGROUND = (245, 245, 245)
 _PADDING = 6
@@ -49,7 +49,7 @@ def _thumbnail_path(database, content_object_id: int) -> str | None:
     """The recorded thumbnail path for a content object, if one exists on disk."""
     row = database.fetch_one(
         "SELECT artifact_json FROM analysis_artifacts "
-        "WHERE analyzer_name='images' AND content_object_id=? AND status='COMPLETED'",
+        "WHERE analyser_name='images' AND content_object_id=? AND status='COMPLETED'",
         (content_object_id,),
     )
     if not row:
@@ -100,7 +100,7 @@ def generate_contact_sheet(
 
 
 def run_contact_sheet_generation(
-    database, config, scope: AnalyzerScope | None = None, job_id: int | None = None
+    database, config, scope: analyserScope | None = None, job_id: int | None = None
 ) -> dict:
     section = config.section("images")
     if not section.get("create_contact_sheets", True):

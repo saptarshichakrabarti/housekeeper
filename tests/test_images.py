@@ -1,8 +1,8 @@
-"""Image analyzer tests: metadata, perceptual distance, decompression-bomb guard."""
+"""Image analyser tests: metadata, perceptual distance, decompression-bomb guard."""
 
 import pytest
 
-from housekeeper.analyzers.images import calculate_hash_distance, extract_image_metadata
+from housekeeper.analysers.images import calculate_hash_distance, extract_image_metadata
 from housekeeper.config import load_config
 
 pytest.importorskip("PIL")

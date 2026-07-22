@@ -4,10 +4,10 @@ import time
 
 import pytest
 
-from housekeeper.analyzers.exact_duplicates import run_exact_duplicate_analysis
-from housekeeper.analyzers.lifecycle import assign_state, run_lifecycle_analysis
-from housekeeper.analyzers.preservation_risk import run_preservation_risk_analysis
-from housekeeper.analyzers.review_priority import run_review_priority_analysis, score_entry
+from housekeeper.analysers.exact_duplicates import run_exact_duplicate_analysis
+from housekeeper.analysers.lifecycle import assign_state, run_lifecycle_analysis
+from housekeeper.analysers.preservation_risk import run_preservation_risk_analysis
+from housekeeper.analysers.review_priority import run_review_priority_analysis, score_entry
 from housekeeper.constants import LifecycleState, ReviewPriorityCategory
 from housekeeper.known_content import add_assertion, assertions_for_entry, list_assertions
 from housekeeper.policies import classify_all_entries

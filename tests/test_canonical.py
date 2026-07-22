@@ -2,7 +2,7 @@
 
 import sqlite3
 
-from housekeeper.analyzers.exact_duplicates import run_exact_duplicate_analysis
+from housekeeper.analysers.exact_duplicates import run_exact_duplicate_analysis
 from housekeeper.canonical.roles import (
     assign_canonical_roles,
     assign_location_roles,

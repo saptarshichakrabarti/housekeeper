@@ -1,4 +1,4 @@
-"""Format-aware normalized-equivalence analyzer.
+"""Format-aware normalized-equivalence analyser.
 
 For each unique content object it computes deterministic, versioned normalized fingerprints
 (one parse per content object, with representative-path fallback), stores them, and emits
@@ -28,8 +28,8 @@ from ..normalization.registry import (
 )
 from ..relationships import invalidate_content_relationships, upsert_content_relationship
 
-ANALYZER_NAME = "normalized_content"
-ANALYZER_VERSION = "1"
+analyseR_NAME = "normalized_content"
+analyseR_VERSION = "1"
 
 _SIGNATURE_TYPE = {
     "IMAGE_PIXEL_EQUIVALENCE": "PIXEL_HASH",
@@ -165,7 +165,7 @@ def _normalize_objects(database, config, allowed, job_id, counts) -> None:
 def _ensure_content_objects(database, config, allowed_entries: set[int] | None) -> None:
     """Hash supported-suffix files that are not yet linked to a content object.
 
-    Makes ``analyze normalized-content`` self-sufficient after a bare scan: identity analysis
+    Makes ``analyse normalized-content`` self-sufficient after a bare scan: identity analysis
     otherwise only hashes exact-duplicate candidates, so format-equivalent (byte-different)
     files would have no content object to normalize.
     """

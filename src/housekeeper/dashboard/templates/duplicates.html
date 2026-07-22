@@ -18,5 +18,5 @@
     <td><code title="{{ group.full_hash }}">{{ group.full_hash[:12] }}…</code> <button class="copy-button" type="button" data-copy="{{ group.full_hash }}" aria-label="Copy full hash">Copy</button></td>
     <td>{{ group.member_count | thousands }}</td><td>{{ group.size_bytes | filesizeformat }}</td><td><strong>{{ group.reclaimable_bytes | filesizeformat }}</strong></td>
     <td>{{ group.canonical_entry_id | thousands }}</td><td><button hx-get="/fragments/duplicates/{{ group.id }}" hx-target="#detail-drawer">Compare</button></td>
-  </tr>{% else %}<tr><td class="empty-state" colspan="8">No duplicates yet{% if has_run_page %} — run Analyze → exact-duplicates from the <a href="/control">Run page</a>{% endif %}.</td></tr>{% endfor %}</tbody>
+  </tr>{% else %}<tr><td class="empty-state" colspan="8">No duplicates yet{% if has_run_page %} — run analyse → exact-duplicates from the <a href="/control">Run page</a>{% endif %}.</td></tr>{% endfor %}</tbody>
 </table></div>

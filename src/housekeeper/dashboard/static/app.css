@@ -507,3 +507,33 @@ aside#detail-drawer {
   nav { grid-column: 1; }
   .nav-group { align-items: center; flex-direction: column; gap: .2rem; }
 }
+
+/* In-browser folder picker (the "Choose folder…" modal). */
+.folder-browser {
+  position: fixed;
+  inset: 0;
+  z-index: 1000;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  background: rgba(0, 0, 0, .5);
+}
+.folder-browser[hidden] { display: none; }
+.folder-browser__panel {
+  width: min(640px, 92vw);
+  max-height: 82vh;
+  overflow: auto;
+  padding: 1rem 1.25rem;
+  background: var(--hk-surface);
+  color: var(--hk-text);
+  border: var(--hk-border-w) solid var(--hk-border-strong);
+  border-radius: var(--hk-radius);
+  box-shadow: var(--hk-shadow);
+}
+.folder-browser__head { display: flex; flex-wrap: wrap; gap: .5rem; justify-content: space-between; align-items: baseline; }
+.folder-browser__crumbs a { color: var(--hk-link); }
+.folder-browser__current { font-family: var(--hk-font-num); color: var(--hk-text-muted); word-break: break-all; margin: .35rem 0; }
+.folder-list { list-style: none; padding: 0; margin: .25rem 0 0; }
+.folder-list li { padding: .15rem 0; }
+.folder-list a { text-decoration: none; color: var(--hk-link); }
+.folder-list a:hover { text-decoration: underline; }

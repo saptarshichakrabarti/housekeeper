@@ -6,8 +6,8 @@ import zipfile
 
 import pytest
 
-from housekeeper.analyzers.cross_format_derivation import run_cross_format_derivation_analysis
-from housekeeper.analyzers.normalized_content import run_normalized_content_analysis
+from housekeeper.analysers.cross_format_derivation import run_cross_format_derivation_analysis
+from housekeeper.analysers.normalized_content import run_normalized_content_analysis
 from housekeeper.graph.builder import build_projection
 from housekeeper.scanner import DriveScanner
 

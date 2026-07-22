@@ -6,8 +6,8 @@ byte have completely different SHA-256 digests. It is the evidence source for th
 relationships `PARTIAL_CONTENT_OVERLAP` and `NEAR_SUBSET_CONTENT`.
 
 CDC is **opt-in** (`chunking.enabled`, default `false`) and gated to large files
-(`minimum_file_size_bytes`, default 128 MiB), because it is the most expensive analyzer in the
-system. It never deletes or moves a file: like every analyzer, the strongest outcome it can
+(`minimum_file_size_bytes`, default 128 MiB), because it is the most expensive analyser in the
+system. It never deletes or moves a file: like every analyser, the strongest outcome it can
 produce is a reviewable relationship.
 
 ## Why content-defined boundaries
@@ -68,7 +68,7 @@ below.
 
 ## From chunks to overlap relationships
 
-`src/housekeeper/chunking/overlap.py` and `analyzers/content_defined_chunks.py` turn stored chunks
+`src/housekeeper/chunking/overlap.py` and `analysers/content_defined_chunks.py` turn stored chunks
 into relationships without an all-pairs comparison:
 
 1. **Candidate generation** (`generate_overlap_candidates`). An inverted index maps each chunk to

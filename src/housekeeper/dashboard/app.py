@@ -576,7 +576,7 @@ def create_app(
         if not entry:
             raise HTTPException(404, "entry not found")
         artifacts = reader.fetch_all(
-            """SELECT a.analyzer_name,a.status,a.completed_at FROM entry_content_links l
+            """SELECT a.analyser_name,a.status,a.completed_at FROM entry_content_links l
                JOIN analysis_artifacts a ON a.content_object_id=l.content_object_id
                WHERE l.entry_id=? ORDER BY a.completed_at DESC""",
             (entry_id,),
@@ -887,8 +887,8 @@ def create_app(
         return explorer(
             "documents",
             "Document-version explorer",
-            "SELECT content_object_id,analyzer_version,status,completed_at,error_code FROM analysis_artifacts WHERE analyzer_name='documents' ORDER BY completed_at DESC LIMIT ?",
-            ["content_object_id", "analyzer_version", "status", "completed_at", "error_code"],
+            "SELECT content_object_id,analyser_version,status,completed_at,error_code FROM analysis_artifacts WHERE analyser_name='documents' ORDER BY completed_at DESC LIMIT ?",
+            ["content_object_id", "analyser_version", "status", "completed_at", "error_code"],
             limit,
         )
 
@@ -901,7 +901,7 @@ def create_app(
             (limit,),
         )
         artifacts = reader.fetch_all(
-            "SELECT content_object_id,analyzer_version,status,completed_at,error_code FROM analysis_artifacts WHERE analyzer_name='images' ORDER BY completed_at DESC LIMIT ?",
+            "SELECT content_object_id,analyser_version,status,completed_at,error_code FROM analysis_artifacts WHERE analyser_name='images' ORDER BY completed_at DESC LIMIT ?",
             (limit,),
         )
         groups_table = linked_rows_table(
@@ -909,7 +909,7 @@ def create_app(
         )
         artifacts_table = rows_table(
             artifacts,
-            ["content_object_id", "analyzer_version", "status", "completed_at", "error_code"],
+            ["content_object_id", "analyser_version", "status", "completed_at", "error_code"],
         )
         return page(
             "Image-similarity explorer",
@@ -941,7 +941,7 @@ def create_app(
                       (SELECT e.relative_path FROM entry_content_links l JOIN filesystem_entries e ON e.id=l.entry_id
                        WHERE l.content_object_id=m.content_object_id ORDER BY e.id LIMIT 1) relative_path,
                       (SELECT a.artifact_json FROM analysis_artifacts a
-                       WHERE a.analyzer_name='images' AND a.content_object_id=m.content_object_id
+                       WHERE a.analyser_name='images' AND a.content_object_id=m.content_object_id
                        AND a.status='COMPLETED' LIMIT 1) artifact_json
                FROM relationship_group_members m WHERE m.group_id=? ORDER BY m.content_object_id LIMIT 200""",
             (group_id,),
@@ -994,10 +994,30 @@ def create_app(
 
     @app.get("/jobs", response_class=HTMLResponse)
     def jobs(limit: int = Query(100, ge=1, le=500)):
+        # When the runner is active (gui/app, not the read-only viewer) let users start work right
+        # here: reuse the Run page's control panel (`#control-panel` + /fragments/control) above the
+        # list. It shares the /control/* endpoints, so starting a job also fires HX-Trigger:
+        # job-started, which re-arms the self-suspending jobs poll below on this same page.
+        launcher = ""
+        scripts = ""
+        if runner is not None:
+            launcher = (
+                "<h2>Start a job</h2>"
+                "<section id='control-panel' hx-get='/fragments/control' "
+                "hx-trigger='load, every 2s' hx-swap='innerHTML'>Loading…</section>"
+                # Folder-picker modal lives outside #control-panel so the 2s status poll never wipes
+                # it mid-browse.
+                "<div id='folder-browser' class='folder-browser' hidden>"
+                "<div class='folder-browser__panel'><div id='folder-browser-body'>Loading…</div></div></div>"
+                "<h2>Jobs</h2>"
+            )
+            folder_picker_version = (static_dir / "folder-picker.js").stat().st_mtime_ns
+            scripts = f"<script defer src='/static/folder-picker.js?v={folder_picker_version}'></script>"
         # Only a one-shot load: the fragment itself decides whether to keep polling (see below).
         return page(
             "Jobs",
-            f"<section hx-get='/fragments/jobs?limit={limit}' hx-trigger='load'>Loading…</section>",
+            f"{launcher}<section hx-get='/fragments/jobs?limit={limit}' hx-trigger='load'>Loading…</section>",
+            scripts=scripts,
             active_path="jobs",
         )
 
@@ -1056,14 +1076,75 @@ def create_app(
         return HTMLResponse(table.split("<tbody>", 1)[1].split("</tbody>", 1)[0])
 
     if runner is not None:
-        from .runner import ANALYZE_KINDS, REPORT_KINDS
+        from .runner import analyse_KINDS, REPORT_KINDS
+        from urllib.parse import quote
+
+        @app.get("/fragments/folders", response_class=HTMLResponse)
+        def folders_fragment(path: str | None = None):
+            """Read-only host directory listing that powers the in-browser folder picker.
+
+            Operational-only (defined inside the runner block): a plain browser cannot open a native
+            OS folder dialog, so the "Choose folder…" button drives this instead. It lists
+            directories only — it never reads file contents or writes anything.
+            """
+            try:
+                current = Path(path).expanduser().resolve() if path else Path.home()
+            except (OSError, ValueError, RuntimeError):
+                current = Path.home()
+            if not current.is_dir():
+                current = current.parent if current.parent.is_dir() else Path(current.anchor or "/")
+            error: str | None = None
+            subdirs: list[Path] = []
+            try:
+                for entry in sorted(current.iterdir(), key=lambda p: p.name.casefold()):
+                    if entry.name.startswith("."):
+                        continue
+                    try:
+                        if entry.is_dir():
+                            subdirs.append(entry)
+                    except OSError:
+                        continue  # unreadable entry — skip, never crash the picker
+            except OSError as exc:
+                error = exc.strerror or str(exc)
+
+            def nav(target: Path, label: str) -> str:
+                return (
+                    f"<a href='#' hx-get='/fragments/folders?path={quote(str(target))}' "
+                    f"hx-target='#folder-browser-body' hx-swap='innerHTML'>{escape(label)}</a>"
+                )
+
+            crumbs = [
+                nav(Path(*current.parts[: i + 1]), current.parts[i] or "/")
+                for i in range(len(current.parts))
+            ]
+            breadcrumb = crumbs[0] + (" " + " / ".join(crumbs[1:]) if len(crumbs) > 1 else "")
+            items = ""
+            if current.parent != current:
+                items += f"<li class='folder-list__up'>{nav(current.parent, '⬆ parent folder')}</li>"
+            for directory in subdirs:
+                items += f"<li>{nav(directory, '📁 ' + directory.name)}</li>"
+            if not subdirs and not error:
+                items += "<li class='empty-state'>No subfolders here.</li>"
+            if error:
+                items += f"<li class='empty-state'>Cannot open: {escape(error)}</li>"
+            body = (
+                "<div class='folder-browser__head'>"
+                f"<nav class='folder-browser__crumbs'>{breadcrumb}</nav>"
+                "<div class='controls'>"
+                f"<button type='button' class='folder-use' data-path='{escape(str(current))}'>Use this folder</button> "
+                "<button type='button' class='folder-close'>Cancel</button>"
+                "</div></div>"
+                f"<p class='folder-browser__current'>{escape(str(current))}</p>"
+                f"<ul class='folder-list'>{items}</ul>"
+            )
+            return HTMLResponse(body)
 
         def control_fragment(job_started: bool = False) -> HTMLResponse:
             response = HTMLResponse(
                 templates.get_template("fragments/control.html").render(
                     status=runner.status(),
                     read_only=read_only,
-                    analyze_kinds=ANALYZE_KINDS,
+                    analyse_kinds=analyse_KINDS,
                     report_kinds=REPORT_KINDS,
                 )
             )
@@ -1079,7 +1160,7 @@ def create_app(
                 "Run",
                 "control.html",
                 read_only=read_only,
-                analyze_kinds=ANALYZE_KINDS,
+                analyse_kinds=analyse_KINDS,
                 report_kinds=REPORT_KINDS,
                 status=runner.status(),
                 scripts=f"<script defer src='/static/folder-picker.js?v={folder_picker_version}'></script>",
@@ -1101,14 +1182,14 @@ def create_app(
                 raise HTTPException(409, "an operation is already running")
             return control_fragment(job_started=True)
 
-        @app.post("/control/analyze", response_class=HTMLResponse)
-        def control_analyze(
+        @app.post("/control/analyse", response_class=HTMLResponse)
+        def control_analyse(
             kind: Annotated[str, Form()], x_csrf_token: str | None = Header(default=None)
         ):
             guard(x_csrf_token)
-            if kind != "all" and kind not in ANALYZE_KINDS:
-                raise HTTPException(422, "invalid analyze kind")
-            if runner.submit("analyze", kind=kind) == "busy":
+            if kind != "all" and kind not in analyse_KINDS:
+                raise HTTPException(422, "invalid analyse kind")
+            if runner.submit("analyse", kind=kind) == "busy":
                 raise HTTPException(409, "an operation is already running")
             return control_fragment(job_started=True)
 

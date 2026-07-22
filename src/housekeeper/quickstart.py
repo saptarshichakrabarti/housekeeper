@@ -1,4 +1,4 @@
-"""One-command pipeline: scan, analyze, classify, and report in a single invocation.
+"""One-command pipeline: scan, analyse, classify, and report in a single invocation.
 
 ``housekeeper quickstart <source>`` (or ``make quickstart SOURCE=<source>``) runs the complete
 *read-only* pipeline a new user would otherwise assemble from six commands. It follows the same
@@ -7,7 +7,7 @@ safety rules as the individual commands:
 * nothing is ever moved, deleted, or modified — the pipeline only reads the source tree and writes
   the workspace inventory/reports;
 * every step runs inside a durable job (pause/cancel-able, visible in ``jobs``/dashboard);
-* optional-dependency analyzers degrade to honest "unavailable" results instead of failing;
+* optional-dependency analysers degrade to honest "unavailable" results instead of failing;
 * re-running is safe and incremental — the scan reuses unchanged entries.
 
 The strongest action the tool ever takes (moving approved files into a review folder) remains a
@@ -19,7 +19,7 @@ from __future__ import annotations
 from pathlib import Path
 from typing import Callable
 
-from .analyzers.scope import AnalyzerScope
+from .analysers.scope import analyserScope
 from .config import config_fingerprint
 from .jobs import tracked_job
 
@@ -38,20 +38,20 @@ def run_quickstart(
     progress: Callable[[str, int, int], None] = lambda message, stage, stage_total: None,
 ) -> dict:
     """Execute the full safe pipeline against ``source_root`` and return a summary."""
-    from .analyzers.archive_equivalence import run_archive_directory_analysis
-    from .analyzers.backup_lineage import run_backup_lineage_analysis
-    from .analyzers.contact_sheets import run_contact_sheet_generation
-    from .analyzers.cross_format_derivation import run_cross_format_derivation_analysis
-    from .analyzers.directory_overlap import run_directory_overlap_analysis
-    from .analyzers.document_versions import run_document_version_analysis
-    from .analyzers.exact_duplicates import run_exact_duplicate_analysis
-    from .analyzers.images import run_image_analysis
-    from .analyzers.lifecycle import run_lifecycle_analysis
-    from .analyzers.normalized_content import run_normalized_content_analysis
-    from .analyzers.preservation_risk import run_preservation_risk_analysis
-    from .analyzers.projects import run_project_analysis
-    from .analyzers.registry import run_content_analysis
-    from .analyzers.review_priority import run_review_priority_analysis
+    from .analysers.archive_equivalence import run_archive_directory_analysis
+    from .analysers.backup_lineage import run_backup_lineage_analysis
+    from .analysers.contact_sheets import run_contact_sheet_generation
+    from .analysers.cross_format_derivation import run_cross_format_derivation_analysis
+    from .analysers.directory_overlap import run_directory_overlap_analysis
+    from .analysers.document_versions import run_document_version_analysis
+    from .analysers.exact_duplicates import run_exact_duplicate_analysis
+    from .analysers.images import run_image_analysis
+    from .analysers.lifecycle import run_lifecycle_analysis
+    from .analysers.normalized_content import run_normalized_content_analysis
+    from .analysers.preservation_risk import run_preservation_risk_analysis
+    from .analysers.projects import run_project_analysis
+    from .analysers.registry import run_content_analysis
+    from .analysers.review_priority import run_review_priority_analysis
     from .canonical.roles import assign_canonical_roles
     from .collections.events import run_photo_event_analysis
     from .collections.marginal_value import run_backup_value_analysis
@@ -69,7 +69,7 @@ def run_quickstart(
 
     # Named (rather than left as inline loop literals) so the stage count below is derived from
     # their length instead of a hand-maintained magic number.
-    STRUCTURAL_ANALYZERS = (
+    STRUCTURAL_analyseRS = (
         ("directory-overlap", "DIRECTORY_OVERLAP", run_directory_overlap_analysis),
         ("document-versions", "VERSION_ANALYSIS", run_document_version_analysis),
         ("image-similarity", "IMAGE_ANALYSIS", run_image_analysis),
@@ -78,7 +78,7 @@ def run_quickstart(
         ("normalized-content", "CONTENT_ANALYSIS", run_normalized_content_analysis),
         ("derivations", "VERSION_ANALYSIS", run_cross_format_derivation_analysis),
     )
-    POST_CANONICAL_ANALYZERS = (
+    POST_CANONICAL_analyseRS = (
         ("archive-of-directory", "ARCHIVE_ANALYSIS", run_archive_directory_analysis),
         ("backup-value", "DIRECTORY_SUMMARY", run_backup_value_analysis),
         ("record-series", "CLASSIFICATION", run_record_series_analysis),
@@ -90,8 +90,8 @@ def run_quickstart(
     FIXED_STAGE_COUNT = 7
     stage_total = (
         FIXED_STAGE_COUNT
-        + len(STRUCTURAL_ANALYZERS)
-        + len(POST_CANONICAL_ANALYZERS)
+        + len(STRUCTURAL_analyseRS)
+        + len(POST_CANONICAL_analyseRS)
         + (1 if generate_reports else 0)
     )
 
@@ -119,7 +119,7 @@ def run_quickstart(
     # current copy as a removable duplicate — marking unique, single-copy files REVIEW_SAFE on a
     # routine re-run. Scoping to this scan run keeps re-runs safe and idempotent.
     scan_run_id = scanner.last_run_id
-    scope = AnalyzerScope(scan_run_id=scan_run_id) if scan_run_id is not None else None
+    scope = analyserScope(scan_run_id=scan_run_id) if scan_run_id is not None else None
     begin_stage("exact-duplicates")
     record(
         "exact-duplicates",
@@ -143,7 +143,7 @@ def run_quickstart(
         ),
     )
     # Each factory binds ``runner`` as a fresh parameter (avoiding late-binding over the loop) and
-    # returns a single-argument step callback. Structural analyzers receive the current-run scope so
+    # returns a single-argument step callback. Structural analysers receive the current-run scope so
     # they never relate a file to its own prior-scan snapshot.
     def scope_positional(runner: Callable) -> Callable[[int | None], object]:
         return lambda job: runner(database, config, scope, job)
@@ -151,8 +151,8 @@ def run_quickstart(
     def job_keyword(runner: Callable) -> Callable[[int | None], object]:
         return lambda job: runner(database, config, job_id=job)
 
-    # Structural analyzers over the fresh inventory (scope, then job_id, positionally).
-    for label, job_type, runner in STRUCTURAL_ANALYZERS:
+    # Structural analysers over the fresh inventory (scope, then job_id, positionally).
+    for label, job_type, runner in STRUCTURAL_analyseRS:
         begin_stage(label)
         record(label, _step(database, config, job_type, label, scope_positional(runner)))
     begin_stage("canonical-roles")
@@ -166,7 +166,7 @@ def run_quickstart(
             lambda job: assign_canonical_roles(database),
         ),
     )
-    for label, job_type, runner in POST_CANONICAL_ANALYZERS:
+    for label, job_type, runner in POST_CANONICAL_analyseRS:
         begin_stage(label)
         record(label, _step(database, config, job_type, label, job_keyword(runner)))
     begin_stage("classify")

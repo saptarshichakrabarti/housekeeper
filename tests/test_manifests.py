@@ -2,7 +2,7 @@
 
 import pytest
 
-from housekeeper.analyzers.exact_duplicates import run_exact_duplicate_analysis
+from housekeeper.analysers.exact_duplicates import run_exact_duplicate_analysis
 from housekeeper.manifests import (
     export_review_manifest,
     load_manifest,

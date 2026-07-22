@@ -2,7 +2,7 @@
 
 import pytest
 
-from housekeeper.analyzers.exact_duplicates import run_exact_duplicate_analysis
+from housekeeper.analysers.exact_duplicates import run_exact_duplicate_analysis
 from housekeeper.hashing import compute_full_hash
 from housekeeper.models import ManifestEntry
 from housekeeper.review_mover import move_approved_entries, validate_review_root

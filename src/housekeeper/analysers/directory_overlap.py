@@ -2,7 +2,7 @@ from ..config import AppConfig
 import json
 from ..database import Database
 from ..relationships import upsert_relationship
-from .scope import AnalyzerScope, scoped_entry_ids
+from .scope import analyserScope, scoped_entry_ids
 
 
 def calculate_containment(a: set[str], b: set[str]) -> float:
@@ -29,7 +29,7 @@ def get_directory_hash_set(directory_id: int, database: Database) -> set[str]:
 
 
 def build_directory_summaries(
-    database: Database, config: AppConfig, scope: AnalyzerScope | None = None
+    database: Database, config: AppConfig, scope: analyserScope | None = None
 ) -> None:
     database.connect().execute("DELETE FROM directory_summaries")
     dirs = database.fetch_all(
@@ -127,7 +127,7 @@ def generate_candidate_directory_pairs(
 def run_directory_overlap_analysis(
     database: Database,
     config: AppConfig,
-    scope: AnalyzerScope | None = None,
+    scope: analyserScope | None = None,
     job_id: int | None = None,
 ) -> None:
     from ..jobs import checkpoint

@@ -10,11 +10,11 @@ Date: 2026-07-16
 - Lint command: `ruff check .` (baseline: 6 pre-existing unused-import/unused-variable findings).
 - Type-check command: `mypy src` (baseline: 6 pre-existing errors in database, archives, scanner, and reporting).
 - Schema version: 1 (`SCHEMA_VERSION = 1`); the existing database layer creates tables directly and has no ordered migration framework.
-- CLI commands: `init-workspace`, `scan`, `scan-status`, `stats`, `analyze`, `classify`, `report`, `export-review`, `validate-manifest`, `move-to-review`, and `restore`.
+- CLI commands: `init-workspace`, `scan`, `scan-status`, `stats`, `analyse`, `classify`, `report`, `export-review`, `validate-manifest`, `move-to-review`, and `restore`.
 
 ## Current architecture
 
-The package is a compact Python application under `src/housekeeper`. `scanner.py` traverses a source root with `os.scandir`, stores one `filesystem_entries` row per scan/path, and checkpoints aggregate counters. `hashing.py` provides streamed quick and full hashing with a stability check. Analyzer modules operate directly on filesystem-entry rows; exact duplicates write hashes and duplicate groups. `policies.py` classifies files conservatively, while `reporting.py` emits small static HTML reports.
+The package is a compact Python application under `src/housekeeper`. `scanner.py` traverses a source root with `os.scandir`, stores one `filesystem_entries` row per scan/path, and checkpoints aggregate counters. `hashing.py` provides streamed quick and full hashing with a stability check. analyser modules operate directly on filesystem-entry rows; exact duplicates write hashes and duplicate groups. `policies.py` classifies files conservatively, while `reporting.py` emits small static HTML reports.
 
 Review is a file-based workflow: `manifests.py` exports CSV rows, `validate-manifest` checks schema and basic database drift, and `review_mover.py` performs an explicit, hash-verified copy into a non-nested review root before unlinking the source. `restore.py` verifies the review copy and restores only when safe. No permanent delete or purge command exists.
 
@@ -31,7 +31,7 @@ The schema consists of `schema_migrations`, `scan_runs`, `filesystem_entries`, `
 
 ## Reusable modules
 
-The scanner, streamed hashing, exact duplicate analyzer, policy engine, manifest validation, mover, restore, configuration merge, and path safety helpers are useful foundations. The current analyzer package provides conservative extension points for archives, documents, images, media, projects, versions, and directory overlap.
+The scanner, streamed hashing, exact duplicate analyser, policy engine, manifest validation, mover, restore, configuration merge, and path safety helpers are useful foundations. The current analyser package provides conservative extension points for archives, documents, images, media, projects, versions, and directory overlap.
 
 ## Technical debt and performance assumptions
 
@@ -68,6 +68,6 @@ There is no permanent deletion API. Movement remains explicit and manifest-drive
 
 ## Upgrade implementation status
 
-The implementation is now at schema v4. It adds additive legacy-column migrations, a resumable migration cursor, migration-progress records, materialized summaries, WAL checkpoint/vacuum guards, read-only dashboard connections, source/device registration, reusable verified content links, scan change/rename evidence, cooperative cancellation checkpoints, immutable review snapshots, analyzer/group staleness, manifest preflight, and explicit `--yes` execution gates.
+The implementation is now at schema v4. It adds additive legacy-column migrations, a resumable migration cursor, migration-progress records, materialized summaries, WAL checkpoint/vacuum guards, read-only dashboard connections, source/device registration, reusable verified content links, scan change/rename evidence, cooperative cancellation checkpoints, immutable review snapshots, analyser/group staleness, manifest preflight, and explicit `--yes` execution gates.
 
 The dashboard has bounded cursor pagination, local fragment refresh, safe duplicate-group bulk decisions, jobs/progress views, structured relationship explorers, and a Cytoscape.js-only graph with cache keys tied to relationship versions, confidence filtering, progressive neighborhood expansion, and client PNG export. Synthetic benchmark tooling now includes a million-entry metadata corpus generator; the Rust boundary provides capability detection, stable full hashing, and quick hashing with Python fallback. Validation remains intentionally synthetic/copied-database only: mounted-drive performance and filesystem behavior still require deployment-specific operational qualification.

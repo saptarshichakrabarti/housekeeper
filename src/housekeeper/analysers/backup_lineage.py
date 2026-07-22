@@ -7,7 +7,7 @@ Uses the same build-once hash-set map + inverted-index candidate generation as
 from ..jobs import check_cancelled, update_job
 from ..relationships import upsert_relationship
 from .directory_overlap import generate_candidate_directory_pairs
-from .scope import AnalyzerScope, scoped_entry_ids
+from .scope import analyserScope, scoped_entry_ids
 
 
 def _direct_child_hashes(database, entry_id: int) -> set[str]:
@@ -22,7 +22,7 @@ def _direct_child_hashes(database, entry_id: int) -> set[str]:
 
 
 def run_backup_lineage_analysis(
-    database, config, scope: AnalyzerScope | None = None, job_id: int | None = None
+    database, config, scope: analyserScope | None = None, job_id: int | None = None
 ) -> None:
     rows = database.fetch_all(
         "SELECT entry_id FROM directory_summaries WHERE recursive_file_count>0"

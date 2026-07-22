@@ -10,16 +10,16 @@
 <section class="card">
   <h3>Scan</h3>
   <form hx-post="/control/scan" hx-target="#control-panel" hx-swap="innerHTML">
-    <label>Directory <input type="text" name="path" id="control-path" size="60" required{% if busy %} disabled{% endif %}></label>
-    <button type="button" id="control-pick-folder"{% if busy %} disabled{% endif %}>Choose folder…</button>
+    <label>Directory <input type="text" name="path" id="control-path" size="60" required hx-preserve="true"{% if busy %} disabled{% endif %}></label>
+    <button type="button" id="control-pick-folder" hx-get="/fragments/folders" hx-target="#folder-browser-body" hx-swap="innerHTML"{% if busy %} disabled{% endif %}>Choose folder…</button>
     <div class="controls"><button type="submit"{% if busy %} disabled{% endif %}>Scan</button></div>
   </form>
 </section>
 <section class="card">
-  <h3>Analyze</h3>
-  <form hx-post="/control/analyze" hx-target="#control-panel" hx-swap="innerHTML">
-    <label>Kind <select name="kind"{% if busy %} disabled{% endif %}><option value="all">all</option>{% for kind in analyze_kinds %}<option value="{{ kind }}">{{ kind }}</option>{% endfor %}</select></label>
-    <div class="controls"><button type="submit"{% if busy %} disabled{% endif %}>Analyze</button></div>
+  <h3>Analyse</h3>
+  <form hx-post="/control/analyse" hx-target="#control-panel" hx-swap="innerHTML">
+    <label>Kind <select name="kind"{% if busy %} disabled{% endif %}><option value="all">all</option>{% for kind in analyse_kinds %}<option value="{{ kind }}">{{ kind }}</option>{% endfor %}</select></label>
+    <div class="controls"><button type="submit"{% if busy %} disabled{% endif %}>Analyse</button></div>
   </form>
 </section>
 <section class="card">

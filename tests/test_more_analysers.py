@@ -4,9 +4,9 @@ import os
 import time
 import zipfile
 
-from housekeeper.analyzers.archive_equivalence import run_archive_directory_analysis
-from housekeeper.analyzers.exact_duplicates import run_exact_duplicate_analysis
-from housekeeper.analyzers.normalized_content import run_normalized_content_analysis
+from housekeeper.analysers.archive_equivalence import run_archive_directory_analysis
+from housekeeper.analysers.exact_duplicates import run_exact_duplicate_analysis
+from housekeeper.analysers.normalized_content import run_normalized_content_analysis
 from housekeeper.collections.events import run_acquisition_batch_analysis
 from housekeeper.collections.record_series import run_record_series_analysis
 from housekeeper.collections.retention import apply_retention_policies
@@ -94,13 +94,13 @@ def test_acquisition_batches(config, database, tmp_path):
 
 
 def test_binary_similarity_capability_report(config, database, tmp_path):
-    from housekeeper.analyzers.binary_similarity import run_binary_similarity_analysis
+    from housekeeper.analysers.binary_similarity import run_binary_similarity_analysis
     from housekeeper.similarity.fuzzy_hashes import capabilities
 
     caps = capabilities()
     assert set(caps) == {"TLSH_AVAILABLE", "SSDEEP_AVAILABLE"}
     assert all(isinstance(v, bool) for v in caps.values())
-    # Without the optional backend enabled, the analyzer reports availability and fabricates
+    # Without the optional backend enabled, the analyser reports availability and fabricates
     # no relationships (a fuzzy match must never become an exact classification).
     result = run_binary_similarity_analysis(database, config)
     assert result["relationships"] == 0
@@ -109,7 +109,7 @@ def test_binary_similarity_capability_report(config, database, tmp_path):
 
 
 def test_binary_similarity_enabled_without_backend_is_graceful(config, database):
-    from housekeeper.analyzers.binary_similarity import run_binary_similarity_analysis
+    from housekeeper.analysers.binary_similarity import run_binary_similarity_analysis
 
     config.section("binary_similarity")["tlsh_enabled"] = True
     result = run_binary_similarity_analysis(database, config)
@@ -118,13 +118,13 @@ def test_binary_similarity_enabled_without_backend_is_graceful(config, database)
 
 
 def test_pdf_equivalence_alias_runs(config, database, tmp_path):
-    from housekeeper.analyzers.normalized_content import run_normalized_content_analysis
+    from housekeeper.analysers.normalized_content import run_normalized_content_analysis
 
     root = tmp_path / "src"
     root.mkdir()
     (root / "a.txt").write_text("x", encoding="utf-8")
     DriveScanner(database, config).scan(root, incremental=False)
-    # pdf-equivalence is handled by the normalized-content analyzer path.
+    # pdf-equivalence is handled by the normalized-content analyser path.
     assert isinstance(run_normalized_content_analysis(database, config), dict)
 
 

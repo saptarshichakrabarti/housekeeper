@@ -100,7 +100,7 @@ def run_record_series_analysis(database, config, scope=None, job_id=None) -> dic
                 series_ids[series],
                 confidence,
                 json.dumps({"suffix": row["suffix"]}),
-                "analyzer",
+                "analyser",
             )
         )
         if len(batch) >= 1000:

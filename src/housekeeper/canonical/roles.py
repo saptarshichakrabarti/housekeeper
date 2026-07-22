@@ -19,7 +19,7 @@ def _representative_entry(database, content_object_id: int) -> int | None:
 def _assign(database, group_type, group_id, role, entry_id, content_object_id, score, components):
     database.connect().execute(
         """INSERT INTO canonical_assignments(target_group_type,target_group_id,canonical_role,entry_id,content_object_id,score,score_components_json,source)
-           VALUES(?,?,?,?,?,?,?, 'analyzer')
+           VALUES(?,?,?,?,?,?,?, 'analyser')
            ON CONFLICT(target_group_type,target_group_id,canonical_role,entry_id)
            DO UPDATE SET score=excluded.score,score_components_json=excluded.score_components_json,superseded_at=NULL""",
         (

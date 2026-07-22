@@ -3,7 +3,7 @@ from difflib import SequenceMatcher
 from collections import defaultdict
 
 from ..relationships import replace_relationship_group, upsert_relationship
-from .scope import AnalyzerScope, scoped_entry_ids
+from .scope import analyserScope, scoped_entry_ids
 from ..jobs import check_cancelled, update_job
 
 
@@ -26,7 +26,7 @@ def calculate_filename_similarity(a: str, b: str) -> float:
 
 
 def run_document_version_analysis(
-    database, config, scope: AnalyzerScope | None = None, job_id: int | None = None
+    database, config, scope: analyserScope | None = None, job_id: int | None = None
 ):
     rows = database.fetch_all("""SELECT e.id,e.name,l.content_object_id FROM filesystem_entries e JOIN entry_content_links l ON l.entry_id=e.id
         WHERE e.entry_type='file' AND e.suffix IN ('.txt','.md','.doc','.docx','.pdf','.rtf') ORDER BY e.id""")

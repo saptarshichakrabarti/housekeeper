@@ -1,6 +1,6 @@
 """Preservation-risk tests: risks increase caution, never become deletion candidates."""
 
-from housekeeper.analyzers.preservation_risk import assess_entry, run_preservation_risk_analysis
+from housekeeper.analysers.preservation_risk import assess_entry, run_preservation_risk_analysis
 from housekeeper.policies import classify_all_entries
 from housekeeper.scanner import DriveScanner
 

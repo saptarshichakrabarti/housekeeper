@@ -10,12 +10,12 @@ architecture, the schema changes required, and the staged implementation plan.
 |--------|-------|-------------------|
 | Full SHA-256 (byte identity) | `hashing.compute_full_hash`, `content_objects` | Cryptographic, exact |
 | Quick hash (size + head/mid/tail sample) | `hashing.compute_quick_hash` | Candidate generation only |
-| Exact duplicate grouping | `analyzers/exact_duplicates.py` | Tier-1 exact (byte identity via content objects) |
-| Directory content overlap (verified hash sets) | `analyzers/directory_overlap.py` | Exact set overlap of Tier-1 hashes |
-| Backup lineage (shared child hashes) | `analyzers/backup_lineage.py` | Heuristic, pairwise |
-| Document version families (filename + text similarity) | `analyzers/document_versions.py` | Probabilistic (SequenceMatcher) |
-| Perceptual image similarity (8×8 average hash) | `analyzers/images.py` | Probabilistic, review-only |
-| Archive manifest hash (member path list) | `analyzers/archives.py` | Structural, not equivalence |
+| Exact duplicate grouping | `analysers/exact_duplicates.py` | Tier-1 exact (byte identity via content objects) |
+| Directory content overlap (verified hash sets) | `analysers/directory_overlap.py` | Exact set overlap of Tier-1 hashes |
+| Backup lineage (shared child hashes) | `analysers/backup_lineage.py` | Heuristic, pairwise |
+| Document version families (filename + text similarity) | `analysers/document_versions.py` | Probabilistic (SequenceMatcher) |
+| Perceptual image similarity (8×8 average hash) | `analysers/images.py` | Probabilistic, review-only |
+| Archive manifest hash (member path list) | `analysers/archives.py` | Structural, not equivalence |
 
 **Gap:** "duplicate" is effectively binary — a file is either a byte-identical member of an
 `exact_duplicate_group` or it is grouped by a single ad-hoc similarity relationship. There is
