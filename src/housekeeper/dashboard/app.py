@@ -42,7 +42,7 @@ def create_app(
     app.mount("/static", StaticFiles(directory=static_dir), name="static")
     service = DashboardService(database)
     runner = None
-    if config is not None:
+    if config is not None and not read_only:
         from .runner import OperationRunner
 
         runner = OperationRunner(config)

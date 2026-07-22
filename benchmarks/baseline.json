@@ -1,0 +1,48 @@
+{
+  "commit": "7bb5bbf",
+  "environment": {
+    "implementation": "CPython",
+    "machine": "arm64",
+    "python": "3.12.7",
+    "system": "Darwin"
+  },
+  "profiles": {
+    "large": {
+      "counts": {
+        "content_objects": 193,
+        "directories": 12,
+        "exact_duplicate_groups": 1,
+        "files": 240
+      },
+      "dir_count": 12,
+      "file_count": 240,
+      "profile": "large",
+      "seconds": 0.1719
+    },
+    "medium": {
+      "counts": {
+        "content_objects": 49,
+        "directories": 6,
+        "exact_duplicate_groups": 1,
+        "files": 60
+      },
+      "dir_count": 6,
+      "file_count": 60,
+      "profile": "medium",
+      "seconds": 0.0837
+    },
+    "small": {
+      "counts": {
+        "content_objects": 10,
+        "directories": 3,
+        "exact_duplicate_groups": 1,
+        "files": 12
+      },
+      "dir_count": 3,
+      "file_count": 12,
+      "profile": "small",
+      "seconds": 0.0753
+    }
+  },
+  "schema_version": 1
+}
