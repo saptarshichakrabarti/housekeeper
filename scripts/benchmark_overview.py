@@ -5,7 +5,7 @@ query count and wall time of the overview on both paths:
 
   * BEFORE — the old behaviour: run the metric COUNT/SUM scans and the five chart GROUP BY queries
     live against the inventory on every page load.
-  * AFTER  — the new behaviour: refresh the materialized summaries once (what a scan/analyze or the
+  * AFTER  — the new behaviour: refresh the materialized summaries once (what a scan/analyse or the
     "Refresh now" button does), then serve DashboardService.overview() from those cached rows.
 
 Usage:  python scripts/benchmark_overview.py [N]   (default N=300_000)
@@ -77,7 +77,7 @@ def _seed(database: Database, n: int) -> None:
         "INSERT INTO classifications(entry_id,classification) SELECT id, CASE WHEN id%10=0 THEN 'PROTECTED' ELSE 'REVIEW_SAFE' END FROM filesystem_entries WHERE id%2=0"
     )
     c.commit()
-    database.optimize_after_write(analyze=True)
+    database.optimize_after_write(analyse=True)
 
 
 def _time_before(database: Database) -> tuple[int, float]:

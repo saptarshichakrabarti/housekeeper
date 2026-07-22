@@ -1,1 +1,1 @@
-"""Compatibility placeholder for optional analyzer value objects."""
+"""Compatibility placeholder for optional analyser value objects."""

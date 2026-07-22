@@ -1,16 +1,16 @@
 # Format-Aware Equivalence
 
-This is the operational summary of the format-aware equivalence analyzer
-(`analyzers/normalized_content.py`). See `normalization_profiles.md` for what each profile
+This is the operational summary of the format-aware equivalence analyser
+(`analysers/normalized_content.py`). See `normalization_profiles.md` for what each profile
 discards and `duplicate_taxonomy.md` for evidence tiers.
 
 ## How it runs
 
 ```
-housekeeper analyze normalized-content        # all supported formats
-housekeeper analyze image-equivalence         # aliases (same analysis, format-scoped by suffix)
-housekeeper analyze office-equivalence
-housekeeper analyze archive-equivalence
+housekeeper analyse normalized-content        # all supported formats
+housekeeper analyse image-equivalence         # aliases (same analysis, format-scoped by suffix)
+housekeeper analyse office-equivalence
+housekeeper analyse archive-equivalence
 ```
 
 Pipeline: ensure every supported-suffix file has a verified content object → normalize each

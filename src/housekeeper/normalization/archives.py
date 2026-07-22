@@ -14,7 +14,7 @@ import tarfile
 import zipfile
 from pathlib import Path
 
-from ..analyzers.archives import detect_archive_kind, normalize_archive_member_path
+from ..analysers.archives import detect_archive_kind, normalize_archive_member_path
 from .model import NormalizationProfile, NormalizedArtifact
 
 # Beyond this declared uncompressed size the content multiset is not computed (kept bounded).

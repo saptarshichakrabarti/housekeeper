@@ -1,4 +1,4 @@
-"""Typed analyzer registry and content-level, versioned artifact execution."""
+"""Typed analyser registry and content-level, versioned artifact execution."""
 
 from dataclasses import dataclass
 import gzip
@@ -21,7 +21,7 @@ from .media import extract_basic_media_metadata
 
 
 @dataclass(frozen=True)
-class AnalyzerSpec:
+class analyserSpec:
     name: str
     version: str
     suffixes: frozenset[str]
@@ -30,7 +30,7 @@ class AnalyzerSpec:
 
 
 REGISTRY = (
-    AnalyzerSpec(
+    analyserSpec(
         "documents",
         "2",
         frozenset(
@@ -38,16 +38,16 @@ REGISTRY = (
         ),
         lambda p, c: extract_document(p, p.suffix, c),
     ),
-    AnalyzerSpec(
+    analyserSpec(
         "archives", "1", frozenset({".zip", ".tar", ".gz", ".tgz", ".bz2", ".xz"}), inspect_archive
     ),
-    AnalyzerSpec(
+    analyserSpec(
         "images",
         "1",
         frozenset({".jpg", ".jpeg", ".png", ".gif", ".webp", ".tiff", ".bmp"}),
         extract_image_metadata,
     ),
-    AnalyzerSpec(
+    analyserSpec(
         "media",
         "1",
         frozenset({".mp3", ".wav", ".flac", ".m4a", ".ogg", ".mp4", ".mov", ".mkv", ".avi"}),
@@ -56,7 +56,7 @@ REGISTRY = (
 )
 
 
-def specs() -> tuple[AnalyzerSpec, ...]:
+def specs() -> tuple[analyserSpec, ...]:
     return REGISTRY
 
 
@@ -98,7 +98,7 @@ def load_text_blob(database: Database, blob_id: int, maximum_characters: int = 5
 def _run_content_analysis(
     database: Database,
     config: AppConfig,
-    analyzer_name: str | None = None,
+    analyser_name: str | None = None,
     under: str | None = None,
     changed_only: bool = False,
     source_id: int | None = None,
@@ -115,11 +115,11 @@ def _run_content_analysis(
     only_duplicate_candidates: bool = False,
     job_id: int | None = None,
 ) -> dict[str, int]:
-    """Analyze each eligible content object once and make parser failures explicit."""
-    wanted = [x for x in REGISTRY if analyzer_name in (None, "all", x.name)]
+    """analyse each eligible content object once and make parser failures explicit."""
+    wanted = [x for x in REGISTRY if analyser_name in (None, "all", x.name)]
     counts = {"completed": 0, "skipped": 0, "errors": 0, "hashed": 0}
     # Establish content identity before parser selection.  An all-analysis pass therefore
-    # covers every regular file, while a narrow analyzer only hashes its eligible suffixes.
+    # covers every regular file, while a narrow analyser only hashes its eligible suffixes.
     suffixes = set().union(*(spec.suffixes for spec in wanted)) if wanted else set()
     source_path = None
     if source_id is not None:
@@ -171,7 +171,7 @@ def _run_content_analysis(
     eligible = (
         dict(entry)
         for entry in candidates
-        if (analyzer_name in (None, "all") or entry["suffix"] in suffixes) and in_scope(entry)
+        if (analyser_name in (None, "all") or entry["suffix"] in suffixes) and in_scope(entry)
     )
 
     def hash_entry(entry: dict[str, Any]):
@@ -353,7 +353,7 @@ def _run_content_analysis(
                 if spec.name == "documents" and result.get("normalized_text"):
                     text_id = _store_text(database, row["id"], result["normalized_text"], config)
                 database.connect().execute(
-                    """INSERT OR REPLACE INTO analysis_artifacts(content_object_id,analyzer_name,analyzer_version,configuration_fingerprint,status,started_at,completed_at,artifact_json,text_blob_id,error_code,error_message)
+                    """INSERT OR REPLACE INTO analysis_artifacts(content_object_id,analyser_name,analyser_version,configuration_fingerprint,status,started_at,completed_at,artifact_json,text_blob_id,error_code,error_message)
                     VALUES(?,?,?,?,?,CURRENT_TIMESTAMP,CURRENT_TIMESTAMP,?,?,?,?)""",
                     (
                         row["id"],
@@ -382,14 +382,14 @@ def _run_content_analysis(
                     )
             except Exception as exc:  # parser errors are protected artifacts, never recommendations
                 database.connect().execute(
-                    "INSERT OR REPLACE INTO analysis_artifacts(content_object_id,analyzer_name,analyzer_version,configuration_fingerprint,status,completed_at,error_code,error_message) VALUES(?,?,?,?,?,CURRENT_TIMESTAMP,?,?)",
+                    "INSERT OR REPLACE INTO analysis_artifacts(content_object_id,analyser_name,analyser_version,configuration_fingerprint,status,completed_at,error_code,error_message) VALUES(?,?,?,?,?,CURRENT_TIMESTAMP,?,?)",
                     (
                         row["id"],
                         spec.name,
                         spec.version,
                         fingerprint,
                         "ERROR",
-                        "ANALYZER_EXCEPTION",
+                        "analyseR_EXCEPTION",
                         str(exc),
                     ),
                 )
@@ -401,7 +401,7 @@ def _run_content_analysis(
 def run_content_analysis(
     database: Database,
     config: AppConfig,
-    analyzer_name: str | None = None,
+    analyser_name: str | None = None,
     under: str | None = None,
     changed_only: bool = False,
     source_id: int | None = None,
@@ -426,9 +426,9 @@ def run_content_analysis(
     }
     managed_job_id = job_id or create_job(
         database,
-        job_types.get(analyzer_name or "", "CONTENT_ANALYSIS"),
+        job_types.get(analyser_name or "", "CONTENT_ANALYSIS"),
         {
-            "analyzer": analyzer_name or "all",
+            "analyser": analyser_name or "all",
             "under": under,
             "changed_only": changed_only,
             "source_id": source_id,
@@ -442,7 +442,7 @@ def run_content_analysis(
         counts = _run_content_analysis(
             database,
             config,
-            analyzer_name,
+            analyser_name,
             under,
             changed_only,
             source_id,

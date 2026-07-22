@@ -10,7 +10,7 @@ from .view_models import Chart, Metric, OverviewViewModel, ReviewRow
 
 # In-process safety net on top of the materialized summaries: even a burst of concurrent loads
 # recomputes the view model at most once every TTL. The summaries themselves only change on a
-# scan/analyze or an explicit "Refresh now", so this is generous.
+# scan/analyse or an explicit "Refresh now", so this is generous.
 OVERVIEW_TTL_SECONDS = 45.0
 
 # Materialized chart key -> the title the overview template keys its bar rendering off of.
@@ -19,7 +19,7 @@ _CHART_TITLES = {
     "classification_bytes": "Classification bytes",
     "top_level": "Top-level directories",
     "scan_history": "Scan history",
-    "analyzer_completion": "Analyzer completion",
+    "analyser_completion": "analyser completion",
 }
 
 
@@ -52,7 +52,7 @@ class DashboardService:
     def _build_overview(self) -> OverviewViewModel:
         # Served entirely from materialized_summaries + one tiny live jobs count — no full-table
         # scan runs on a normal page load regardless of inventory size. The summaries are refreshed
-        # at the end of every scan/analyze and on demand via "Refresh now".
+        # at the end of every scan/analyse and on demand via "Refresh now".
         overview, refreshed_at = self._summary("overview")
         classifications, _ = self._summary("classifications")
         charts_data, _ = self._summary("charts")

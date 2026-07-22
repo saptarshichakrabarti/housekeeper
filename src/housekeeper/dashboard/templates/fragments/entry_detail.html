@@ -8,7 +8,7 @@
     <dt>Hash status</dt><dd>{{ entry.hash_status or '' }}</dd>
   </dl>
   <h3>Analysis artifacts</h3>
-  <ul>{% for artifact in artifacts %}<li>{{ artifact.analyzer_name }} {{ artifact.status }} — {{ artifact.completed_at | relativetime }}</li>{% else %}<li>No analysis artifacts yet{% if has_run_page %} — run an analyzer from the <a href="/control">Run page</a>{% endif %}.</li>{% endfor %}</ul>
+  <ul>{% for artifact in artifacts %}<li>{{ artifact.analyser_name }} {{ artifact.status }} — {{ artifact.completed_at | relativetime }}</li>{% else %}<li>No analysis artifacts yet{% if has_run_page %} — run an analyser from the <a href="/control">Run page</a>{% endif %}.</li>{% endfor %}</ul>
   <form data-review-decision-form hx-post="/fragments/review/decision" hx-target="#detail-drawer">
     <input type="hidden" name="entry_id" value="{{ entry.id }}">
     <label>Session <input type="number" name="session_id" min="1" required></label>

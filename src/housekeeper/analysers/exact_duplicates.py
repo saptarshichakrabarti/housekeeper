@@ -7,10 +7,10 @@ from ..database import Database
 from ..hashing import compute_full_hash
 from ..relationships import invalidate_relationships, upsert_relationship
 from ..jobs import check_cancelled, update_job
-from .scope import AnalyzerScope, scoped_entry_ids
+from .scope import analyserScope, scoped_entry_ids
 
-ANALYZER_NAME = "exact_duplicates"
-ANALYZER_VERSION = "3"
+analyseR_NAME = "exact_duplicates"
+analyseR_VERSION = "3"
 
 
 def _ensure_candidate_links(
@@ -86,7 +86,7 @@ def run_exact_duplicate_analysis(
     database: Database,
     config: AppConfig,
     job_id: int | None = None,
-    scope: AnalyzerScope | None = None,
+    scope: analyserScope | None = None,
 ) -> None:
     """Create duplicate groups directly from verified content-object links."""
     allowed_entry_ids = scoped_entry_ids(database, scope) if scope else None

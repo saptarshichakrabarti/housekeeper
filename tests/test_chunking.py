@@ -2,7 +2,7 @@
 
 import random
 
-from housekeeper.analyzers.content_defined_chunks import (
+from housekeeper.analysers.content_defined_chunks import (
     run_chunk_analysis,
     run_chunk_overlap_analysis,
 )

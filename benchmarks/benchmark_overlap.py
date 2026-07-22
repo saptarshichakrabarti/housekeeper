@@ -2,7 +2,7 @@ import argparse
 from pathlib import Path
 from housekeeper.config import load_config
 from housekeeper.database import Database
-from housekeeper.analyzers.directory_overlap import run_directory_overlap_analysis
+from housekeeper.analysers.directory_overlap import run_directory_overlap_analysis
 
 parser = argparse.ArgumentParser()
 parser.add_argument("database", type=Path)

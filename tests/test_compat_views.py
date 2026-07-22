@@ -8,10 +8,10 @@ names. These tests assert the views exist, are genuinely views (never shadow a b
 return the expected rows once analysis has run.
 """
 
-from housekeeper.analyzers.directory_overlap import run_directory_overlap_analysis
-from housekeeper.analyzers.document_versions import run_document_version_analysis
-from housekeeper.analyzers.documents import run_document_analysis
-from housekeeper.analyzers.exact_duplicates import run_exact_duplicate_analysis
+from housekeeper.analysers.directory_overlap import run_directory_overlap_analysis
+from housekeeper.analysers.document_versions import run_document_version_analysis
+from housekeeper.analysers.documents import run_document_analysis
+from housekeeper.analysers.exact_duplicates import run_exact_duplicate_analysis
 from housekeeper.scanner import DriveScanner
 
 COMPAT_VIEWS = [

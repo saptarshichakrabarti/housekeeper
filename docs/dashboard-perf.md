@@ -13,10 +13,10 @@ moving data or writing from a read surface.
    control operations, and reconciles jobs.
 2. **Tuned read connections.** Each read connection sets `mmap_size=256MB`, `cache_size=-65536`
    (64MB), `temp_store=MEMORY`. After a large write job (`Database.optimize_after_write`) the DB
-   runs `PRAGMA optimize` + `wal_checkpoint(TRUNCATE)`, and `ANALYZE` once after the first scan so
+   runs `PRAGMA optimize` + `wal_checkpoint(TRUNCATE)`, and `analyse` once after the first scan so
    the planner has statistics and the WAL a scan leaves behind never slows later reads.
 3. **Materialized overview.** The overview is served from `materialized_summaries`
-   (metric counts + the five chart aggregates), refreshed at the end of every scan/analyze and via
+   (metric counts + the five chart aggregates), refreshed at the end of every scan/analyse and via
    a CSRF-guarded **Refresh now** button. A 45s in-process TTL cache sits on top. The three
    `database_stats` COUNTs are folded in too, so a normal load counts nothing live.
 4. **Hot-path indexes** (`idx_review_decisions_target`, `idx_dupe_members_entry`,
@@ -41,7 +41,7 @@ The "before" path runs 9 metric COUNT/SUM scans + 5 chart `GROUP BY` scans over 
 against `materialized_summaries` plus one indexed `jobs` count — bounded regardless of inventory
 size. Extrapolating linearly, a 1.5M-entry / ~1.9 GB inventory is ≈3× the "before" scan cost
 (~2 s per load) while the "after" cost stays flat. The one-time refresh that recomputes the
-summaries is paid at the end of a scan/analyze (or on explicit **Refresh now**), off the page-load
+summaries is paid at the end of a scan/analyse (or on explicit **Refresh now**), off the page-load
 path.
 
 Reproduce: `python scripts/benchmark_overview.py [N]` (default N=300,000).

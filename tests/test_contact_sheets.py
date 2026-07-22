@@ -11,12 +11,12 @@ import pytest
 
 pytest.importorskip("PIL")
 
-from housekeeper.analyzers.contact_sheets import (  # noqa: E402
+from housekeeper.analysers.contact_sheets import (  # noqa: E402
     contact_sheet_path,
     run_contact_sheet_generation,
 )
-from housekeeper.analyzers.images import run_image_analysis  # noqa: E402
-from housekeeper.analyzers.registry import run_content_analysis  # noqa: E402
+from housekeeper.analysers.images import run_image_analysis  # noqa: E402
+from housekeeper.analysers.registry import run_content_analysis  # noqa: E402
 from housekeeper.scanner import DriveScanner  # noqa: E402
 
 

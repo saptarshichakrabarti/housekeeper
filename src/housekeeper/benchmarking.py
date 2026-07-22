@@ -86,8 +86,8 @@ def _build_corpus(root: Path, file_count: int, dir_count: int) -> None:
 def run_profile(workspace_root: Path, name: str, file_count: int, dir_count: int) -> dict:
     """Build one profile's corpus, run scan + exact-duplicate + directory-overlap, and return its
     deterministic counts alongside the wall-clock time on this runner."""
-    from .analyzers.directory_overlap import run_directory_overlap_analysis
-    from .analyzers.exact_duplicates import run_exact_duplicate_analysis
+    from .analysers.directory_overlap import run_directory_overlap_analysis
+    from .analysers.exact_duplicates import run_exact_duplicate_analysis
     from .config import load_config
     from .database import Database
     from .scanner import DriveScanner

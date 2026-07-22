@@ -11,7 +11,7 @@ def test_content_identity_and_analysis_current(tmp_path):
     assert first == second
     assert not db.is_analysis_current(first, "documents", "1", "cfg")
     db.connect().execute(
-        "INSERT INTO analysis_artifacts(content_object_id,analyzer_name,analyzer_version,configuration_fingerprint,status) VALUES(?,?,?,?,?)",
+        "INSERT INTO analysis_artifacts(content_object_id,analyser_name,analyser_version,configuration_fingerprint,status) VALUES(?,?,?,?,?)",
         (first, "documents", "1", "cfg", "COMPLETED"),
     )
     db.connect().commit()
@@ -72,7 +72,7 @@ def test_bounded_xlsx_extraction(tmp_path):
 
     pytest.importorskip("openpyxl")
     from openpyxl import Workbook
-    from housekeeper.analyzers.documents import extract_document
+    from housekeeper.analysers.documents import extract_document
     from housekeeper.config import load_config
 
     path = tmp_path / "sheet.xlsx"
@@ -86,7 +86,7 @@ def test_bounded_xlsx_extraction(tmp_path):
 
 def test_archive_path_traversal_is_error(tmp_path):
     import zipfile
-    from housekeeper.analyzers.archives import inspect_archive
+    from housekeeper.analysers.archives import inspect_archive
     from housekeeper.config import load_config
 
     path = tmp_path / "unsafe.zip"
@@ -97,7 +97,7 @@ def test_archive_path_traversal_is_error(tmp_path):
 
 
 def test_incremental_scan_reuses_verified_content_and_full_analysis_hashes_inventory(tmp_path):
-    from housekeeper.analyzers.registry import run_content_analysis
+    from housekeeper.analysers.registry import run_content_analysis
     from housekeeper.config import load_config
     from housekeeper.scanner import DriveScanner
 
@@ -124,7 +124,7 @@ def test_incremental_scan_reuses_verified_content_and_full_analysis_hashes_inven
 
 def test_duplicate_movement_refuses_last_verified_copy(tmp_path):
     import pytest
-    from housekeeper.analyzers.exact_duplicates import run_exact_duplicate_analysis
+    from housekeeper.analysers.exact_duplicates import run_exact_duplicate_analysis
     from housekeeper.config import load_config
     from housekeeper.models import ManifestEntry
     from housekeeper.review_mover import move_approved_entries

@@ -23,7 +23,7 @@ def test_full_read_only_workflow(tmp_path, capsys):
     root = _source(tmp_path)
     assert main([*ws, "init-workspace"]) == 0
     assert main([*ws, "scan", str(root)]) == 0
-    assert main([*ws, "analyze", "all"]) == 0
+    assert main([*ws, "analyse", "all"]) == 0
     assert main([*ws, "classify"]) == 0
     assert main([*ws, "report", "all"]) == 0
     assert main([*ws, "stats"]) == 0
@@ -37,7 +37,7 @@ def test_export_validate_and_move_dry_run(tmp_path):
     ws = _ws(tmp_path)
     root = _source(tmp_path)
     main([*ws, "scan", str(root)])
-    main([*ws, "analyze", "exact-duplicates"])
+    main([*ws, "analyse", "exact-duplicates"])
     main([*ws, "classify"])
     manifest = tmp_path / "review.csv"
     assert main([*ws, "export-review", "--output", str(manifest)]) == 0
@@ -86,17 +86,17 @@ def test_diff_reports_changes(tmp_path):
     assert main([*scans, "diff", "1", "2"]) == 0
 
 
-def test_analyze_all_runs_advanced_analyzers(tmp_path):
+def test_analyse_all_runs_advanced_analysers(tmp_path):
     from housekeeper.config import load_config
     from housekeeper.database import Database
 
     ws = _ws(tmp_path)
     root = _source(tmp_path)
     main([*ws, "scan", str(root)])
-    assert main([*ws, "analyze", "all"]) == 0
+    assert main([*ws, "analyse", "all"]) == 0
     assert main([*ws, "classify"]) == 0
     db = Database(load_config(workspace_override=tmp_path / "ws").database_path)
-    # analyze all + classify populate the advanced tables.
+    # analyse all + classify populate the advanced tables.
     assert db.fetch_one("SELECT COUNT(*) n FROM collection_clusters")["n"] >= 1
     assert db.fetch_one("SELECT COUNT(*) n FROM record_series_assignments")["n"] >= 1
     assert db.fetch_one("SELECT COUNT(*) n FROM review_priority")["n"] >= 1
@@ -107,7 +107,7 @@ def test_collections_retention_and_known_cli(tmp_path):
     ws = _ws(tmp_path)
     root = _source(tmp_path)
     main([*ws, "scan", str(root)])
-    main([*ws, "analyze", "record-series"])
+    main([*ws, "analyse", "record-series"])
     assert main([*ws, "collections", "retention"]) == 0
     assert main([*ws, "known", "assert", "KNOWN_INSTALLER", "PATH_PATTERN", "setup"]) == 0
     assert main([*ws, "known", "list"]) == 0

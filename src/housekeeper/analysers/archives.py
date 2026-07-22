@@ -78,7 +78,7 @@ def inspect_archive(path: Path, config):
             "archive_kind": detect_archive_kind(path),
             "member_count": len(names),
             "manifest_hash": hashlib.sha256("\n".join(names).encode()).hexdigest(),
-            # Nested archives are reported as inventory only.  This analyzer never opens
+            # Nested archives are reported as inventory only.  This analyser never opens
             # them recursively, avoiding decompression bombs and path traversal chains.
             "nested_archive_count": sum(
                 1

@@ -1,4 +1,4 @@
-"""Cooperative pause/cancel is now honored by every analyzer, including ones that previously ran
+"""Cooperative pause/cancel is now honored by every analyser, including ones that previously ran
 to completion regardless of a control request.
 
 The ``checkpoint`` helper is the single cooperative point: it honors a pending pause/cancel and
@@ -9,8 +9,8 @@ before this change) both stop at their next checkpoint when paused or cancelled.
 
 import pytest
 
-from housekeeper.analyzers.directory_overlap import run_directory_overlap_analysis
-from housekeeper.analyzers.exact_duplicates import run_exact_duplicate_analysis
+from housekeeper.analysers.directory_overlap import run_directory_overlap_analysis
+from housekeeper.analysers.exact_duplicates import run_exact_duplicate_analysis
 from housekeeper.collections.events import run_acquisition_batch_analysis
 from housekeeper.jobs import (
     JobCancelled,
@@ -29,7 +29,7 @@ def _status(database, job_id):
 
 
 def test_checkpoint_is_noop_without_job(database):
-    # No job -> no error and nothing recorded; analyzers stay directly callable outside a job.
+    # No job -> no error and nothing recorded; analysers stay directly callable outside a job.
     checkpoint(database, None, processed_count=5)
 
 
@@ -76,8 +76,8 @@ def test_directory_overlap_honors_pause(config, database, tmp_path):
     assert _status(database, job_id) == "PAUSED"
 
 
-def test_collection_analyzer_honors_cancel(config, database, tmp_path):
-    # A collections analyzer that had no job_id before this change now honors cancellation.
+def test_collection_analyser_honors_cancel(config, database, tmp_path):
+    # A collections analyser that had no job_id before this change now honors cancellation.
     root = tmp_path / "src"
     root.mkdir()
     (root / "download0.bin").write_bytes(b"a")
@@ -91,8 +91,8 @@ def test_collection_analyzer_honors_cancel(config, database, tmp_path):
     assert _status(database, job_id) == "CANCELLED"
 
 
-def test_analyzers_still_run_without_a_job(config, database, tmp_path):
-    # The job_id path is optional: the same analyzers complete normally when called without one.
+def test_analysers_still_run_without_a_job(config, database, tmp_path):
+    # The job_id path is optional: the same analysers complete normally when called without one.
     _two_overlapping_dirs(config, database, tmp_path)
     run_directory_overlap_analysis(database, config)  # no job_id
     result = run_acquisition_batch_analysis(database, config)  # no job_id

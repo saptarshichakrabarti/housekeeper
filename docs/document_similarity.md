@@ -14,12 +14,12 @@ The whole path is dependency-free (standard-library hashing only) and determinis
 
 ## The pipeline
 
-Orchestrated by `src/housekeeper/analyzers/document_minhash.py`
+Orchestrated by `src/housekeeper/analysers/document_minhash.py`
 (`run_document_minhash_analysis`), over documents with suffixes
 `.txt .md .csv .rst .log .docx .pdf`:
 
 1. **Ensure text.** Document content objects are hashed if needed, then normalized text is
-   extracted via `analyzers/documents.extract_document` (the same normalization used elsewhere).
+   extracted via `analysers/documents.extract_document` (the same normalization used elsewhere).
 2. **Tokenize** (`similarity/shingling.py`). Text is NFKC-normalized, casefolded, and split into
    `\w+` tokens. Documents with fewer than `minimum_tokens` (default 20) tokens are **skipped** —
    too little text to judge similarity honestly.
@@ -49,7 +49,7 @@ Orchestrated by `src/housekeeper/analyzers/document_minhash.py`
 
 | Key                     | Default | Meaning                                                        |
 |-------------------------|---------|----------------------------------------------------------------|
-| `enabled`               | `true`  | Master switch for the analyzer.                                |
+| `enabled`               | `true`  | Master switch for the analyser.                                |
 | `shingle_type`          | `word`  | Shingling unit.                                                |
 | `shingle_size`          | `5`     | Words per shingle.                                             |
 | `minhash_permutations`  | `128`   | Signature length; higher = tighter Jaccard estimate, more cost.|

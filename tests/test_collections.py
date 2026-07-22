@@ -1,6 +1,6 @@
 """Backup marginal value, removal simulation, and record-series tests."""
 
-from housekeeper.analyzers.exact_duplicates import run_exact_duplicate_analysis
+from housekeeper.analysers.exact_duplicates import run_exact_duplicate_analysis
 from housekeeper.collections.marginal_value import run_backup_value_analysis, simulate_removal
 from housekeeper.collections.record_series import classify_series, run_record_series_analysis
 from housekeeper.scanner import DriveScanner

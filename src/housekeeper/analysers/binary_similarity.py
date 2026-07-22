@@ -1,4 +1,4 @@
-"""Binary fuzzy-similarity analyzer (TLSH / ssdeep), capability-gated and bucketed.
+"""Binary fuzzy-similarity analyser (TLSH / ssdeep), capability-gated and bucketed.
 
 Optional: if neither backend is installed it reports availability and does nothing (never an
 error). When available, digests are bucketed by detected type + size band (never all-pairs), and

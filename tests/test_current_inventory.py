@@ -8,8 +8,8 @@ the GUI runner and the CLI, while genuine same-snapshot duplicates are still det
 
 import time
 
-from housekeeper.analyzers.exact_duplicates import run_exact_duplicate_analysis
-from housekeeper.analyzers.scope import AnalyzerScope
+from housekeeper.analysers.exact_duplicates import run_exact_duplicate_analysis
+from housekeeper.analysers.scope import analyserScope
 from housekeeper.cli import main
 from housekeeper.dashboard.runner import OperationRunner
 from housekeeper.database import Database
@@ -38,7 +38,7 @@ def _current_classifications(database):
 
 
 def test_runner_rescans_leave_unique_files_keep(config, tmp_path):
-    """Two GUI scans of a unique-only drive + standalone analyze/classify: nothing goes REVIEW_*."""
+    """Two GUI scans of a unique-only drive + standalone analyse/classify: nothing goes REVIEW_*."""
     root = tmp_path / "drive"
     root.mkdir()
     for i in range(4):
@@ -48,7 +48,7 @@ def test_runner_rescans_leave_unique_files_keep(config, tmp_path):
     for _ in range(2):
         assert runner.submit("quickstart", source=str(root)) == "accepted"
         _wait_idle(runner)
-    assert runner.submit("analyze", kind="exact-duplicates") == "accepted"
+    assert runner.submit("analyse", kind="exact-duplicates") == "accepted"
     _wait_idle(runner)
     assert runner.submit("classify") == "accepted"
     _wait_idle(runner)
@@ -64,7 +64,7 @@ def test_runner_rescans_leave_unique_files_keep(config, tmp_path):
 
 
 def test_cli_rescans_leave_unique_files_keep(config, tmp_path):
-    """Same invariant via the CLI: scan twice, then unscoped analyze/classify keeps uniques KEEP."""
+    """Same invariant via the CLI: scan twice, then unscoped analyse/classify keeps uniques KEEP."""
     ws = ["--workspace", str(config.workspace)]
     root = tmp_path / "drive"
     root.mkdir()
@@ -73,7 +73,7 @@ def test_cli_rescans_leave_unique_files_keep(config, tmp_path):
 
     assert main([*ws, "scan", str(root)]) == 0
     assert main([*ws, "scan", str(root)]) == 0
-    assert main([*ws, "analyze", "exact-duplicates"]) == 0
+    assert main([*ws, "analyse", "exact-duplicates"]) == 0
     assert main([*ws, "classify"]) == 0
 
     db = Database(config.database_path)
@@ -97,7 +97,7 @@ def test_genuine_duplicates_still_detected_under_current_inventory(config, datab
     (root / "unique.bin").write_bytes(b"different")
     DriveScanner(database, config).scan(root, incremental=False)
 
-    run_exact_duplicate_analysis(database, config, scope=AnalyzerScope(current_inventory=True))
+    run_exact_duplicate_analysis(database, config, scope=analyserScope(current_inventory=True))
     groups = database.fetch_all("SELECT * FROM exact_duplicate_groups")
     assert len(groups) == 1
     assert groups[0]["member_count"] == 2

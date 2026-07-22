@@ -18,7 +18,7 @@ Beyond the bounded explorer tables, three GET-only detail views present richer f
   modified-gap evidence surfaced. Labeled as contextual inference, never proof.
 - **Image group detail** (`/images/<group id>`, linked from the Images explorer): the members of an
   `IMAGE_SIMILARITY` group with dimensions and representative paths, and the group's contact sheet
-  (montage) when `housekeeper analyze contact-sheets` has rendered one. Contact-sheet JPEGs are
+  (montage) when `housekeeper analyse contact-sheets` has rendered one. Contact-sheet JPEGs are
   served from the workspace by validated integer id only; if none exists the page says how to
   generate it.
 

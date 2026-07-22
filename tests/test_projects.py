@@ -1,6 +1,6 @@
 """Project detection: kinds, reproducibility signals, storage breakdown, .git protection."""
 
-from housekeeper.analyzers.projects import (
+from housekeeper.analysers.projects import (
     calculate_project_storage_breakdown,
     classify_project_kind,
     detect_reproducibility_signals,

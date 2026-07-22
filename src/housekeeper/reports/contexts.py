@@ -162,8 +162,8 @@ def build_errors_context(database, config) -> dict:
         "SELECT relative_path,read_error FROM filesystem_entries WHERE scan_status='ERROR' LIMIT 500"
     )
     parser_errors = database.fetch_all(
-        """SELECT a.analyzer_name,a.error_code,a.error_message,COUNT(*) n FROM analysis_artifacts a
-           WHERE a.status IN ('ERROR','UNSUPPORTED') GROUP BY a.analyzer_name,a.error_code ORDER BY n DESC LIMIT 200"""
+        """SELECT a.analyser_name,a.error_code,a.error_message,COUNT(*) n FROM analysis_artifacts a
+           WHERE a.status IN ('ERROR','UNSUPPORTED') GROUP BY a.analyser_name,a.error_code ORDER BY n DESC LIMIT 200"""
     )
     return {"title": "Errors", "scan_errors": scan_errors, "parser_errors": parser_errors}
 

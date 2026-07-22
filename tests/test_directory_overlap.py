@@ -1,12 +1,12 @@
 """Directory-overlap tests: pure containment/jaccard maths and integration containment."""
 
-from housekeeper.analyzers.directory_overlap import (
+from housekeeper.analysers.directory_overlap import (
     calculate_containment,
     calculate_jaccard,
     generate_candidate_directory_pairs,
     run_directory_overlap_analysis,
 )
-from housekeeper.analyzers.exact_duplicates import run_exact_duplicate_analysis
+from housekeeper.analysers.exact_duplicates import run_exact_duplicate_analysis
 from housekeeper.scanner import DriveScanner
 
 

@@ -1,4 +1,4 @@
-"""Content-defined chunking analyzer: partial-content overlap (Tier-4).
+"""Content-defined chunking analyser: partial-content overlap (Tier-4).
 
 Selective and opt-in: only content objects at/above ``chunking.minimum_file_size_bytes`` are
 chunked. Candidate pairs come from an inverted chunk index (never all-pairs). Overlap produces

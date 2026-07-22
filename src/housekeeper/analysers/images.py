@@ -1,6 +1,6 @@
 from pathlib import Path
 from collections import defaultdict
-from .scope import AnalyzerScope, scoped_entry_ids
+from .scope import analyserScope, scoped_entry_ids
 from ..jobs import check_cancelled, update_job
 
 
@@ -52,13 +52,13 @@ def create_thumbnail(path: Path, content_object_id: int, config) -> str | None:
 
 
 def run_image_analysis(
-    database, config, scope: AnalyzerScope | None = None, job_id: int | None = None
+    database, config, scope: analyserScope | None = None, job_id: int | None = None
 ):
     import json
     from ..relationships import replace_relationship_group, upsert_relationship
 
     rows = database.fetch_all(
-        "SELECT id,content_object_id,artifact_json FROM analysis_artifacts WHERE analyzer_name='images' AND status='COMPLETED'"
+        "SELECT id,content_object_id,artifact_json FROM analysis_artifacts WHERE analyser_name='images' AND status='COMPLETED'"
     )
     if scope:
         entry_ids = scoped_entry_ids(database, scope)

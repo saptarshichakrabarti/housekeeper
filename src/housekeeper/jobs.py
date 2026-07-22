@@ -172,11 +172,11 @@ def checkpoint(
     current_item: str | None = None,
     state: dict[str, Any] | None = None,
 ) -> None:
-    """One cooperative checkpoint for an analyzer loop.
+    """One cooperative checkpoint for an analyser loop.
 
     Honors any pending pause/cancel request (raising ``JobPaused`` / ``JobCancelled`` so the
     tracked job settles into a resumable terminal state), then records progress telemetry. A no-op
-    when ``job_id`` is ``None`` so every analyzer remains directly callable outside a job. Resume is
+    when ``job_id`` is ``None`` so every analyser remains directly callable outside a job. Resume is
     idempotent re-run rather than seek-to-offset, so the recorded ``state`` is progress telemetry,
     not a mandatory resume cursor.
     """

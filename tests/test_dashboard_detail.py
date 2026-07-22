@@ -110,7 +110,7 @@ def test_image_group_detail_without_sheet(client):
     response = client.get("/images/1")
     assert response.status_code == 200
     assert "abcd1234" in response.text
-    assert "analyze contact-sheets" in response.text  # hint when no sheet rendered
+    assert "analyse contact-sheets" in response.text  # hint when no sheet rendered
     assert client.get("/images/999").status_code == 404
     assert client.get("/contact-sheets/1.jpg").status_code == 404
 

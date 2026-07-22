@@ -45,11 +45,11 @@ def scanned(config, database, fixture_root):
     return database, config, fixture_root
 
 
-def analyze_and_classify(database, config):
+def analyse_and_classify(database, config):
     """Run the full analysis + classification pipeline used by several integration tests."""
-    from housekeeper.analyzers.exact_duplicates import run_exact_duplicate_analysis
-    from housekeeper.analyzers.projects import run_project_analysis
-    from housekeeper.analyzers.registry import run_content_analysis
+    from housekeeper.analysers.exact_duplicates import run_exact_duplicate_analysis
+    from housekeeper.analysers.projects import run_project_analysis
+    from housekeeper.analysers.registry import run_content_analysis
     from housekeeper.policies import classify_all_entries
 
     run_exact_duplicate_analysis(database, config)

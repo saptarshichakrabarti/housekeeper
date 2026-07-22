@@ -55,5 +55,5 @@ EXIF *presence* (never GPS coordinates) are recorded.
 ## Configuration
 
 `normalization.*` (see `config/default.yaml`). Equivalence analysis is opt-in via
-`housekeeper analyze normalized-content` (or the `image/office/archive-equivalence` aliases)
+`housekeeper analyse normalized-content` (or the `image/office/archive-equivalence` aliases)
 and supports the standard scope filters.

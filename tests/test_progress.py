@@ -1,5 +1,5 @@
 """Progress reporting: derivation helpers (core/progress.py), total_estimate wiring across
-analyzers, GUI progress-cell rendering, and the CLI status-line formatter. All of these read the
+analysers, GUI progress-cell rendering, and the CLI status-line formatter. All of these read the
 same ``jobs`` rows, so the GUI and the CLI can never disagree about a job's progress.
 """
 
@@ -49,7 +49,7 @@ def test_update_job_persists_and_revises_total_estimate(database):
 
 
 def test_exact_duplicate_analysis_sets_total_estimate(config, database, tmp_path):
-    from housekeeper.analyzers.exact_duplicates import run_exact_duplicate_analysis
+    from housekeeper.analysers.exact_duplicates import run_exact_duplicate_analysis
     from housekeeper.scanner import DriveScanner
 
     root = tmp_path / "src"

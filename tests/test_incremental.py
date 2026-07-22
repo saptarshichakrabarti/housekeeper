@@ -106,7 +106,7 @@ def test_content_analysis_reused_after_unchanged_rescan(config, database, tmp_pa
     root = tmp_path / "src"
     root.mkdir()
     (root / "doc.txt").write_text("stable document body", encoding="utf-8")
-    from housekeeper.analyzers.registry import run_content_analysis
+    from housekeeper.analysers.registry import run_content_analysis
 
     scanner = DriveScanner(database, config)
     scanner.scan(root, incremental=True)

@@ -1,6 +1,6 @@
 """MinHash / LSH near-duplicate document tests (Tier-5, verified, review-only)."""
 
-from housekeeper.analyzers.document_minhash import run_document_minhash_analysis
+from housekeeper.analysers.document_minhash import run_document_minhash_analysis
 from housekeeper.scanner import DriveScanner
 from housekeeper.similarity.lsh import candidate_pairs, choose_bands
 from housekeeper.similarity.minhash import estimated_jaccard, minhash_signature

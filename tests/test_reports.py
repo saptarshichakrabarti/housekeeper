@@ -6,7 +6,7 @@ from housekeeper.reports.exports import export_csv, export_jsonl
 from housekeeper.reports.formatting import human_size, percent
 from housekeeper.reports.generator import generate_all_reports, generate_report
 from housekeeper.scanner import DriveScanner
-from tests.conftest import analyze_and_classify
+from tests.conftest import analyse_and_classify
 
 
 def test_formatting_helpers():
@@ -19,7 +19,7 @@ def test_formatting_helpers():
 
 def test_all_reports_generated_with_exports(scanned):
     database, config, _ = scanned
-    analyze_and_classify(database, config)
+    analyse_and_classify(database, config)
     paths = generate_all_reports(database, config)
     names = {p.name for p in paths}
     assert "recommendations.csv" in names and "recommendations.jsonl" in names
@@ -30,7 +30,7 @@ def test_all_reports_generated_with_exports(scanned):
 
 def test_reports_are_distinct_not_stubs(scanned):
     database, config, _ = scanned
-    analyze_and_classify(database, config)
+    analyse_and_classify(database, config)
     generate_all_reports(database, config)
     reports = config.workspace / config.data["workspace"]["reports_dir"]
     duplicates = (reports / "exact_duplicates.html").read_text(encoding="utf-8")
@@ -44,7 +44,7 @@ def test_reports_are_distinct_not_stubs(scanned):
 
 
 def test_exact_duplicates_report_lists_group(config, database, tmp_path):
-    from housekeeper.analyzers.exact_duplicates import run_exact_duplicate_analysis
+    from housekeeper.analysers.exact_duplicates import run_exact_duplicate_analysis
 
     root = tmp_path / "src"
     root.mkdir()
@@ -62,7 +62,7 @@ def test_exact_duplicates_report_lists_group(config, database, tmp_path):
 
 
 def test_recommendations_export_has_reason_codes(config, database, tmp_path):
-    from housekeeper.analyzers.exact_duplicates import run_exact_duplicate_analysis
+    from housekeeper.analysers.exact_duplicates import run_exact_duplicate_analysis
     from housekeeper.policies import classify_all_entries
 
     root = tmp_path / "src"

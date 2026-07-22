@@ -13,9 +13,9 @@ ERROR — never as safe to remove. Inspection failure never lowers retention val
 </table></div>
 <h2>Parser failures / unsupported</h2>
 <div class="overflow"><table>
-  <tr><th>Analyzer</th><th>Error code</th><th class="num">Count</th></tr>
+  <tr><th>analyser</th><th>Error code</th><th class="num">Count</th></tr>
   {% for p in parser_errors %}
-  <tr><td>{{ p.analyzer_name }}</td><td><code>{{ p.error_code }}</code></td><td class="num">{{ p.n }}</td></tr>
+  <tr><td>{{ p.analyser_name }}</td><td><code>{{ p.error_code }}</code></td><td class="num">{{ p.n }}</td></tr>
   {% else %}
   <tr><td colspan="3">None.</td></tr>
   {% endfor %}

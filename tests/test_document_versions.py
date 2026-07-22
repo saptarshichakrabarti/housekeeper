@@ -1,6 +1,6 @@
 """Document-version grouping: token retention, filename normalization, similarity, review-only."""
 
-from housekeeper.analyzers.document_versions import (
+from housekeeper.analysers.document_versions import (
     calculate_filename_similarity,
     extract_version_tokens,
     normalize_version_filename,
@@ -34,7 +34,7 @@ def test_version_family_is_grouped_and_review_only(config, database, tmp_path):
     (root / "essay_draft.txt").write_text("chapter one draft version", encoding="utf-8")
     (root / "essay_final.txt").write_text("chapter one final version edited", encoding="utf-8")
     DriveScanner(database, config).scan(root, incremental=False)
-    from housekeeper.analyzers.registry import run_content_analysis
+    from housekeeper.analysers.registry import run_content_analysis
 
     run_content_analysis(database, config, "documents")
     run_document_version_analysis(database, config)

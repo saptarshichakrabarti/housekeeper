@@ -6,7 +6,7 @@ import zipfile
 
 import pytest
 
-from housekeeper.analyzers.archives import (
+from housekeeper.analysers.archives import (
     detect_archive_kind,
     inspect_archive,
     normalize_archive_member_path,

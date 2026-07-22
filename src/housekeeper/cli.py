@@ -3,7 +3,7 @@ import sqlite3
 import sys
 from pathlib import Path
 
-from .analyzers.exact_duplicates import run_exact_duplicate_analysis
+from .analysers.exact_duplicates import run_exact_duplicate_analysis
 from .config import config_fingerprint, load_config
 from .database import Database
 from .logging_utils import configure_logging
@@ -105,7 +105,7 @@ def build_parser():
     sub.add_parser("init-workspace")
     q = sub.add_parser(
         "quickstart",
-        help="one command: scan + analyze + classify + reports (read-only; never moves data)",
+        help="one command: scan + analyse + classify + reports (read-only; never moves data)",
     )
     q.add_argument("source_root")
     q.add_argument(
@@ -123,7 +123,7 @@ def build_parser():
     diff = sub.add_parser("diff")
     diff.add_argument("scan_a", type=int)
     diff.add_argument("scan_b", type=int)
-    a = sub.add_parser("analyze")
+    a = sub.add_parser("analyse")
     a.add_argument(
         "kind",
         choices=[
@@ -466,8 +466,8 @@ def _dispatch(args, c, d) -> int:
             )
         print(result)
         return 0
-    if cmd == "analyze":
-        from .analyzers.scope import AnalyzerScope
+    if cmd == "analyse":
+        from .analysers.scope import analyserScope
 
         scoped_content_ids = (
             frozenset(
@@ -478,7 +478,7 @@ def _dispatch(args, c, d) -> int:
             if args.content_object_ids
             else frozenset()
         )
-        analyzer_scope = AnalyzerScope(
+        analyser_scope = analyserScope(
             under=args.under,
             source_id=args.source,
             scan_run_id=args.scan_run,
@@ -500,27 +500,27 @@ def _dispatch(args, c, d) -> int:
             current_inventory=args.scan_run is None,
         )
         scope_payload = {
-            **analyzer_scope.__dict__,
-            "extensions": sorted(analyzer_scope.extensions),
-            "content_object_ids": sorted(analyzer_scope.content_object_ids),
+            **analyser_scope.__dict__,
+            "extensions": sorted(analyser_scope.extensions),
+            "content_object_ids": sorted(analyser_scope.content_object_ids),
         }
         if args.kind in {"exact-duplicates", "all"}:
             _run_job(
                 d,
                 c,
                 "FULL_HASH",
-                {"analyzer": "exact-duplicates", "scope": scope_payload},
-                lambda _job: run_exact_duplicate_analysis(d, c, _job, analyzer_scope),
+                {"analyser": "exact-duplicates", "scope": scope_payload},
+                lambda _job: run_exact_duplicate_analysis(d, c, _job, analyser_scope),
             )
         if args.kind in {"archives", "documents", "images", "media", "all"}:
-            from .analyzers.registry import run_content_analysis
+            from .analysers.registry import run_content_analysis
 
             print(
                 _run_job(
                     d,
                     c,
                     "CONTENT_ANALYSIS",
-                    {"analyzer": args.kind, "scope": scope_payload},
+                    {"analyser": args.kind, "scope": scope_payload},
                     lambda _job: run_content_analysis(
                         d,
                         c,
@@ -544,66 +544,66 @@ def _dispatch(args, c, d) -> int:
                 )
             )
         if args.kind in {"directory-overlap", "all"}:
-            from .analyzers.directory_overlap import run_directory_overlap_analysis
+            from .analysers.directory_overlap import run_directory_overlap_analysis
 
             _run_job(
                 d,
                 c,
                 "DIRECTORY_OVERLAP",
                 {"scope": scope_payload},
-                lambda _job: run_directory_overlap_analysis(d, c, analyzer_scope, _job),
+                lambda _job: run_directory_overlap_analysis(d, c, analyser_scope, _job),
             )
         if args.kind in {"document-versions", "all"}:
-            from .analyzers.document_versions import run_document_version_analysis
+            from .analysers.document_versions import run_document_version_analysis
 
             _run_job(
                 d,
                 c,
                 "VERSION_ANALYSIS",
                 {"scope": scope_payload},
-                lambda _job: run_document_version_analysis(d, c, analyzer_scope, _job),
+                lambda _job: run_document_version_analysis(d, c, analyser_scope, _job),
             )
         if args.kind in {"projects", "all"}:
-            from .analyzers.projects import run_project_analysis
+            from .analysers.projects import run_project_analysis
 
             _run_job(
                 d,
                 c,
                 "PROJECT_ANALYSIS",
                 {"scope": scope_payload},
-                lambda _job: run_project_analysis(d, c, analyzer_scope, _job),
+                lambda _job: run_project_analysis(d, c, analyser_scope, _job),
             )
         if args.kind in {"backup-lineage", "all"}:
-            from .analyzers.backup_lineage import run_backup_lineage_analysis
+            from .analysers.backup_lineage import run_backup_lineage_analysis
 
             _run_job(
                 d,
                 c,
                 "DIRECTORY_SUMMARY",
-                {"analyzer": "backup-lineage", "scope": scope_payload},
-                lambda _job: run_backup_lineage_analysis(d, c, analyzer_scope, _job),
+                {"analyser": "backup-lineage", "scope": scope_payload},
+                lambda _job: run_backup_lineage_analysis(d, c, analyser_scope, _job),
             )
         if args.kind in {"images", "all"}:
-            from .analyzers.images import run_image_analysis
+            from .analysers.images import run_image_analysis
 
             _run_job(
                 d,
                 c,
                 "IMAGE_ANALYSIS",
-                {"analyzer": "similarity", "scope": scope_payload},
-                lambda _job: run_image_analysis(d, c, analyzer_scope, _job),
+                {"analyser": "similarity", "scope": scope_payload},
+                lambda _job: run_image_analysis(d, c, analyser_scope, _job),
             )
         if args.kind in {"contact-sheets", "all"}:
             # Contact sheets composite existing thumbnails of each IMAGE_SIMILARITY group; they run
             # after image similarity so the groups exist.
-            from .analyzers.contact_sheets import run_contact_sheet_generation
+            from .analysers.contact_sheets import run_contact_sheet_generation
 
             result = _run_job(
                 d,
                 c,
                 "CONTACT_SHEET_GENERATION",
-                {"analyzer": "contact-sheets", "scope": scope_payload},
-                lambda _job: run_contact_sheet_generation(d, c, analyzer_scope, _job),
+                {"analyser": "contact-sheets", "scope": scope_payload},
+                lambda _job: run_contact_sheet_generation(d, c, analyser_scope, _job),
             )
             if args.kind == "contact-sheets":
                 print(result)
@@ -614,20 +614,20 @@ def _dispatch(args, c, d) -> int:
             "pdf-equivalence",
             "archive-equivalence",
         }:
-            from .analyzers.normalized_content import run_normalized_content_analysis
+            from .analysers.normalized_content import run_normalized_content_analysis
             from .canonical.roles import assign_canonical_roles
 
             result = _run_job(
                 d,
                 c,
                 "CONTENT_ANALYSIS",
-                {"analyzer": args.kind, "scope": scope_payload},
-                lambda _job: run_normalized_content_analysis(d, c, analyzer_scope, _job),
+                {"analyser": args.kind, "scope": scope_payload},
+                lambda _job: run_normalized_content_analysis(d, c, analyser_scope, _job),
             )
             assign_canonical_roles(d)
             print(result)
         if args.kind == "chunks":
-            from .analyzers.content_defined_chunks import run_chunk_analysis
+            from .analysers.content_defined_chunks import run_chunk_analysis
 
             print(
                 _run_job(
@@ -635,11 +635,11 @@ def _dispatch(args, c, d) -> int:
                     c,
                     "CHUNK_ANALYSIS",
                     {"scope": scope_payload},
-                    lambda _job: run_chunk_analysis(d, c, analyzer_scope, _job),
+                    lambda _job: run_chunk_analysis(d, c, analyser_scope, _job),
                 )
             )
         if args.kind == "chunk-overlap":
-            from .analyzers.content_defined_chunks import run_chunk_overlap_analysis
+            from .analysers.content_defined_chunks import run_chunk_overlap_analysis
 
             print(
                 _run_job(
@@ -647,14 +647,14 @@ def _dispatch(args, c, d) -> int:
                 )
             )
         if args.kind == "binary-similarity":
-            from .analyzers.binary_similarity import run_binary_similarity_analysis
+            from .analysers.binary_similarity import run_binary_similarity_analysis
 
             print(
-                _run_job(d, c, "CONTENT_ANALYSIS", {"analyzer": "binary-similarity"},
+                _run_job(d, c, "CONTENT_ANALYSIS", {"analyser": "binary-similarity"},
                          lambda _job: run_binary_similarity_analysis(d, c, _job))
             )
         if args.kind == "document-minhash":
-            from .analyzers.document_minhash import run_document_minhash_analysis
+            from .analysers.document_minhash import run_document_minhash_analysis
 
             print(
                 _run_job(
@@ -662,7 +662,7 @@ def _dispatch(args, c, d) -> int:
                     c,
                     "VERSION_ANALYSIS",
                     {"scope": scope_payload},
-                    lambda _job: run_document_minhash_analysis(d, c, analyzer_scope, _job),
+                    lambda _job: run_document_minhash_analysis(d, c, analyser_scope, _job),
                 )
             )
         if args.kind == "backup-value":
@@ -670,7 +670,7 @@ def _dispatch(args, c, d) -> int:
 
             print(_run_job(d, c, "DIRECTORY_SUMMARY", {}, lambda _job: run_backup_value_analysis(d, c, job_id=_job)))
         if args.kind == "preservation-risk":
-            from .analyzers.preservation_risk import run_preservation_risk_analysis
+            from .analysers.preservation_risk import run_preservation_risk_analysis
 
             print(
                 _run_job(
@@ -682,13 +682,13 @@ def _dispatch(args, c, d) -> int:
 
             print(_run_job(d, c, "CLASSIFICATION", {}, lambda _job: run_record_series_analysis(d, c, job_id=_job)))
         if args.kind == "review-priority":
-            from .analyzers.review_priority import run_review_priority_analysis
+            from .analysers.review_priority import run_review_priority_analysis
 
             print(
                 _run_job(d, c, "CLASSIFICATION", {}, lambda _job: run_review_priority_analysis(d, c, job_id=_job))
             )
         if args.kind == "lifecycle":
-            from .analyzers.lifecycle import run_lifecycle_analysis
+            from .analysers.lifecycle import run_lifecycle_analysis
 
             print(_run_job(d, c, "CLASSIFICATION", {}, lambda _job: run_lifecycle_analysis(d, c, job_id=_job)))
         if args.kind == "photo-events":
@@ -706,13 +706,13 @@ def _dispatch(args, c, d) -> int:
                 _run_job(d, c, "DIRECTORY_SUMMARY", {}, lambda _job: run_acquisition_batch_analysis(d, c, job_id=_job))
             )
         if args.kind == "archive-of-directory":
-            from .analyzers.archive_equivalence import run_archive_directory_analysis
+            from .analysers.archive_equivalence import run_archive_directory_analysis
 
             print(
                 _run_job(d, c, "ARCHIVE_ANALYSIS", {}, lambda _job: run_archive_directory_analysis(d, c, job_id=_job))
             )
         if args.kind == "derivations":
-            from .analyzers.cross_format_derivation import run_cross_format_derivation_analysis
+            from .analysers.cross_format_derivation import run_cross_format_derivation_analysis
 
             print(
                 _run_job(
@@ -720,23 +720,23 @@ def _dispatch(args, c, d) -> int:
                     c,
                     "VERSION_ANALYSIS",
                     {"scope": scope_payload},
-                    lambda _job: run_cross_format_derivation_analysis(d, c, analyzer_scope, _job),
+                    lambda _job: run_cross_format_derivation_analysis(d, c, analyser_scope, _job),
                 )
             )
         if args.kind == "all":
-            # Include the cheap advanced analyzers in `all`; chunking, MinHash, and binary fuzzy
+            # Include the cheap advanced analysers in `all`; chunking, MinHash, and binary fuzzy
             # similarity stay opt-in (large/expensive). Priority + lifecycle run after classify.
-            from .analyzers.archive_equivalence import run_archive_directory_analysis
-            from .analyzers.cross_format_derivation import run_cross_format_derivation_analysis
-            from .analyzers.normalized_content import run_normalized_content_analysis
-            from .analyzers.preservation_risk import run_preservation_risk_analysis
+            from .analysers.archive_equivalence import run_archive_directory_analysis
+            from .analysers.cross_format_derivation import run_cross_format_derivation_analysis
+            from .analysers.normalized_content import run_normalized_content_analysis
+            from .analysers.preservation_risk import run_preservation_risk_analysis
             from .canonical.roles import assign_canonical_roles
             from .collections.events import run_photo_event_analysis
             from .collections.marginal_value import run_backup_value_analysis
             from .collections.record_series import run_record_series_analysis
 
-            _run_job(d, c, "CONTENT_ANALYSIS", {"analyzer": "normalized-content"},
-                     lambda _job: run_normalized_content_analysis(d, c, analyzer_scope, _job))
+            _run_job(d, c, "CONTENT_ANALYSIS", {"analyser": "normalized-content"},
+                     lambda _job: run_normalized_content_analysis(d, c, analyser_scope, _job))
             assign_canonical_roles(d)
             _run_job(d, c, "VERSION_ANALYSIS", {}, lambda _job: run_cross_format_derivation_analysis(d, c, job_id=_job))
             _run_job(d, c, "ARCHIVE_ANALYSIS", {}, lambda _job: run_archive_directory_analysis(d, c, job_id=_job))
@@ -746,8 +746,8 @@ def _dispatch(args, c, d) -> int:
             _run_job(d, c, "IMAGE_ANALYSIS", {}, lambda _job: run_photo_event_analysis(d, c, job_id=_job))
         return 0
     if cmd == "classify":
-        from .analyzers.lifecycle import run_lifecycle_analysis
-        from .analyzers.review_priority import run_review_priority_analysis
+        from .analysers.lifecycle import run_lifecycle_analysis
+        from .analysers.review_priority import run_review_priority_analysis
 
         _run_job(d, c, "CLASSIFICATION", {}, lambda _job: classify_all_entries(d, c, job_id=_job))
         # Prioritization and lifecycle depend on classifications, so they run right after.
@@ -920,7 +920,7 @@ def _dispatch(args, c, d) -> int:
                 )
             else:
                 print(
-                    "resume scheduled; rerun the corresponding analyzer command to continue its idempotent content work"
+                    "resume scheduled; rerun the corresponding analyser command to continue its idempotent content work"
                 )
             return 0
         if args.jobs_command == "show":
@@ -1273,7 +1273,7 @@ def _dispatch(args, c, d) -> int:
         return 0
     if cmd == "dashboard":
         import uvicorn
-        from .analyzers.contact_sheets import contact_sheet_dir
+        from .analysers.contact_sheets import contact_sheet_dir
         from .dashboard.app import create_app
 
         host = args.host or c.data["dashboard"]["host"]
@@ -1295,7 +1295,7 @@ def _dispatch(args, c, d) -> int:
         import webbrowser
 
         import uvicorn
-        from .analyzers.contact_sheets import contact_sheet_dir
+        from .analysers.contact_sheets import contact_sheet_dir
         from .dashboard.app import create_app
 
         host = args.host or c.data["dashboard"]["host"]
@@ -1321,7 +1321,7 @@ def _dispatch(args, c, d) -> int:
         import time
 
         import uvicorn
-        from .analyzers.contact_sheets import contact_sheet_dir
+        from .analysers.contact_sheets import contact_sheet_dir
         from .dashboard.app import create_app
         from .desktop import Api
 
