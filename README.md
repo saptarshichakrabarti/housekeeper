@@ -4,6 +4,8 @@
 
 Scanning is read-only, does not follow symbolic links by default, never executes content, and treats errors and unsupported formats conservatively. Exact duplicates require verified SHA-256 hashes and retain a deterministic canonical copy. Similarity is never proof of disposability. Movement requires an explicit edited manifest, revalidates size and hash immediately beforehand, refuses collisions and nested source/review roots, verifies the destination, then removes the source only after a verified copy. There is no delete or purge command.
 
+Primarily vibe-coded. Improvements are welcome.
+
 ## Quickstart (one command)
 
 The fastest way to point the tool at a drive and get a full picture. This is entirely read-only —
