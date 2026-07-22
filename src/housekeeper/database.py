@@ -423,7 +423,13 @@ class Database:
         c.commit()
         return {key: len(value) for key, value in values.items()}
 
-    def database_stats(self) -> dict[str, int | str]:
+    def database_stats(self, check_integrity: bool = True) -> dict[str, int | str]:
+        """Cheap COUNT-based stats, plus a full ``PRAGMA integrity_check`` unless disabled.
+
+        The integrity check is O(database size) — fine for a deliberate CLI invocation, but far
+        too slow to run on every dashboard page load on a multi-GB database (measured 50s+ on a
+        1.9GB/1.5M-entry inventory). Callers on a hot path should pass ``check_integrity=False``.
+        """
         c = self.connect()
         return {
             "schema_version": int(
@@ -435,7 +441,7 @@ class Database:
             "analysis_artifacts": int(
                 c.execute("SELECT COUNT(*) FROM analysis_artifacts").fetchone()[0]
             ),
-            "integrity": self.integrity_check(),
+            "integrity": self.integrity_check() if check_integrity else "not checked",
         }
 
     def get_or_create_content_object(
