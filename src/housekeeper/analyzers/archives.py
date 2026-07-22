@@ -29,9 +29,15 @@ def _safe_member_name(value: str) -> bool:
 def inspect_archive(path: Path, config):
     try:
         names: list[str]
+        max_members = config.section("archives")["max_members"]
         if detect_archive_kind(path) == "zip":
             with zipfile.ZipFile(path) as z:
-                zip_members = z.infolist()[: config.section("archives")["max_members"]]
+                zip_members = z.infolist()
+                if len(zip_members) > max_members:
+                    return {
+                        "analysis_status": "ERROR",
+                        "analysis_error": f"archive exceeds max_members ({len(zip_members)}>{max_members})",
+                    }
                 if (
                     sum(max(0, item.file_size) for item in zip_members)
                     > config.section("archives")["max_declared_uncompressed_bytes"]
@@ -48,7 +54,12 @@ def inspect_archive(path: Path, config):
                 names = [normalize_archive_member_path(x.filename) for x in zip_members]
         else:
             with tarfile.open(path) as t:
-                tar_members = t.getmembers()[: config.section("archives")["max_members"]]
+                tar_members = t.getmembers()
+                if len(tar_members) > max_members:
+                    return {
+                        "analysis_status": "ERROR",
+                        "analysis_error": f"archive exceeds max_members ({len(tar_members)}>{max_members})",
+                    }
                 if (
                     sum(max(0, item.size) for item in tar_members)
                     > config.section("archives")["max_declared_uncompressed_bytes"]
@@ -81,7 +92,7 @@ def inspect_archive(path: Path, config):
         return {"analysis_status": "ERROR", "analysis_error": str(exc)}
 
 
-def run_archive_analysis(database, config):
+def run_archive_analysis(database, config, scope=None, job_id=None):
     from .registry import run_content_analysis
 
-    return run_content_analysis(database, config, "archives")
+    return run_content_analysis(database, config, "archives", job_id=job_id)

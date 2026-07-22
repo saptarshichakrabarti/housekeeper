@@ -16,7 +16,9 @@ def extract_image_metadata(path: Path, config):
             if im.width * im.height > config.section("images")["max_pixels"]:
                 return {"analysis_status": "ERROR", "analysis_error": "pixel limit"}
             thumb = im.convert("L").resize((8, 8))
-            values = list(thumb.getdata())
+            # An 8-bit grayscale ("L") image yields exactly one byte per pixel; tobytes avoids
+            # the deprecated getdata() while staying valid across Pillow versions.
+            values = list(thumb.tobytes())
             average = sum(values) / len(values)
             phash = "".join("1" if value >= average else "0" for value in values)
             return {

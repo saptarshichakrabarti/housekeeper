@@ -1,0 +1,13 @@
+{% extends "_base.html.j2" %}
+{% block content %}
+<p class="facts">Files at or above {{ threshold | human_size }}. Size alone is never a removal signal —
+this list is for attention, not for automatic action.</p>
+<div class="overflow"><table>
+  <tr><th>Path</th><th class="num">Size</th></tr>
+  {% for f in files %}
+  <tr><td class="path">{{ f.relative_path }}</td><td class="num">{{ f.size_bytes | human_size }}</td></tr>
+  {% else %}
+  <tr><td colspan="2">No files above the threshold.</td></tr>
+  {% endfor %}
+</table></div>
+{% endblock %}

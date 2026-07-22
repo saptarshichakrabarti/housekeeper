@@ -24,6 +24,9 @@ def _projection_clause(projection_type: str) -> tuple[str, tuple[object, ...]]:
         "project": ("relationship_type LIKE '%PROJECT%'", ()),
         "document-family": ("relationship_type LIKE '%DOCUMENT%'", ()),
         "image-cluster": ("relationship_type LIKE '%IMAGE%'", ()),
+        # A directory-scoped exploration: unrestricted relationship type, narrowed by the
+        # supplied root_id/depth via get_subgraph.  Falls back to a general view without a root.
+        "selected-directory": ("1=1", ()),
     }
     return clauses[projection_type]
 
@@ -87,6 +90,67 @@ def _universe_aggregation(database, max_nodes: int, max_edges: int, aggregation_
     return serialize(nodes[:max_nodes], edges[:max_edges], {"type": "universe", "aggregation_level": aggregation_level, "max_nodes": max_nodes, "max_edges": max_edges}, len(nodes) > max_nodes or len(edges) > max_edges)
 
 
+_CONTENT_PROJECTION_FILTER = {
+    "content-equivalence": "evidence_tier IN ('TIER_1_EXACT','TIER_2_NORMALIZED_EXACT','TIER_3_STRONG_EQUIVALENCE')",
+    "partial-overlap": "evidence_tier='TIER_4_PARTIAL_OVERLAP'",
+    "derivation-family": "relationship_type IN ('LIKELY_EXPORT','LIKELY_RENDERING','LIKELY_DERIVED','LIKELY_VERSION','LIKELY_COPY')",
+}
+
+
+def _content_relationship_projection(
+    database, projection_type: str, max_nodes: int, max_edges: int, minimum_confidence: float
+) -> dict:
+    """A bounded projection over the tiered ``content_relationships`` store."""
+    where = _CONTENT_PROJECTION_FILTER[projection_type]
+    rows = database.fetch_all(
+        f"""SELECT id,source_type,source_id,target_type,target_id,relationship_type,evidence_tier,confidence,evidence_json
+            FROM content_relationships WHERE status='ACTIVE' AND ({where}) AND confidence>=?
+            ORDER BY confidence DESC,id LIMIT ?""",
+        (minimum_confidence, max_edges + 1),
+    )
+    truncated = len(rows) > max_edges
+    rows = rows[:max_edges]
+    identifiers: set[tuple[str, int]] = set()
+    usable = []
+    for row in rows:
+        a = (str(row["source_type"]), int(row["source_id"]))
+        b = (str(row["target_type"]), int(row["target_id"]))
+        if a not in identifiers and len(identifiers) >= max_nodes:
+            truncated = True
+            continue
+        identifiers.add(a)
+        if b not in identifiers and len(identifiers) >= max_nodes:
+            truncated = True
+            continue
+        identifiers.add(b)
+        usable.append(row)
+    labels = _labels(database, identifiers)
+    nodes = [
+        GraphNode(f"{typ}:{ident}", typ, labels.get((typ, ident), f"{typ} {ident}"), {"entity_id": ident})
+        for typ, ident in sorted(identifiers)
+    ]
+    allowed = {node.id for node in nodes}
+    edges = [
+        GraphEdge(
+            f"content_rel:{row['id']}",
+            f"{row['source_type']}:{row['source_id']}",
+            f"{row['target_type']}:{row['target_id']}",
+            str(row["relationship_type"]),
+            float(row["confidence"]),
+            {"evidence_tier": row["evidence_tier"], **json.loads(row["evidence_json"] or "{}")},
+        )
+        for row in usable
+        if f"{row['source_type']}:{row['source_id']}" in allowed
+        and f"{row['target_type']}:{row['target_id']}" in allowed
+    ]
+    return serialize(
+        nodes,
+        edges,
+        {"type": projection_type, "max_nodes": max_nodes, "max_edges": max_edges},
+        truncated,
+    )
+
+
 def build_projection(
     database,
     projection_type: str = "universe",
@@ -113,6 +177,13 @@ def build_projection(
     cached = load_cached_projection(database, key)
     if cached:
         return cached["projection"]
+
+    if projection_type in {"content-equivalence", "partial-overlap", "derivation-family"}:
+        projection = _content_relationship_projection(
+            database, projection_type, max_nodes, max_edges, minimum_confidence
+        )
+        cache_projection(database, key, projection, {}, version)
+        return projection
 
     if projection_type == "universe" and root_id is None and aggregation_level != "none":
         projection = _universe_aggregation(database, max_nodes, max_edges, aggregation_level)

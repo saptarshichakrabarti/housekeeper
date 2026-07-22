@@ -1,10 +1,94 @@
+# Explicit, deterministic classification rules.
+#
+# Each rule names a *condition* implemented in housekeeper.policies.CONDITIONS (there is no
+# eval-based expression language over the drive's data, by design).  When several rules match
+# one entry the most protective classification wins (see `priority`).  These rules mirror the
+# built-in defaults; edit them to tune behaviour.  No rule may permanently delete a file --
+# the strongest action is moving an explicitly approved file into a review folder.
+
+# Most-protective first.  A lower-safety classification never overrides a stronger one.
+priority:
+  - ERROR
+  - PROTECTED
+  - UNKNOWN
+  - KEEP
+  - KEEP_CANONICAL
+  - REVIEW_VERSION_FAMILY
+  - REVIEW_BACKUP
+  - REVIEW_LARGE
+  - REVIEW_PROBABLE
+  - REVIEW_SAFE
+
+# Applied only when no rule matches an entry.
+default:
+  classification: KEEP
+  confidence: 0.5
+  reason_codes: [NO_REMOVAL_SIGNAL]
+  explanation: "No safe-removal signal detected; retained by default."
+  requires_manual_approval: false
+
 rules:
-  - id: exact-duplicate-noncanonical
-    classification: REVIEW_SAFE
-    confidence: 1.0
-    requires_manual_approval: true
-    requires_canonical: true
-  - id: parser-failure
+  - id: parser-or-filesystem-error
+    condition: analysis_or_scan_failed
     classification: ERROR
     confidence: 1.0
+    reason_codes: [PARSER_OR_FILESYSTEM_ERROR]
+    explanation: "Inspection or content analysis failed; manual review is required."
+    requires_manual_approval: true
+
+  - id: protected-signal
+    condition: protected_signal
+    classification: PROTECTED
+    confidence: 0.95
+    reason_codes: [PROTECTED_SIGNAL]
+    explanation: "Matches a conservative protected-file pattern (extension, name or directory)."
+    requires_manual_approval: true
+
+  - id: exact-duplicate-noncanonical
+    condition: exact_duplicate_noncanonical
+    classification: REVIEW_SAFE
+    confidence: 1.0
+    reason_codes: [EXACT_SHA256_DUPLICATE, VERIFIED_CANONICAL_SURVIVES]
+    explanation: "Verified byte-identical duplicate; a canonical copy remains outside review."
+    requires_manual_approval: true
+    requires_canonical: true
+
+  - id: office-temporary-lock
+    condition: office_temporary_lock
+    classification: REVIEW_SAFE
+    confidence: 0.9
+    reason_codes: [OFFICE_TEMPORARY_LOCK_FILE]
+    explanation: "Office temporary owner-lock file with a matching document nearby."
+    requires_manual_approval: true
+
+  - id: python-bytecode-cache
+    condition: python_bytecode_cache
+    classification: REVIEW_SAFE
+    confidence: 0.9
+    reason_codes: [PYTHON_BYTECODE_CACHE, REGENERABLE]
+    explanation: "Compiled Python cache inside a source project; regenerated automatically."
+    requires_manual_approval: true
+
+  - id: virtualenv-regenerable
+    condition: virtualenv_with_reproducibility
+    classification: REVIEW_PROBABLE
+    confidence: 0.75
+    reason_codes: [VIRTUAL_ENVIRONMENT, PROJECT_HAS_REPRODUCIBILITY]
+    explanation: "Virtual-environment content inside a project that carries a dependency or lock specification."
+    requires_manual_approval: true
+
+  - id: node-modules-regenerable
+    condition: node_modules_with_lockfile
+    classification: REVIEW_PROBABLE
+    confidence: 0.75
+    reason_codes: [NODE_MODULES, PROJECT_HAS_LOCKFILE]
+    explanation: "node_modules content inside a project that carries a lockfile."
+    requires_manual_approval: true
+
+  - id: old-duplicate-installer
+    condition: old_duplicate_installer
+    classification: REVIEW_PROBABLE
+    confidence: 0.6
+    reason_codes: [INSTALLER_OR_IMAGE, OLD_AND_DUPLICATED]
+    explanation: "Old installer or disk image that is byte-duplicated elsewhere. Age alone is never sufficient."
     requires_manual_approval: true

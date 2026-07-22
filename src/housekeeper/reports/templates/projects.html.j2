@@ -1,0 +1,21 @@
+{% extends "_base.html.j2" %}
+{% block content %}
+<p class="facts">Detected projects with storage attributed to source, generated (regenerable), and
+environment content. <code>.git</code> is never treated as clutter.</p>
+<div class="overflow"><table>
+  <tr><th>Project</th><th>Kind</th><th>Git</th><th class="num">Source</th><th class="num">Generated</th><th class="num">Environment</th><th>Markers</th></tr>
+  {% for p in projects %}
+  <tr>
+    <td class="path">{{ p.name }}</td>
+    <td>{{ p.kind }}</td>
+    <td>{{ p.git_status }}</td>
+    <td class="num">{{ p.source_size_bytes | human_size }}</td>
+    <td class="num">{{ p.generated_size_bytes | human_size }}</td>
+    <td class="num">{{ p.environment_size_bytes | human_size }}</td>
+    <td>{% for m in p.markers %}<code>{{ m }}</code> {% endfor %}</td>
+  </tr>
+  {% else %}
+  <tr><td colspan="7">No projects detected.</td></tr>
+  {% endfor %}
+</table></div>
+{% endblock %}

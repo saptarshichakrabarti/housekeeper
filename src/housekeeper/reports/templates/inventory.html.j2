@@ -1,0 +1,19 @@
+{% extends "_base.html.j2" %}
+{% block content %}
+<section class="facts">
+  <h2>Largest top-level directories</h2>
+  <div class="overflow"><table>
+    <tr><th>Source root</th><th>Top-level</th><th class="num">Files</th><th class="num">Bytes</th></tr>
+    {% for d in directories %}
+    <tr><td class="path">{{ d.source_root }}</td><td class="path">{{ d.top_level }}</td><td class="num">{{ d.n }}</td><td class="num">{{ d.b | human_size }}</td></tr>
+    {% endfor %}
+  </table></div>
+  <h2>Extension distribution</h2>
+  <div class="overflow"><table>
+    <tr><th>Extension</th><th class="num">Files</th><th class="num">Bytes</th></tr>
+    {% for e in extensions %}
+    <tr><td><code>{{ e.suffix }}</code></td><td class="num">{{ e.n }}</td><td class="num">{{ e.b | human_size }}</td></tr>
+    {% endfor %}
+  </table></div>
+</section>
+{% endblock %}

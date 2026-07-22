@@ -4,6 +4,31 @@
 
 Scanning is read-only, does not follow symbolic links by default, never executes content, and treats errors and unsupported formats conservatively. Exact duplicates require verified SHA-256 hashes and retain a deterministic canonical copy. Similarity is never proof of disposability. Movement requires an explicit edited manifest, revalidates size and hash immediately beforehand, refuses collisions and nested source/review roots, verifies the destination, then removes the source only after a verified copy. There is no delete or purge command.
 
+## Quickstart (one command)
+
+The fastest way to point the tool at a drive and get a full picture. This is entirely read-only —
+it scans, analyzes, classifies, and writes reports; it never moves or deletes anything.
+
+```bash
+make install                       # create .venv and install with all optional features
+make quickstart SOURCE=/mnt/drive  # scan + analyze + classify + reports, then print a summary
+make dashboard                     # browse results locally (loopback only)
+```
+
+Without `make`, the same thing:
+
+```bash
+pip install -e '.[analysis,dashboard]'
+housekeeper quickstart /mnt/drive        # add --no-reports to skip HTML, --json for machine output
+housekeeper dashboard
+```
+
+`quickstart` runs every step inside a durable, pausable job and is safe to re-run — each run reports
+the current snapshot of the drive. It deliberately stops short of any movement: staging approved
+files into a review folder remains the separate, explicit, manifest-verified flow shown below.
+Run `make help` to see all targets (`install-dev`, `check`, `test`, `lint`, `typecheck`,
+`benchmark`, `clean`).
+
 ## Install and synthetic workflow
 
 ```bash

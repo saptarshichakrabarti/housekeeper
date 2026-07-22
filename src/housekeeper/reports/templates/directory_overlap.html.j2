@@ -1,0 +1,20 @@
+{% extends "_base.html.j2" %}
+{% block content %}
+<p class="facts">Directories substantially contained in another by verified content hashes. Unique
+content in the smaller directory is listed as <em>unique hashes</em> — review it before treating a
+backup as redundant.</p>
+<div class="overflow"><table>
+  <tr><th>Mostly-contained directory</th><th>Contained in</th><th class="num">Containment</th><th>Shared</th><th>Unique in source</th></tr>
+  {% for o in overlaps %}
+  <tr>
+    <td class="path">{{ o.a_path }}</td>
+    <td class="path">{{ o.b_path }}</td>
+    <td class="num">{{ (o.confidence * 100) | round(1) }}%</td>
+    <td class="num">{{ o.evidence.shared_hashes if o.evidence.shared_hashes is defined else "—" }}</td>
+    <td class="num">{{ (o.evidence.source_hashes - o.evidence.shared_hashes) if o.evidence.source_hashes is defined else "—" }}</td>
+  </tr>
+  {% else %}
+  <tr><td colspan="5">No directory-overlap relationships found.</td></tr>
+  {% endfor %}
+</table></div>
+{% endblock %}

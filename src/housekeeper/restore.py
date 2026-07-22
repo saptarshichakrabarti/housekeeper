@@ -6,6 +6,34 @@ from pathlib import Path
 from .hashing import compute_full_hash
 
 
+def verify_transaction(manifest: Path) -> list[dict]:
+    """Re-hash every moved file at its destination to confirm the review copy is intact.
+
+    Operates on a transaction manifest (as written by ``move-to-review``), never a review
+    manifest.  Each moved record is verified independently and never modified.
+    """
+    results = []
+    for line in manifest.read_text(encoding="utf-8").splitlines():
+        if not line.strip():
+            continue
+        record = json.loads(line)
+        if record.get("status") != "MOVED":
+            record["verify_status"] = "SKIPPED"
+        else:
+            destination = Path(record["destination_path"])
+            if not destination.is_file():
+                record["verify_status"] = "MISSING_DESTINATION"
+            elif (
+                compute_full_hash(destination, "sha256", 8_388_608).digest
+                != record.get("expected_hash")
+            ):
+                record["verify_status"] = "HASH_MISMATCH"
+            else:
+                record["verify_status"] = "VERIFIED"
+        results.append(record)
+    return results
+
+
 def restore_transaction(manifest: Path, dry_run=False, yes=False):
     results = []
     for line in manifest.read_text(encoding="utf-8").splitlines():

@@ -6,13 +6,15 @@ import uuid
 class SubprocessBackend:
     protocol_version = "1"
 
-    def __init__(self, executable: str, timeout: float = 300):
-        self.executable, self.timeout = executable, timeout
+    def __init__(self, executable: "str | list[str]", timeout: float = 300):
+        self.command = [executable] if isinstance(executable, str) else list(executable)
+        self.executable = self.command[0]
+        self.timeout = timeout
 
     def _request(self, operation: str, arguments: dict):
         request_id = str(uuid.uuid4())
         process = subprocess.run(
-            [self.executable],
+            self.command,
             input=json.dumps(
                 {
                     "protocol_version": self.protocol_version,

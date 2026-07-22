@@ -62,7 +62,7 @@ def test_v1_database_backfills_verified_hashes(tmp_path):
     conn.close()
     db = Database(old)
     db.initialize()
-    assert db.database_stats()["schema_version"] == 4
+    assert db.database_stats()["schema_version"] == 6
     assert db.fetch_one("SELECT COUNT(*) AS n FROM content_objects")["n"] == 1
     assert db.fetch_one("SELECT COUNT(*) AS n FROM entry_content_links")["n"] == 1
 

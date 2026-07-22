@@ -1,4 +1,6 @@
 import argparse
+import sqlite3
+import sys
 from pathlib import Path
 
 from .analyzers.exact_duplicates import run_exact_duplicate_analysis
@@ -26,6 +28,46 @@ def _run_job(database, config, job_type: str, scope: dict, callback):
         return callback(job_id)
 
 
+def _print_table(rows: list) -> None:
+    """Render a list of sqlite3.Row values as an aligned, readable table."""
+    if not rows:
+        print("(no rows)")
+        return
+    columns = list(rows[0].keys())
+    rendered = [{col: ("" if row[col] is None else str(row[col])) for col in columns} for row in rows]
+    widths = {
+        col: min(max(len(col), *(len(item[col]) for item in rendered)), 60) for col in columns
+    }
+    print("  ".join(col.ljust(widths[col]) for col in columns))
+    print("  ".join("-" * widths[col] for col in columns))
+    for item in rendered:
+        print("  ".join(item[col][: widths[col]].ljust(widths[col]) for col in columns))
+    print(f"({len(rows)} row{'s' if len(rows) != 1 else ''})")
+
+
+def _print_row(row) -> None:
+    if row is None:
+        print("(not found)")
+        return
+    for key in row.keys():
+        print(f"{key}: {'' if row[key] is None else row[key]}")
+
+
+def _emit(value) -> None:
+    """Print CLI query results in a human-readable form instead of raw Row reprs."""
+    if isinstance(value, sqlite3.Row):
+        _print_row(value)
+    elif isinstance(value, list) and value and isinstance(value[0], sqlite3.Row):
+        _print_table(value)
+    elif isinstance(value, list) and not value:
+        print("(no rows)")
+    elif isinstance(value, dict):
+        for key, inner in value.items():
+            print(f"{key}: {inner}")
+    else:
+        print(value)
+
+
 def _ctx(args):
     c = load_config(
         Path(args.config) if args.config else None,
@@ -47,8 +89,23 @@ def build_parser():
     p = argparse.ArgumentParser(prog="housekeeper")
     p.add_argument("--config")
     p.add_argument("--workspace")
+    p.add_argument(
+        "--verbose",
+        "-v",
+        action="store_true",
+        help="show full tracebacks for unexpected errors",
+    )
     sub = p.add_subparsers(dest="command", required=True)
     sub.add_parser("init-workspace")
+    q = sub.add_parser(
+        "quickstart",
+        help="one command: scan + analyze + classify + reports (read-only; never moves data)",
+    )
+    q.add_argument("source_root")
+    q.add_argument(
+        "--no-reports", action="store_true", help="skip static report generation"
+    )
+    q.add_argument("--json", action="store_true", help="emit the run summary as JSON")
     s = sub.add_parser("scan")
     s.add_argument("source_root")
     s.add_argument("--no-resume", action="store_true")
@@ -70,9 +127,29 @@ def build_parser():
             "documents",
             "document-versions",
             "images",
+            "contact-sheets",
             "media",
             "projects",
             "backup-lineage",
+            "normalized-content",
+            "image-equivalence",
+            "office-equivalence",
+            "pdf-equivalence",
+            "archive-equivalence",
+            "binary-similarity",
+            "chunks",
+            "chunk-overlap",
+            "document-minhash",
+            "backup-value",
+            "preservation-risk",
+            "record-series",
+            "review-priority",
+            "lifecycle",
+            "photo-events",
+            "work-sessions",
+            "acquisition-batches",
+            "archive-of-directory",
+            "derivations",
             "all",
         ],
     )
@@ -185,6 +262,57 @@ def build_parser():
     rcan.add_argument("session_id", type=int)
     rcan.add_argument("group_id", type=int)
     rcan.add_argument("entry_id", type=int)
+    chunks = sub.add_parser("chunks")
+    chunks_sub = chunks.add_subparsers(dest="chunks_command", required=True)
+    ce = chunks_sub.add_parser("estimate")
+    ce.add_argument("--profile", default=None)
+    cc = chunks_sub.add_parser("clear")
+    cc.add_argument("--profile", default=None)
+    cc.add_argument("--dry-run", action="store_true")
+    derived = sub.add_parser("derived-data")
+    derived_sub = derived.add_subparsers(dest="derived_command", required=True)
+    derived_sub.add_parser("estimate")
+    dclear = derived_sub.add_parser("clear")
+    dclear.add_argument("kind", choices=["CHUNK_INDEX", "MINHASH_INDEX"])
+    dclear.add_argument("--dry-run", action="store_true")
+    collections = sub.add_parser("collections")
+    collections_sub = collections.add_subparsers(dest="collections_command", required=True)
+    collections_sub.add_parser("list")
+    colshow = collections_sub.add_parser("show")
+    colshow.add_argument("collection_id", type=int)
+    colsim = collections_sub.add_parser("simulate-removal")
+    colsim.add_argument("collection_id", type=int)
+    colassign = collections_sub.add_parser("assign-series")
+    colassign.add_argument("collection_id", type=int)
+    colassign.add_argument("series_id", type=int)
+    collections_sub.add_parser("retention")
+    preservation = sub.add_parser("preservation")
+    preservation_sub = preservation.add_subparsers(dest="preservation_command", required=True)
+    preservation_sub.add_parser("queue")
+    preservation_sub.add_parser("report")
+    learning = sub.add_parser("learning")
+    learning_sub = learning.add_subparsers(dest="learning_command", required=True)
+    learning_sub.add_parser("train")
+    learning_sub.add_parser("evaluate")
+    learning_sub.add_parser("predict")
+    learning_sub.add_parser("disable")
+    known = sub.add_parser("known")
+    known_sub = known.add_subparsers(dest="known_command", required=True)
+    known_sub.add_parser("list")
+    ka = known_sub.add_parser("assert")
+    ka.add_argument("assertion")
+    ka.add_argument("scope_type")
+    ka.add_argument("scope_value")
+    canonical = sub.add_parser("canonical")
+    canonical_sub = canonical.add_subparsers(dest="canonical_command", required=True)
+    canonical_sub.add_parser("assign")
+    canonical_sub.add_parser("list")
+    cshow = canonical_sub.add_parser("show")
+    cshow.add_argument("group_id", type=int)
+    cshow.add_argument("--type", default="EXACT_DUPLICATE_GROUP")
+    cexplain = canonical_sub.add_parser("explain")
+    cexplain.add_argument("group_id", type=int)
+    cexplain.add_argument("--type", default="PIXEL_IDENTICAL_GROUP")
     dashboard = sub.add_parser("dashboard")
     dashboard.add_argument("--host", default=None)
     dashboard.add_argument("--port", type=int, default=None)
@@ -199,14 +327,36 @@ def build_parser():
     ge = graph_sub.add_parser("export")
     ge.add_argument("projection", default="universe", nargs="?")
     ge.add_argument("--output", required=True)
+    ge.add_argument("--format", choices=["json", "svg"], default="json")
     ge.add_argument("--max-nodes", type=int, default=500)
     ge.add_argument("--max-edges", type=int, default=2000)
     graph_sub.add_parser("cache-clear")
     benchmark = sub.add_parser("benchmark")
     benchmark.add_argument(
-        "kind", choices=["scan", "hashing", "database", "overlap", "dashboard", "graph"]
+        "kind",
+        choices=[
+            "scan",
+            "hashing",
+            "database",
+            "overlap",
+            "dashboard",
+            "graph",
+            "baseline",
+            "compare",
+        ],
     )
     benchmark.add_argument("fixture", nargs="?")
+    benchmark.add_argument(
+        "--baseline",
+        default=None,
+        help="baseline artifact path for 'baseline'/'compare' (default: benchmarks/baseline.json)",
+    )
+    benchmark.add_argument(
+        "--tolerance",
+        type=float,
+        default=0.5,
+        help="relative wall-clock regression tolerance for 'compare' (same-runner only)",
+    )
     profile = sub.add_parser("profile")
     profile.add_argument("job_id", type=int)
     acceleration = sub.add_parser("acceleration")
@@ -218,12 +368,66 @@ def build_parser():
     return p
 
 
-def main(argv=None):
+def main(argv=None) -> int:
+    """Parse arguments, then dispatch with a top-level user-facing error guard."""
     args = build_parser().parse_args(argv)
-    c, d = _ctx(args)
+    verbose = bool(getattr(args, "verbose", False))
+    database = None
+    try:
+        c, d = _ctx(args)
+        database = d
+        return _dispatch(args, c, d)
+    except KeyboardInterrupt:
+        print("Interrupted by user (SIGINT); no partial move was left unverified.", file=sys.stderr)
+        return 130
+    except BrokenPipeError:
+        return 0
+    except SystemExit:
+        raise
+    except Exception as exc:  # noqa: BLE001 - single top-level guard for CLI ergonomics
+        if verbose:
+            raise
+        print(f"error: {exc}", file=sys.stderr)
+        return 1
+    finally:
+        if database is not None:
+            database.close()
+
+
+def _dispatch(args, c, d) -> int:
     cmd = args.command
     if cmd == "init-workspace":
         print(f"Workspace ready: {c.workspace}")
+        return 0
+    if cmd == "quickstart":
+        import json as _json
+
+        from .quickstart import next_steps, run_quickstart
+
+        summary = run_quickstart(
+            d,
+            c,
+            Path(args.source_root),
+            generate_reports=not args.no_reports,
+            progress=lambda message: print(message, file=sys.stderr),
+        )
+        if args.json:
+            print(_json.dumps(summary, indent=2, sort_keys=True))
+            return 0
+        totals = summary["totals"]
+        print("\nQuickstart complete (read-only — nothing was moved or deleted).")
+        print(f"  workspace:         {summary['workspace']}")
+        print(f"  files:             {totals['files']}")
+        print(f"  directories:       {totals['directories']}")
+        print(f"  content objects:   {totals['content_objects']}")
+        print(f"  duplicate groups:  {totals['exact_duplicate_groups']}")
+        print(f"  duplicate files:   {totals['duplicate_files']}")
+        print(f"  protected:         {totals['protected']}")
+        if summary.get("reports"):
+            print(f"  reports written:   {len(summary['reports'])}")
+        print("\nNext steps:")
+        for step in next_steps(c):
+            print(f"  - {step}")
         return 0
     if cmd == "scan":
         print(
@@ -317,7 +521,7 @@ def main(argv=None):
                 c,
                 "DIRECTORY_OVERLAP",
                 {"scope": scope_payload},
-                lambda _job: run_directory_overlap_analysis(d, c, analyzer_scope),
+                lambda _job: run_directory_overlap_analysis(d, c, analyzer_scope, _job),
             )
         if args.kind in {"document-versions", "all"}:
             from .analyzers.document_versions import run_document_version_analysis
@@ -359,9 +563,168 @@ def main(argv=None):
                 {"analyzer": "similarity", "scope": scope_payload},
                 lambda _job: run_image_analysis(d, c, analyzer_scope, _job),
             )
+        if args.kind in {"contact-sheets", "all"}:
+            # Contact sheets composite existing thumbnails of each IMAGE_SIMILARITY group; they run
+            # after image similarity so the groups exist.
+            from .analyzers.contact_sheets import run_contact_sheet_generation
+
+            result = _run_job(
+                d,
+                c,
+                "CONTACT_SHEET_GENERATION",
+                {"analyzer": "contact-sheets", "scope": scope_payload},
+                lambda _job: run_contact_sheet_generation(d, c, analyzer_scope, _job),
+            )
+            if args.kind == "contact-sheets":
+                print(result)
+        if args.kind in {
+            "normalized-content",
+            "image-equivalence",
+            "office-equivalence",
+            "pdf-equivalence",
+            "archive-equivalence",
+        }:
+            from .analyzers.normalized_content import run_normalized_content_analysis
+            from .canonical.roles import assign_canonical_roles
+
+            result = _run_job(
+                d,
+                c,
+                "CONTENT_ANALYSIS",
+                {"analyzer": args.kind, "scope": scope_payload},
+                lambda _job: run_normalized_content_analysis(d, c, analyzer_scope, _job),
+            )
+            assign_canonical_roles(d)
+            print(result)
+        if args.kind == "chunks":
+            from .analyzers.content_defined_chunks import run_chunk_analysis
+
+            print(
+                _run_job(
+                    d,
+                    c,
+                    "CHUNK_ANALYSIS",
+                    {"scope": scope_payload},
+                    lambda _job: run_chunk_analysis(d, c, analyzer_scope, _job),
+                )
+            )
+        if args.kind == "chunk-overlap":
+            from .analyzers.content_defined_chunks import run_chunk_overlap_analysis
+
+            print(
+                _run_job(
+                    d, c, "CHUNK_OVERLAP", {}, lambda _job: run_chunk_overlap_analysis(d, c, _job)
+                )
+            )
+        if args.kind == "binary-similarity":
+            from .analyzers.binary_similarity import run_binary_similarity_analysis
+
+            print(
+                _run_job(d, c, "CONTENT_ANALYSIS", {"analyzer": "binary-similarity"},
+                         lambda _job: run_binary_similarity_analysis(d, c, _job))
+            )
+        if args.kind == "document-minhash":
+            from .analyzers.document_minhash import run_document_minhash_analysis
+
+            print(
+                _run_job(
+                    d,
+                    c,
+                    "VERSION_ANALYSIS",
+                    {"scope": scope_payload},
+                    lambda _job: run_document_minhash_analysis(d, c, analyzer_scope, _job),
+                )
+            )
+        if args.kind == "backup-value":
+            from .collections.marginal_value import run_backup_value_analysis
+
+            print(_run_job(d, c, "DIRECTORY_SUMMARY", {}, lambda _job: run_backup_value_analysis(d, c, job_id=_job)))
+        if args.kind == "preservation-risk":
+            from .analyzers.preservation_risk import run_preservation_risk_analysis
+
+            print(
+                _run_job(
+                    d, c, "PROJECT_ANALYSIS", {}, lambda _job: run_preservation_risk_analysis(d, c, job_id=_job)
+                )
+            )
+        if args.kind == "record-series":
+            from .collections.record_series import run_record_series_analysis
+
+            print(_run_job(d, c, "CLASSIFICATION", {}, lambda _job: run_record_series_analysis(d, c, job_id=_job)))
+        if args.kind == "review-priority":
+            from .analyzers.review_priority import run_review_priority_analysis
+
+            print(
+                _run_job(d, c, "CLASSIFICATION", {}, lambda _job: run_review_priority_analysis(d, c, job_id=_job))
+            )
+        if args.kind == "lifecycle":
+            from .analyzers.lifecycle import run_lifecycle_analysis
+
+            print(_run_job(d, c, "CLASSIFICATION", {}, lambda _job: run_lifecycle_analysis(d, c, job_id=_job)))
+        if args.kind == "photo-events":
+            from .collections.events import run_photo_event_analysis
+
+            print(_run_job(d, c, "IMAGE_ANALYSIS", {}, lambda _job: run_photo_event_analysis(d, c, job_id=_job)))
+        if args.kind == "work-sessions":
+            from .collections.events import run_work_session_analysis
+
+            print(_run_job(d, c, "VERSION_ANALYSIS", {}, lambda _job: run_work_session_analysis(d, c, job_id=_job)))
+        if args.kind == "acquisition-batches":
+            from .collections.events import run_acquisition_batch_analysis
+
+            print(
+                _run_job(d, c, "DIRECTORY_SUMMARY", {}, lambda _job: run_acquisition_batch_analysis(d, c, job_id=_job))
+            )
+        if args.kind == "archive-of-directory":
+            from .analyzers.archive_equivalence import run_archive_directory_analysis
+
+            print(
+                _run_job(d, c, "ARCHIVE_ANALYSIS", {}, lambda _job: run_archive_directory_analysis(d, c, job_id=_job))
+            )
+        if args.kind == "derivations":
+            from .analyzers.cross_format_derivation import run_cross_format_derivation_analysis
+
+            print(
+                _run_job(
+                    d,
+                    c,
+                    "VERSION_ANALYSIS",
+                    {"scope": scope_payload},
+                    lambda _job: run_cross_format_derivation_analysis(d, c, analyzer_scope, _job),
+                )
+            )
+        if args.kind == "all":
+            # Include the cheap advanced analyzers in `all`; chunking, MinHash, and binary fuzzy
+            # similarity stay opt-in (large/expensive). Priority + lifecycle run after classify.
+            from .analyzers.archive_equivalence import run_archive_directory_analysis
+            from .analyzers.cross_format_derivation import run_cross_format_derivation_analysis
+            from .analyzers.normalized_content import run_normalized_content_analysis
+            from .analyzers.preservation_risk import run_preservation_risk_analysis
+            from .canonical.roles import assign_canonical_roles
+            from .collections.events import run_photo_event_analysis
+            from .collections.marginal_value import run_backup_value_analysis
+            from .collections.record_series import run_record_series_analysis
+
+            _run_job(d, c, "CONTENT_ANALYSIS", {"analyzer": "normalized-content"},
+                     lambda _job: run_normalized_content_analysis(d, c, analyzer_scope, _job))
+            assign_canonical_roles(d)
+            _run_job(d, c, "VERSION_ANALYSIS", {}, lambda _job: run_cross_format_derivation_analysis(d, c, job_id=_job))
+            _run_job(d, c, "ARCHIVE_ANALYSIS", {}, lambda _job: run_archive_directory_analysis(d, c, job_id=_job))
+            _run_job(d, c, "DIRECTORY_SUMMARY", {}, lambda _job: run_backup_value_analysis(d, c, job_id=_job))
+            _run_job(d, c, "CLASSIFICATION", {}, lambda _job: run_record_series_analysis(d, c, job_id=_job))
+            _run_job(d, c, "PROJECT_ANALYSIS", {}, lambda _job: run_preservation_risk_analysis(d, c, job_id=_job))
+            _run_job(d, c, "IMAGE_ANALYSIS", {}, lambda _job: run_photo_event_analysis(d, c, job_id=_job))
         return 0
     if cmd == "classify":
+        from .analyzers.lifecycle import run_lifecycle_analysis
+        from .analyzers.review_priority import run_review_priority_analysis
+
         _run_job(d, c, "CLASSIFICATION", {}, lambda _job: classify_all_entries(d, c))
+        # Prioritization and lifecycle depend on classifications, so they run right after.
+        _run_job(d, c, "CLASSIFICATION", {"stage": "review-priority"},
+                 lambda _job: run_review_priority_analysis(d, c, job_id=_job))
+        _run_job(d, c, "CLASSIFICATION", {"stage": "lifecycle"},
+                 lambda _job: run_lifecycle_analysis(d, c, job_id=_job))
         return 0
     if cmd == "report":
         print(
@@ -392,7 +755,7 @@ def main(argv=None):
             ),
         )
         return 0
-    if cmd in {"validate-manifest", "verify-review"}:
+    if cmd == "validate-manifest":
         errors = _run_job(
             d,
             c,
@@ -405,6 +768,21 @@ def main(argv=None):
         )
         print("valid" if not errors else "\n".join(errors))
         return 0 if not errors else 2
+    if cmd == "verify-review":
+        from .restore import verify_transaction
+
+        results = _run_job(
+            d,
+            c,
+            "MANIFEST_VALIDATION",
+            {"transaction": args.manifest},
+            lambda _job: verify_transaction(Path(args.manifest)),
+        )
+        for record in results:
+            print(f"{record.get('verify_status')}: {record.get('destination_path')}")
+        unverified = [r for r in results if r.get("verify_status") not in {"VERIFIED", "SKIPPED"}]
+        print(f"{len(results) - len(unverified)}/{len(results)} verified")
+        return 0 if not unverified else 2
     if cmd == "move-to-review":
         entries = load_manifest(Path(args.manifest))
         errors = validate_manifest_schema(entries) + validate_manifest_against_database(entries, d)
@@ -435,36 +813,42 @@ def main(argv=None):
         )
         return 0
     if cmd == "scan-status":
-        print(
+        _emit(
             d.fetch_all(
-                "SELECT id,source_root,status,files_seen,bytes_seen FROM scan_runs ORDER BY id DESC LIMIT 1"
+                "SELECT id,source_root,status,files_seen,directories_seen,symlinks_seen,errors_seen,bytes_seen,started_at,completed_at FROM scan_runs ORDER BY id DESC LIMIT 5"
             )
         )
         return 0
     if cmd == "stats":
-        print(
+        _emit(
             d.fetch_all(
-                "SELECT entry_type,COUNT(*) n,SUM(size_bytes) bytes FROM filesystem_entries GROUP BY entry_type"
+                "SELECT entry_type,COUNT(*) n,COALESCE(SUM(size_bytes),0) bytes FROM filesystem_entries GROUP BY entry_type ORDER BY entry_type"
             )
         )
         return 0
     if cmd == "diff":
-        print(
+        _emit(
             d.fetch_all(
-                "SELECT relative_path,change_status,evidence_json FROM scan_entry_changes WHERE scan_run_id=? ORDER BY relative_path",
+                "SELECT change_status,COUNT(*) n FROM scan_entry_changes WHERE scan_run_id=? GROUP BY change_status ORDER BY change_status",
+                (args.scan_b,),
+            )
+        )
+        _emit(
+            d.fetch_all(
+                "SELECT relative_path,change_status FROM scan_entry_changes WHERE scan_run_id=? ORDER BY relative_path LIMIT 200",
                 (args.scan_b,),
             )
         )
         return 0
     if cmd == "sources":
         if args.sources_command == "list":
-            print(
+            _emit(
                 d.fetch_all(
                     "SELECT id,display_name,last_mount_path,last_seen_at FROM source_roots ORDER BY id"
                 )
             )
         elif args.sources_command == "show":
-            print(d.fetch_one("SELECT * FROM source_roots WHERE id=?", (args.source_id,)))
+            _emit(d.fetch_one("SELECT * FROM source_roots WHERE id=?", (args.source_id,)))
         else:
             d.connect().execute(
                 "UPDATE source_roots SET last_mount_path=?,last_seen_at=CURRENT_TIMESTAMP WHERE id=?",
@@ -509,14 +893,14 @@ def main(argv=None):
                     "resume scheduled; rerun the corresponding analyzer command to continue its idempotent content work"
                 )
             return 0
-        print(
-            d.fetch_all(
-                "SELECT * FROM jobs WHERE id=?"
-                if args.jobs_command == "show"
-                else "SELECT id,job_type,status,processed_count,total_estimate,updated_at FROM jobs ORDER BY id DESC",
-                (args.job_id,) if args.jobs_command == "show" else (),
+        if args.jobs_command == "show":
+            _emit(d.fetch_one("SELECT * FROM jobs WHERE id=?", (args.job_id,)))
+        else:
+            _emit(
+                d.fetch_all(
+                    "SELECT id,job_type,status,processed_count,total_estimate,error_count,updated_at FROM jobs ORDER BY id DESC LIMIT 50"
+                )
             )
-        )
         return 0
     if cmd == "database":
         if args.database_command == "backup":
@@ -578,7 +962,7 @@ def main(argv=None):
                 "graph": (0.7, 2000),
                 "duplicates": (100,),
             }
-            print(
+            _emit(
                 d.fetch_all(
                     "EXPLAIN QUERY PLAN " + queries[args.query_name], params[args.query_name]
                 )
@@ -598,7 +982,7 @@ def main(argv=None):
         if args.review_command == "create":
             print(create_session(d, args.name, args.description))
         elif args.review_command == "list":
-            print(
+            _emit(
                 d.fetch_all(
                     "SELECT id,name,status,updated_at FROM review_sessions ORDER BY id DESC"
                 )
@@ -644,9 +1028,148 @@ def main(argv=None):
             override_canonical(d, args.session_id, args.group_id, args.entry_id)
             print("canonical override recorded")
         else:
-            print(d.fetch_one("SELECT * FROM review_sessions WHERE id=?", (args.session_id,)))
+            _emit(d.fetch_one("SELECT * FROM review_sessions WHERE id=?", (args.session_id,)))
+        return 0
+    if cmd == "chunks":
+        from .chunking.index import clear_chunk_index, estimate_chunk_analysis
+
+        if args.chunks_command == "estimate":
+            _emit(estimate_chunk_analysis(d, c))
+        else:
+            _emit(clear_chunk_index(d, None, args.dry_run))
+        return 0
+    if cmd == "derived-data":
+        from .chunking.index import clear_chunk_index, estimate_chunk_analysis
+
+        if args.derived_command == "estimate":
+            _emit(estimate_chunk_analysis(d, c))
+        elif args.kind == "CHUNK_INDEX":
+            _emit(clear_chunk_index(d, None, args.dry_run))
+        else:
+            from .similarity.minhash import clear_minhash_index
+
+            _emit(clear_minhash_index(d, args.dry_run))
+        return 0
+    if cmd == "collections":
+        from .collections.marginal_value import simulate_removal
+
+        if args.collections_command == "list":
+            _emit(
+                d.fetch_all(
+                    "SELECT id,cluster_type,name,confidence FROM collection_clusters ORDER BY id DESC LIMIT 100"
+                )
+            )
+        elif args.collections_command == "show":
+            _emit(d.fetch_one("SELECT * FROM collection_clusters WHERE id=?", (args.collection_id,)))
+            _emit(
+                d.fetch_all(
+                    "SELECT member_type,member_id,sequence_index FROM collection_members WHERE cluster_id=? ORDER BY sequence_index LIMIT 200",
+                    (args.collection_id,),
+                )
+            )
+        elif args.collections_command == "simulate-removal":
+            _emit(simulate_removal(d, args.collection_id))
+        elif args.collections_command == "retention":
+            from .collections.retention import apply_retention_policies
+
+            _emit(apply_retention_policies(d, c))
+        else:
+            from .collections.record_series import assign_series_to_collection
+
+            assign_series_to_collection(d, args.collection_id, args.series_id)
+            print("assigned")
+        return 0
+    if cmd == "preservation":
+        if args.preservation_command == "queue":
+            _emit(
+                d.fetch_all(
+                    """SELECT p.target_id,e.relative_path,p.recommended_action,p.format_risk,p.encryption_risk,p.integrity_risk
+                       FROM preservation_assessments p JOIN filesystem_entries e ON e.id=p.target_id
+                       WHERE p.recommended_action NOT IN ('KEEP_WITH_CHECKSUM') ORDER BY p.id LIMIT 200"""
+                )
+            )
+        else:
+            _emit(
+                d.fetch_all(
+                    "SELECT recommended_action,COUNT(*) n FROM preservation_assessments GROUP BY recommended_action ORDER BY n DESC"
+                )
+            )
+        return 0
+    if cmd == "learning":
+        from .learning import prediction, training
+
+        if args.learning_command == "train":
+            _emit(training.train_model(d, c))
+        elif args.learning_command == "evaluate":
+            _emit(training.evaluate_model(d, c))
+        elif args.learning_command == "predict":
+            _emit(prediction.predict_pending(d, c))
+        else:
+            d.connect().execute("UPDATE review_learning_models SET active=0")
+            d.connect().commit()
+            print("learning disabled")
+        return 0
+    if cmd == "known":
+        from .known_content import add_assertion, list_assertions
+
+        if args.known_command == "list":
+            _emit(list_assertions(d))
+        else:
+            print(add_assertion(d, args.assertion, args.scope_type, args.scope_value))
+        return 0
+    if cmd == "canonical":
+        from .canonical.roles import assign_canonical_roles, roles_for_group
+
+        if args.canonical_command == "assign":
+            print(assign_canonical_roles(d))
+        elif args.canonical_command in {"show", "explain"}:
+            group_type = args.type
+            _emit(roles_for_group(d, group_type, args.group_id))
+        else:
+            _emit(
+                d.fetch_all(
+                    "SELECT target_group_type,target_group_id,canonical_role,entry_id,content_object_id FROM canonical_assignments WHERE superseded_at IS NULL ORDER BY id DESC LIMIT 100"
+                )
+            )
         return 0
     if cmd == "benchmark":
+        if args.kind in {"baseline", "compare"}:
+            import json
+            import tempfile
+
+            from .benchmarking import (
+                compare,
+                default_baseline_path,
+                load_baseline,
+                run_suite,
+                write_baseline,
+            )
+
+            baseline_path = Path(args.baseline) if args.baseline else default_baseline_path()
+            # The suite runs against its own throwaway workspace so a benchmark never mutates the
+            # user's real inventory database.
+            with tempfile.TemporaryDirectory() as tmp:
+                suite = run_suite(Path(tmp))
+            if args.kind == "baseline":
+                write_baseline(baseline_path, suite)
+                print(
+                    json.dumps(
+                        {
+                            "status": "written",
+                            "path": str(baseline_path),
+                            "profiles": sorted(suite["profiles"]),
+                            "environment": suite["environment"],
+                        }
+                    )
+                )
+                return 0
+            if not baseline_path.exists():
+                print(json.dumps({"status": "no-baseline", "path": str(baseline_path)}))
+                return 1
+            result = compare(suite, load_baseline(baseline_path), timing_tolerance=args.tolerance)
+            print(json.dumps(result, indent=2))
+            # A count regression (correctness drift) or a same-runner timing regression fails.
+            return 0 if result["ok"] else 1
         if args.kind == "scan" and args.fixture:
             import time
 
@@ -659,7 +1182,7 @@ def main(argv=None):
             )
         return 0
     if cmd == "profile":
-        print(d.fetch_one("SELECT * FROM jobs WHERE id=?", (args.job_id,)))
+        _emit(d.fetch_one("SELECT * FROM jobs WHERE id=?", (args.job_id,)))
         return 0
     if cmd == "acceleration":
         from .acceleration.capability_detection import detect_backend
@@ -701,14 +1224,18 @@ def main(argv=None):
                 ),
             )
             if args.graph_command == "export":
+                if args.format == "svg":
+                    from .graph.serialization import to_svg
+
+                    content = to_svg(payload)
+                else:
+                    content = json.dumps(payload, indent=2)
                 _run_job(
                     d,
                     c,
                     "GRAPH_EXPORT",
-                    {"projection": args.projection, "output": args.output},
-                    lambda _job: Path(args.output).write_text(
-                        json.dumps(payload, indent=2), encoding="utf-8"
-                    ),
+                    {"projection": args.projection, "output": args.output, "format": args.format},
+                    lambda _job: Path(args.output).write_text(content, encoding="utf-8"),
                 )
                 print(args.output)
             else:
@@ -716,6 +1243,7 @@ def main(argv=None):
         return 0
     if cmd == "dashboard":
         import uvicorn
+        from .analyzers.contact_sheets import contact_sheet_dir
         from .dashboard.app import create_app
 
         host = args.host or c.data["dashboard"]["host"]
@@ -726,7 +1254,7 @@ def main(argv=None):
                 "refusing non-loopback dashboard binding; set dashboard.allow_non_loopback=true explicitly"
             )
         uvicorn.run(
-            create_app(d, args.read_only),
+            create_app(d, args.read_only, contact_sheet_dir(c)),
             host=host,
             port=args.port or c.data["dashboard"]["port"],
             log_level="info",

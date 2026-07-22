@@ -75,7 +75,7 @@ def extract_basic_media_metadata(path: Path, config):
         return {"analysis_status": "ERROR", "analysis_error": str(exc)}
 
 
-def run_media_analysis(database, config):
+def run_media_analysis(database, config, scope=None, job_id=None):
     from .registry import run_content_analysis
 
-    return run_content_analysis(database, config, "media")
+    return run_content_analysis(database, config, "media", job_id=job_id)

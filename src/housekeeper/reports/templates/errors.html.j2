@@ -1,0 +1,23 @@
+{% extends "_base.html.j2" %}
+{% block content %}
+<p class="warn">Unreadable, malformed, and parser-failed items are shown here. They are classified
+ERROR — never as safe to remove. Inspection failure never lowers retention value.</p>
+<h2>Filesystem read errors</h2>
+<div class="overflow"><table>
+  <tr><th>Path</th><th>Error</th></tr>
+  {% for e in scan_errors %}
+  <tr><td class="path">{{ e.relative_path }}</td><td>{{ e.read_error }}</td></tr>
+  {% else %}
+  <tr><td colspan="2">None.</td></tr>
+  {% endfor %}
+</table></div>
+<h2>Parser failures / unsupported</h2>
+<div class="overflow"><table>
+  <tr><th>Analyzer</th><th>Error code</th><th class="num">Count</th></tr>
+  {% for p in parser_errors %}
+  <tr><td>{{ p.analyzer_name }}</td><td><code>{{ p.error_code }}</code></td><td class="num">{{ p.n }}</td></tr>
+  {% else %}
+  <tr><td colspan="3">None.</td></tr>
+  {% endfor %}
+</table></div>
+{% endblock %}

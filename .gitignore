@@ -217,15 +217,35 @@ __marimo__/
 # Streamlit
 .streamlit/secrets.toml
 
-.venv
-__pycache__/
-*.py[cod]
-.pytest_cache/
-.mypy_cache/
-.ruff_cache/
-workspace/*.sqlite*
-workspace/logs/*
-workspace/reports/*
-workspace/manifests/*
+# ---------------------------------------------------------------------------
+# Housekeeper runtime artifacts
+# ---------------------------------------------------------------------------
+# Default workspace layout (see config/default.yaml + README):
+#   workspace/inventory.sqlite[.wal|.shm|.journal]
+#   workspace/logs/housekeeper.log[.N]
+#   workspace/reports/*.{html,csv,jsonl}
+#   workspace/manifests/*.{csv,jsonl}
+#   workspace/backups/*.sqlite*
+#   workspace/.housekeeper/thumbnails/*.jpg
+#   workspace/.housekeeper/contact_sheets/*.jpg
+# Nested workspaces from `--workspace workspace` are also covered.
+workspace/**
+!workspace/**/
 !workspace/**/.gitkeep
-*.pyc
+
+# SQLite inventory + sidecars (PRAGMA journal_mode=WAL). Catch these even if
+# the DB or a `database backup` copy lands outside the default workspace/.
+*.sqlite
+*.sqlite-wal
+*.sqlite-shm
+*.sqlite-journal
+*.db
+*.db-wal
+*.db-shm
+*.db-journal
+
+# Derived media / local artifact store when workspace is relocated into the repo
+.housekeeper/
+
+# RotatingFileHandler backups (housekeeper.log.1 .. .3); *.log is covered above
+housekeeper.log.*

@@ -33,6 +33,10 @@ def stat_fingerprint(record: FileStatRecord) -> str:
 class DriveScanner:
     def __init__(self, database: Database, config: AppConfig):
         self.db, self.config = database, config
+        # The scan_run id written by the most recent scan() call (set before scan returns), so a
+        # caller can scope follow-up analysis to exactly the run just produced rather than guessing
+        # via MAX(scan_runs.id) — which is wrong when a scan resumes an earlier interrupted run.
+        self.last_run_id: int | None = None
 
     def inspect_entry(self, path: Path, root: Path) -> FileStatRecord:
         try:
@@ -119,6 +123,7 @@ class DriveScanner:
                 python_version=sys.version,
             )
         )
+        self.last_run_id = run_id
         previous = (
             self.db.fetch_one(
                 "SELECT id FROM scan_runs WHERE source_root_fingerprint=? AND id<>? AND status='COMPLETE' ORDER BY id DESC LIMIT 1",

@@ -1,0 +1,51 @@
+{% extends "_base.html.j2" %}
+{% block content %}
+<section class="facts">
+  <h2>Scan identity</h2>
+  <p>
+    Source root: <span class="path">{{ identity.source_root or "—" }}</span><br>
+    Fingerprint: <code>{{ (identity.source_root_fingerprint or "")[:16] }}</code> ·
+    Config fingerprint: <code>{{ config_fingerprint }}</code><br>
+    Started: {{ identity.started_at or "—" }} · Completed: {{ identity.completed_at or "—" }} ·
+    Status: {{ identity.status or "—" }}
+  </p>
+  <div class="cards">
+    <div class="card"><b>{{ file_count }}</b> files</div>
+    <div class="card"><b>{{ byte_count | human_size }}</b> indexed</div>
+    <div class="card"><b>{{ content_objects }}</b> unique content objects</div>
+    <div class="card"><b>{{ exact_duplicate_groups }}</b> exact-duplicate groups</div>
+    <div class="card"><b>{{ exact_duplicate_bytes | human_size }}</b> duplicate bytes*</div>
+    <div class="card"><b>{{ backup_overlaps }}</b> redundant backups</div>
+    <div class="card"><b>{{ document_version_groups }}</b> doc-version groups</div>
+    <div class="card"><b>{{ image_groups }}</b> image groups</div>
+    <div class="card"><b>{{ projects }}</b> projects</div>
+    <div class="card"><b>{{ protected }}</b> protected</div>
+    <div class="card"><b>{{ unknown }}</b> unknown</div>
+    <div class="card"><b>{{ errors }}</b> error</div>
+    <div class="card"><b>{{ unreadable }}</b> unreadable</div>
+  </div>
+  <p style="font-size:.85em">* excludes one canonical copy per group.</p>
+</section>
+
+<section class="estimate">
+  <h2>Estimated reviewable bytes by classification <span class="warn">(estimate, not guaranteed)</span></h2>
+  <table>
+    <tr><th>Classification</th><th class="num">Files</th><th class="num">Bytes</th></tr>
+    {% for name, info in reviewable_by_class.items() %}
+    <tr><td>{{ name }}</td><td class="num">{{ info.count }}</td><td class="num">{{ info.bytes | human_size }}</td></tr>
+    {% endfor %}
+  </table>
+</section>
+
+{% if content_relationships %}
+<section class="facts">
+  <h2>Tiered content relationships</h2>
+  <table>
+    <tr><th>Type</th><th>Evidence tier</th><th class="num">Count</th></tr>
+    {% for r in content_relationships %}
+    <tr><td>{{ r.relationship_type }}</td><td>{{ r.evidence_tier }}</td><td class="num">{{ r.n }}</td></tr>
+    {% endfor %}
+  </table>
+</section>
+{% endif %}
+{% endblock %}

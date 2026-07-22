@@ -1,0 +1,19 @@
+{% extends "_base.html.j2" %}
+{% block content %}
+<p class="facts">{{ groups | length }} exact-duplicate groups (verified by full SHA-256). One canonical
+copy per group is retained; only non-canonical members are review candidates.</p>
+{% for g in groups %}
+<section class="facts">
+  <h3>Group <code>{{ g.hash }}</code> · {{ g.size_bytes | human_size }} × {{ g.member_count }}
+      · <span class="estimate">{{ g.redundant_bytes | human_size }} redundant</span></h3>
+  <table>
+    <tr><th>Role</th><th>Path</th></tr>
+    {% for m in g.members %}
+    <tr><td>{{ "canonical (retained)" if m.is_canonical else "duplicate" }}</td><td class="path">{{ m.relative_path }}</td></tr>
+    {% endfor %}
+  </table>
+</section>
+{% else %}
+<p>No exact duplicates found.</p>
+{% endfor %}
+{% endblock %}

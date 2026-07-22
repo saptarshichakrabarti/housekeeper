@@ -135,6 +135,35 @@ def check_cancelled(database: Database, job_id: int) -> None:
         raise JobCancelled(f"job {job_id} cancelled")
 
 
+def checkpoint(
+    database: Database,
+    job_id: int | None,
+    processed_count: int | None = None,
+    current_item: str | None = None,
+    state: dict[str, Any] | None = None,
+) -> None:
+    """One cooperative checkpoint for an analyzer loop.
+
+    Honors any pending pause/cancel request (raising ``JobPaused`` / ``JobCancelled`` so the
+    tracked job settles into a resumable terminal state), then records progress telemetry. A no-op
+    when ``job_id`` is ``None`` so every analyzer remains directly callable outside a job. Resume is
+    idempotent re-run rather than seek-to-offset, so the recorded ``state`` is progress telemetry,
+    not a mandatory resume cursor.
+    """
+    if job_id is None:
+        return
+    check_cancelled(database, job_id)
+    if processed_count is not None or current_item is not None or state is not None:
+        update_job(
+            database,
+            job_id,
+            "RUNNING",
+            processed_count=processed_count,
+            current_item=current_item,
+            checkpoint=state,
+        )
+
+
 @contextmanager
 def tracked_job(
     database: Database,

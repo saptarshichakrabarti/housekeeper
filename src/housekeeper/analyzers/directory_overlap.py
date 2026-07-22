@@ -71,41 +71,91 @@ def build_directory_summaries(
     database.connect().commit()
 
 
-def run_directory_overlap_analysis(
-    database: Database, config: AppConfig, scope: AnalyzerScope | None = None
-) -> None:
-    build_directory_summaries(database, config, scope)
+# A single hash shared by more directories than this is treated as non-discriminating and
+# skipped for candidate generation to keep the pairwise fan-out bounded; any real backup
+# relationship is still found through its more distinctive shared content.
+MAX_SHARED_HASH_FANOUT = 64
+
+
+def _candidate_directory_hash_sets(
+    database: Database, config: AppConfig
+) -> dict[int, set[str]]:
+    """Fetch each candidate directory's verified-hash set exactly once (N queries, not N²)."""
     rows = database.fetch_all(
-        "SELECT entry_id,recursive_file_count,recursive_size_bytes,content_signature FROM directory_summaries WHERE recursive_file_count>=?",
+        """SELECT ds.entry_id,e.scan_run_id,e.relative_path
+           FROM directory_summaries ds JOIN filesystem_entries e ON e.id=ds.entry_id
+           WHERE ds.recursive_file_count>=?""",
         (config.section("directory_overlap")["minimum_files"],),
     )
-    for a in rows:
-        hashes_a = get_directory_hash_set(a["entry_id"], database)
-        if not hashes_a:
-            continue
-        for b in rows:
-            if a["entry_id"] >= b["entry_id"]:
-                continue
-            hashes_b = get_directory_hash_set(b["entry_id"], database)
-            if not hashes_b:
-                continue
-            containment = max(
-                calculate_containment(hashes_a, hashes_b), calculate_containment(hashes_b, hashes_a)
+    result: dict[int, set[str]] = {}
+    for row in rows:
+        prefix = (row["relative_path"] + "/%") if row["relative_path"] else "%"
+        hashes = {
+            r["full_hash"]
+            for r in database.iter_rows(
+                "SELECT s.full_hash FROM filesystem_entries e JOIN file_signatures s ON s.entry_id=e.id "
+                "WHERE e.scan_run_id=? AND e.relative_path LIKE ? AND s.full_hash IS NOT NULL",
+                (row["scan_run_id"], prefix),
             )
-            if containment >= config.section("directory_overlap")["containment_threshold"]:
-                source, target = (a, b) if len(hashes_a) <= len(hashes_b) else (b, a)
-                upsert_relationship(
-                    database,
-                    "DIRECTORY",
-                    source["entry_id"],
-                    "DIRECTORY",
-                    target["entry_id"],
-                    "MOSTLY_CONTAINED_IN",
-                    containment,
-                    {
-                        "shared_hashes": len(hashes_a & hashes_b),
-                        "source_hashes": len(hashes_a),
-                        "target_hashes": len(hashes_b),
-                    },
-                    "1",
-                )
+        }
+        if hashes:
+            result[int(row["entry_id"])] = hashes
+    return result
+
+
+def generate_candidate_directory_pairs(
+    dir_hashes: dict[int, set[str]],
+) -> set[tuple[int, int]]:
+    """Only directories that share at least one verified content hash are compared."""
+    from collections import defaultdict
+
+    hash_to_dirs: dict[str, list[int]] = defaultdict(list)
+    for directory_id, hashes in dir_hashes.items():
+        for content_hash in hashes:
+            hash_to_dirs[content_hash].append(directory_id)
+    pairs: set[tuple[int, int]] = set()
+    for sharing in hash_to_dirs.values():
+        if not 2 <= len(sharing) <= MAX_SHARED_HASH_FANOUT:
+            continue
+        ordered = sorted(sharing)
+        for i, left in enumerate(ordered):
+            for right in ordered[i + 1 :]:
+                pairs.add((left, right))
+    return pairs
+
+
+def run_directory_overlap_analysis(
+    database: Database,
+    config: AppConfig,
+    scope: AnalyzerScope | None = None,
+    job_id: int | None = None,
+) -> None:
+    from ..jobs import checkpoint
+
+    build_directory_summaries(database, config, scope)
+    threshold = config.section("directory_overlap")["containment_threshold"]
+    dir_hashes = _candidate_directory_hash_sets(database, config)
+    for index, (a_id, b_id) in enumerate(sorted(generate_candidate_directory_pairs(dir_hashes)), 1):
+        checkpoint(database, job_id, processed_count=index, state={"last_pair": [a_id, b_id]})
+        hashes_a, hashes_b = dir_hashes[a_id], dir_hashes[b_id]
+        containment = max(
+            calculate_containment(hashes_a, hashes_b), calculate_containment(hashes_b, hashes_a)
+        )
+        if containment >= threshold:
+            # The smaller (more likely contained/predecessor) directory is the source.
+            source_id, target_id = (a_id, b_id) if len(hashes_a) <= len(hashes_b) else (b_id, a_id)
+            upsert_relationship(
+                database,
+                "DIRECTORY",
+                source_id,
+                "DIRECTORY",
+                target_id,
+                "MOSTLY_CONTAINED_IN",
+                containment,
+                {
+                    "shared_hashes": len(hashes_a & hashes_b),
+                    "source_hashes": len(dir_hashes[source_id]),
+                    "target_hashes": len(dir_hashes[target_id]),
+                },
+                "1",
+            )

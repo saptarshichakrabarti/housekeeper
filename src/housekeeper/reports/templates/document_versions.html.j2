@@ -1,0 +1,16 @@
+{% extends "_base.html.j2" %}
+{% block content %}
+<p class="warn">Near-duplicate documents are review-only. They are never treated as interchangeable
+or as safe to remove automatically.</p>
+<h2>Document families ({{ families | length }})</h2>
+<ul>{% for f in families %}<li class="path">{{ f.group_key }}</li>{% else %}<li>None.</li>{% endfor %}</ul>
+<h2>Likely version pairs</h2>
+<div class="overflow"><table>
+  <tr><th>Document A</th><th>Document B</th><th class="num">Filename similarity</th></tr>
+  {% for p in pairs %}
+  <tr><td class="path">{{ p.a_name }}</td><td class="path">{{ p.b_name }}</td><td class="num">{{ (p.confidence * 100) | round(1) }}%</td></tr>
+  {% else %}
+  <tr><td colspan="3">No document-version relationships found.</td></tr>
+  {% endfor %}
+</table></div>
+{% endblock %}

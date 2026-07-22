@@ -73,7 +73,11 @@ def is_supported_document(s):
 
 
 def is_supported_archive(s):
-    return classify_high_level_type(s) == "archive" or s.detected_type in {"zip", "tar"}
+    if classify_high_level_type(s) == "archive" or s.detected_type in {"zip", "tar"}:
+        return True
+    # A PK/zip container is a real archive only when the extension agrees; Office documents
+    # (docx/xlsx/pptx) are also zip containers and must not be treated as archives here.
+    return s.detected_type == "zip-container" and (s.extension_mime or "") == "application/zip"
 
 
 def is_supported_image(s):

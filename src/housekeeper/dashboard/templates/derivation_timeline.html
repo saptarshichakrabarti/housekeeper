@@ -1,0 +1,16 @@
+<p><a href="/derivations">&larr; All derivations</a></p>
+<h2>Derivation timeline for content object {{ content_object_id }}</h2>
+<p>Tier-6 contextual inference: each entry is a <em>likely</em> derivation ordered by the derived
+file's modified time. These are review candidates, never proof of redundancy.</p>
+<ol>
+  {% for item in items %}
+  <li>
+    <strong>{{ item.source.name }}</strong>
+    &rarr; <strong>{{ item.target.name }}</strong>
+    ({{ item.relationship_type }}, {{ item.evidence_tier }}, confidence {{ item.confidence }})
+    {% if item.gap_seconds is not none %}<br>modified {{ item.gap_seconds }}s apart{% endif %}
+    {% if item.target.modified_at %}<br>derived file modified at {{ item.target.modified_at }}{% endif %}
+    {% if item.explanation %}<br><small>{{ item.explanation }}</small>{% endif %}
+  </li>
+  {% endfor %}
+</ol>

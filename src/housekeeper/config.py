@@ -50,6 +50,9 @@ DEFAULTS: dict[str, Any] = {
         "enable_perceptual_hashing": True,
         "max_pixels": 200000000,
         "create_contact_sheets": True,
+        "contact_sheet_columns": 4,
+        "contact_sheet_cell_pixels": 160,
+        "contact_sheet_max_members": 36,
     },
     "directory_overlap": {
         "minimum_files": 5,
@@ -74,6 +77,88 @@ DEFAULTS: dict[str, Any] = {
         "compression": "gzip",
         "store_image_thumbnails": True,
         "thumbnail_max_dimension": 512,
+    },
+    "chunking": {
+        "enabled": False,
+        "minimum_file_size_bytes": 134217728,
+        "maximum_total_index_bytes": 10737418240,
+        "common_chunk_frequency_cutoff": 10000,
+        "minimum_overlap_bytes": 65536,
+        "default_profile": "balanced",
+        "profiles": {
+            "balanced": {
+                "minimum_chunk_size": 16384,
+                "average_chunk_size": 65536,
+                "maximum_chunk_size": 262144,
+            },
+            "large_binary": {
+                "minimum_chunk_size": 65536,
+                "average_chunk_size": 262144,
+                "maximum_chunk_size": 1048576,
+            },
+        },
+    },
+    "document_similarity": {
+        "enabled": True,
+        "shingle_type": "word",
+        "shingle_size": 5,
+        "minhash_permutations": 128,
+        "lsh_threshold": 0.75,
+        "verification_threshold": 0.80,
+        "minimum_tokens": 20,
+    },
+    "binary_similarity": {
+        "tlsh_enabled": False,
+        "ssdeep_enabled": False,
+        "minimum_file_size_bytes": 512,
+        "maximum_file_size_bytes": 536870912,
+    },
+    "collections": {
+        "photo_event_gap_minutes": 90,
+        "work_session_gap_hours": 8,
+        "acquisition_batch_gap_minutes": 30,
+    },
+    "preservation": {
+        "enabled": True,
+        "precise_gps_enabled": False,
+        "flag_legacy_formats": True,
+        "flag_encrypted_unknowns": True,
+    },
+    "review_priority": {
+        "weights": {
+            "recoverable_bytes": 1.0,
+            "redundancy_confidence": 1.0,
+            "regeneration_confidence": 1.0,
+            "loss_risk": -2.0,
+            "preservation_risk": -2.0,
+            "review_effort": -0.5,
+        }
+    },
+    "learning": {
+        "enabled": False,
+        "minimum_training_examples": 20,
+        "model_type": "logistic_regression",
+        "allow_protected_categories": False,
+    },
+    "normalization": {
+        "office": {
+            "enabled": True,
+            "preserve_tracked_changes": True,
+            "preserve_comments": True,
+            "ignore_volatile_properties": True,
+        },
+        "pdf": {
+            "enabled": False,
+            "compare_page_text": True,
+            "compare_embedded_images": True,
+            "render_pages_by_default": False,
+        },
+        "images": {
+            "decoded_pixel_hash": True,
+            "orientation_normalized_hash": True,
+            "preserve_metadata_differences": True,
+        },
+        "archives": {"enabled": True, "max_content_bytes": 268435456},
     },
     "dashboard": {
         "enabled": True,
@@ -188,7 +273,8 @@ def resolve_workspace_paths(config: AppConfig) -> AppConfig:
 def load_config(
     config_path: Path | None = None, workspace_override: Path | None = None
 ) -> AppConfig:
-    data = DEFAULTS
+    # Deep-copy so callers that mutate a config section never corrupt the shared DEFAULTS.
+    data = copy.deepcopy(DEFAULTS)
     if config_path:
         with Path(config_path).open(encoding="utf-8") as fh:
             data = merge_configs(DEFAULTS, yaml.safe_load(fh) or {})
@@ -211,7 +297,8 @@ def performance_profile(config: AppConfig, source_root: Path | None = None) -> d
         raise ValueError(f"unknown storage profile: {profile}")
     selected = dict(performance["profiles"][profile])
     for key in ("full_hash_workers", "quick_hash_workers", "parser_workers"):
-        selected[key] = int(performance.get(key, selected[key]))
+        override = performance.get(key, selected[key])
+        selected[key] = int(override if override is not None else selected[key])
     selected["scan_workers"] = int(selected["scan_workers"])
     selected["profile_name"] = profile
     return selected

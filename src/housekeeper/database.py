@@ -43,6 +43,83 @@ CREATE TABLE IF NOT EXISTS canonical_overrides(id INTEGER PRIMARY KEY, duplicate
 CREATE TABLE IF NOT EXISTS materialized_summaries(summary_key TEXT PRIMARY KEY, value_json TEXT NOT NULL, source_scan_run_id INTEGER REFERENCES scan_runs(id), refreshed_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP);
 CREATE INDEX IF NOT EXISTS idx_content_hash ON content_objects(hash_algorithm,full_hash,size_bytes); CREATE INDEX IF NOT EXISTS idx_link_content ON entry_content_links(content_object_id); CREATE INDEX IF NOT EXISTS idx_artifact_lookup ON analysis_artifacts(content_object_id,analyzer_name,analyzer_version,configuration_fingerprint); CREATE INDEX IF NOT EXISTS idx_jobs_status ON jobs(status,updated_at); CREATE INDEX IF NOT EXISTS idx_review_queue ON review_decisions(review_session_id,current,decision,stale); CREATE INDEX IF NOT EXISTS idx_relationship_source ON relationships(source_type,source_id,relationship_type); CREATE INDEX IF NOT EXISTS idx_relationship_target ON relationships(target_type,target_id,relationship_type); CREATE INDEX IF NOT EXISTS idx_relationship_group_members_content ON relationship_group_members(content_object_id,group_id);
 CREATE INDEX IF NOT EXISTS idx_entries_run_relative ON filesystem_entries(scan_run_id,relative_path); CREATE INDEX IF NOT EXISTS idx_changes_run_status ON scan_entry_changes(scan_run_id,change_status); CREATE INDEX IF NOT EXISTS idx_artifacts_name_status ON analysis_artifacts(analyzer_name,status,completed_at);
+CREATE TABLE IF NOT EXISTS normalization_profiles(id INTEGER PRIMARY KEY, name TEXT NOT NULL, content_kind TEXT NOT NULL, algorithm TEXT NOT NULL, algorithm_version TEXT NOT NULL, configuration_json TEXT NOT NULL DEFAULT '{}', configuration_fingerprint TEXT NOT NULL, loss_characteristics_json TEXT NOT NULL DEFAULT '[]', created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP, deprecated_at TEXT, UNIQUE(name, algorithm_version, configuration_fingerprint));
+CREATE TABLE IF NOT EXISTS normalized_content_artifacts(id INTEGER PRIMARY KEY, content_object_id INTEGER NOT NULL REFERENCES content_objects(id) ON DELETE CASCADE, normalization_profile_id INTEGER NOT NULL REFERENCES normalization_profiles(id), status TEXT NOT NULL, normalized_hash TEXT, normalized_size_bytes INTEGER, structural_fingerprint TEXT, artifact_json TEXT NOT NULL DEFAULT '{}', created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP, error_code TEXT, error_message TEXT, UNIQUE(content_object_id, normalization_profile_id));
+CREATE TABLE IF NOT EXISTS content_relationships(id INTEGER PRIMARY KEY, source_type TEXT NOT NULL, source_id INTEGER NOT NULL, target_type TEXT NOT NULL, target_id INTEGER NOT NULL, relationship_type TEXT NOT NULL, evidence_tier TEXT NOT NULL, confidence REAL NOT NULL, algorithm TEXT NOT NULL, algorithm_version TEXT NOT NULL, configuration_fingerprint TEXT NOT NULL DEFAULT '', evidence_json TEXT NOT NULL DEFAULT '{}', explanation TEXT NOT NULL DEFAULT '', status TEXT NOT NULL DEFAULT 'ACTIVE', created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP, updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP, invalidated_at TEXT, UNIQUE(source_type,source_id,target_type,target_id,relationship_type,algorithm,algorithm_version,configuration_fingerprint));
+CREATE TABLE IF NOT EXISTS similarity_signatures(id INTEGER PRIMARY KEY, content_object_id INTEGER NOT NULL REFERENCES content_objects(id) ON DELETE CASCADE, signature_type TEXT NOT NULL, signature_version TEXT NOT NULL, configuration_fingerprint TEXT NOT NULL DEFAULT '', signature_blob TEXT, feature_count INTEGER, status TEXT NOT NULL DEFAULT 'OK', created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP, UNIQUE(content_object_id, signature_type, signature_version, configuration_fingerprint));
+CREATE TABLE IF NOT EXISTS canonical_assignments(id INTEGER PRIMARY KEY, target_group_type TEXT NOT NULL, target_group_id INTEGER NOT NULL, canonical_role TEXT NOT NULL, entry_id INTEGER REFERENCES filesystem_entries(id), content_object_id INTEGER REFERENCES content_objects(id), score REAL, score_components_json TEXT NOT NULL DEFAULT '{}', source TEXT NOT NULL DEFAULT 'analyzer', created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP, superseded_at TEXT, UNIQUE(target_group_type,target_group_id,canonical_role,entry_id));
+CREATE INDEX IF NOT EXISTS idx_content_rel_source ON content_relationships(source_type,source_id,relationship_type,status); CREATE INDEX IF NOT EXISTS idx_content_rel_target ON content_relationships(target_type,target_id,relationship_type,status); CREATE INDEX IF NOT EXISTS idx_content_rel_tier ON content_relationships(evidence_tier,status);
+CREATE INDEX IF NOT EXISTS idx_norm_artifact_hash ON normalized_content_artifacts(normalization_profile_id,normalized_hash); CREATE INDEX IF NOT EXISTS idx_sig_lookup ON similarity_signatures(signature_type,signature_version); CREATE INDEX IF NOT EXISTS idx_canonical_group ON canonical_assignments(target_group_type,target_group_id,canonical_role);
+CREATE TABLE IF NOT EXISTS chunk_profiles(id INTEGER PRIMARY KEY, name TEXT NOT NULL, algorithm TEXT NOT NULL, algorithm_version TEXT NOT NULL, minimum_chunk_size INTEGER NOT NULL, average_chunk_size INTEGER NOT NULL, maximum_chunk_size INTEGER NOT NULL, hash_algorithm TEXT NOT NULL, configuration_fingerprint TEXT NOT NULL, created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP, UNIQUE(name, algorithm_version, configuration_fingerprint));
+CREATE TABLE IF NOT EXISTS content_chunks(id INTEGER PRIMARY KEY, chunking_profile_id INTEGER NOT NULL REFERENCES chunk_profiles(id), chunk_hash_algorithm TEXT NOT NULL, chunk_hash TEXT NOT NULL, size_bytes INTEGER NOT NULL, occurrence_count INTEGER NOT NULL DEFAULT 0, first_seen_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP, UNIQUE(chunking_profile_id, chunk_hash_algorithm, chunk_hash, size_bytes));
+CREATE TABLE IF NOT EXISTS chunk_occurrences(content_object_id INTEGER NOT NULL REFERENCES content_objects(id) ON DELETE CASCADE, chunk_id INTEGER NOT NULL REFERENCES content_chunks(id) ON DELETE CASCADE, sequence_index INTEGER NOT NULL, byte_offset INTEGER NOT NULL, size_bytes INTEGER NOT NULL, PRIMARY KEY(content_object_id, sequence_index));
+CREATE TABLE IF NOT EXISTS content_overlap_results(id INTEGER PRIMARY KEY, content_object_a_id INTEGER NOT NULL, content_object_b_id INTEGER NOT NULL, chunking_profile_id INTEGER NOT NULL, shared_chunk_count INTEGER NOT NULL, shared_chunk_bytes INTEGER NOT NULL, a_total_chunk_bytes INTEGER NOT NULL, b_total_chunk_bytes INTEGER NOT NULL, overlap_a_in_b REAL NOT NULL, overlap_b_in_a REAL NOT NULL, weighted_jaccard REAL NOT NULL, ordered_overlap_score REAL NOT NULL DEFAULT 0, confidence REAL NOT NULL, created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP, UNIQUE(content_object_a_id, content_object_b_id, chunking_profile_id));
+CREATE TABLE IF NOT EXISTS collection_clusters(id INTEGER PRIMARY KEY, cluster_type TEXT NOT NULL, name TEXT NOT NULL, confidence REAL NOT NULL DEFAULT 1.0, algorithm TEXT NOT NULL DEFAULT '', algorithm_version TEXT NOT NULL DEFAULT '1', scope_json TEXT NOT NULL DEFAULT '{}', summary_json TEXT NOT NULL DEFAULT '{}', created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP, UNIQUE(cluster_type, name));
+CREATE TABLE IF NOT EXISTS collection_members(cluster_id INTEGER NOT NULL REFERENCES collection_clusters(id) ON DELETE CASCADE, member_type TEXT NOT NULL, member_id INTEGER NOT NULL, membership_confidence REAL NOT NULL DEFAULT 1.0, membership_evidence_json TEXT NOT NULL DEFAULT '{}', sequence_index INTEGER NOT NULL DEFAULT 0, PRIMARY KEY(cluster_id, member_type, member_id));
+CREATE TABLE IF NOT EXISTS retention_policies(id INTEGER PRIMARY KEY, name TEXT NOT NULL, version TEXT NOT NULL DEFAULT '1', description TEXT NOT NULL DEFAULT '', rules_json TEXT NOT NULL DEFAULT '{}', created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP, deprecated_at TEXT, UNIQUE(name, version));
+CREATE TABLE IF NOT EXISTS record_series(id INTEGER PRIMARY KEY, name TEXT NOT NULL UNIQUE, description TEXT NOT NULL DEFAULT '', parent_series_id INTEGER REFERENCES record_series(id), retention_policy_id INTEGER REFERENCES retention_policies(id), sensitivity TEXT NOT NULL DEFAULT 'normal', default_preservation_priority INTEGER NOT NULL DEFAULT 0, created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP);
+CREATE TABLE IF NOT EXISTS record_series_assignments(id INTEGER PRIMARY KEY, target_type TEXT NOT NULL, target_id INTEGER NOT NULL, series_id INTEGER NOT NULL REFERENCES record_series(id), confidence REAL NOT NULL DEFAULT 1.0, evidence_json TEXT NOT NULL DEFAULT '{}', source TEXT NOT NULL DEFAULT 'analyzer', created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP, UNIQUE(target_type, target_id, series_id));
+CREATE TABLE IF NOT EXISTS preservation_assessments(id INTEGER PRIMARY KEY, target_type TEXT NOT NULL, target_id INTEGER NOT NULL, format_risk TEXT NOT NULL DEFAULT 'none', integrity_risk TEXT NOT NULL DEFAULT 'none', context_loss_risk TEXT NOT NULL DEFAULT 'none', accessibility_risk TEXT NOT NULL DEFAULT 'none', encryption_risk TEXT NOT NULL DEFAULT 'none', application_dependency_risk TEXT NOT NULL DEFAULT 'none', recommended_action TEXT NOT NULL DEFAULT 'KEEP_WITH_CHECKSUM', evidence_json TEXT NOT NULL DEFAULT '{}', created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP, UNIQUE(target_type, target_id));
+CREATE TABLE IF NOT EXISTS known_content_assertions(id INTEGER PRIMARY KEY, assertion TEXT NOT NULL, scope_type TEXT NOT NULL, scope_value TEXT NOT NULL, evidence_json TEXT NOT NULL DEFAULT '{}', source TEXT NOT NULL DEFAULT 'user', created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP, review_at TEXT, expires_at TEXT, UNIQUE(assertion, scope_type, scope_value));
+CREATE TABLE IF NOT EXISTS entry_lifecycle(entry_id INTEGER PRIMARY KEY REFERENCES filesystem_entries(id) ON DELETE CASCADE, state TEXT NOT NULL, recommendation TEXT NOT NULL DEFAULT '', evidence_json TEXT NOT NULL DEFAULT '{}', updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP);
+CREATE TABLE IF NOT EXISTS review_priority(id INTEGER PRIMARY KEY, target_type TEXT NOT NULL, target_id INTEGER NOT NULL, category TEXT NOT NULL, score REAL NOT NULL, components_json TEXT NOT NULL DEFAULT '{}', explanation TEXT NOT NULL DEFAULT '', created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP, UNIQUE(target_type, target_id));
+CREATE TABLE IF NOT EXISTS review_learning_models(id INTEGER PRIMARY KEY, model_type TEXT NOT NULL, model_version TEXT NOT NULL, feature_schema_version TEXT NOT NULL, training_scope_json TEXT NOT NULL DEFAULT '{}', training_count INTEGER NOT NULL DEFAULT 0, metrics_json TEXT NOT NULL DEFAULT '{}', artifact_json TEXT NOT NULL DEFAULT '{}', created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP, active INTEGER NOT NULL DEFAULT 0);
+CREATE TABLE IF NOT EXISTS review_learning_predictions(id INTEGER PRIMARY KEY, model_id INTEGER NOT NULL REFERENCES review_learning_models(id) ON DELETE CASCADE, target_type TEXT NOT NULL, target_id INTEGER NOT NULL, predicted_decision TEXT NOT NULL, probability REAL NOT NULL, feature_summary_json TEXT NOT NULL DEFAULT '{}', precedent_examples_json TEXT NOT NULL DEFAULT '[]', created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP, stale INTEGER NOT NULL DEFAULT 0, UNIQUE(model_id, target_type, target_id));
+CREATE INDEX IF NOT EXISTS idx_chunk_occ_chunk ON chunk_occurrences(chunk_id); CREATE INDEX IF NOT EXISTS idx_chunk_hash ON content_chunks(chunk_hash); CREATE INDEX IF NOT EXISTS idx_overlap_a ON content_overlap_results(content_object_a_id); CREATE INDEX IF NOT EXISTS idx_collection_member ON collection_members(member_type,member_id); CREATE INDEX IF NOT EXISTS idx_series_assign ON record_series_assignments(target_type,target_id); CREATE INDEX IF NOT EXISTS idx_preservation_target ON preservation_assessments(target_type,target_id); CREATE INDEX IF NOT EXISTS idx_priority_cat ON review_priority(category,score);
+-- Compatibility views: the original spec named per-format metadata and relationship-group tables.
+-- Their data is stored normalized (analysis_artifacts / relationships / relationship_groups); these
+-- views expose it under the spec's table names so `SELECT * FROM document_metadata` etc. works.
+CREATE VIEW IF NOT EXISTS document_metadata AS
+  SELECT l.entry_id AS entry_id, a.content_object_id AS content_object_id,
+    COALESCE(json_extract(a.artifact_json,'$.structured_metadata.document_type'),'text') AS document_kind,
+    json_extract(a.artifact_json,'$.normalized_text_hash') AS normalized_text_hash,
+    json_extract(a.artifact_json,'$.character_count') AS character_count,
+    json_extract(a.artifact_json,'$.word_count') AS word_count,
+    a.status AS extraction_status, a.error_message AS extraction_error
+  FROM analysis_artifacts a JOIN entry_content_links l ON l.content_object_id=a.content_object_id
+  WHERE a.analyzer_name='documents';
+CREATE VIEW IF NOT EXISTS image_metadata AS
+  SELECT l.entry_id AS entry_id, a.content_object_id AS content_object_id,
+    json_extract(a.artifact_json,'$.format') AS format,
+    json_extract(a.artifact_json,'$.width') AS width, json_extract(a.artifact_json,'$.height') AS height,
+    json_extract(a.artifact_json,'$.perceptual_hash') AS perceptual_hash, a.status AS analysis_status
+  FROM analysis_artifacts a JOIN entry_content_links l ON l.content_object_id=a.content_object_id
+  WHERE a.analyzer_name='images';
+CREATE VIEW IF NOT EXISTS media_metadata AS
+  SELECT l.entry_id AS entry_id, a.content_object_id AS content_object_id,
+    json_extract(a.artifact_json,'$.media_kind') AS media_kind,
+    json_extract(a.artifact_json,'$.duration_seconds') AS duration_seconds,
+    json_extract(a.artifact_json,'$.bitrate') AS bitrate, json_extract(a.artifact_json,'$.codec') AS codec,
+    a.status AS analysis_status
+  FROM analysis_artifacts a JOIN entry_content_links l ON l.content_object_id=a.content_object_id
+  WHERE a.analyzer_name='media';
+CREATE VIEW IF NOT EXISTS archive_metadata AS
+  SELECT l.entry_id AS entry_id, a.content_object_id AS content_object_id,
+    json_extract(a.artifact_json,'$.archive_kind') AS archive_kind,
+    json_extract(a.artifact_json,'$.member_count') AS member_count,
+    json_extract(a.artifact_json,'$.manifest_hash') AS manifest_hash,
+    json_extract(a.artifact_json,'$.nested_archive_count') AS nested_archive_count, a.status AS analysis_status
+  FROM analysis_artifacts a JOIN entry_content_links l ON l.content_object_id=a.content_object_id
+  WHERE a.analyzer_name='archives';
+CREATE VIEW IF NOT EXISTS directory_overlap_results AS
+  SELECT id, source_id AS directory_a_id, target_id AS directory_b_id,
+    json_extract(evidence_json,'$.shared_hashes') AS shared_file_hashes,
+    json_extract(evidence_json,'$.source_hashes') AS a_file_hashes,
+    json_extract(evidence_json,'$.target_hashes') AS b_file_hashes,
+    confidence AS containment_a_in_b, confidence AS containment_b_in_a, created_at
+  FROM relationships WHERE relationship_type='MOSTLY_CONTAINED_IN';
+CREATE VIEW IF NOT EXISTS document_version_groups AS
+  SELECT id, group_key AS normalized_family_name, 1.0 AS group_confidence, 1 AS review_required, created_at
+  FROM relationship_groups WHERE group_type='DOCUMENT_FAMILY';
+CREATE VIEW IF NOT EXISTS document_version_members AS
+  SELECT g.id AS group_id, m.content_object_id AS entry_id, 0 AS sequence_index, m.role AS relationship_type
+  FROM relationship_group_members m JOIN relationship_groups g ON g.id=m.group_id WHERE g.group_type='DOCUMENT_FAMILY';
+CREATE VIEW IF NOT EXISTS image_similarity_groups AS
+  SELECT id, 'PERCEPTUAL' AS group_kind, 1.0 AS group_confidence, 1 AS review_required, created_at
+  FROM relationship_groups WHERE group_type='IMAGE_SIMILARITY';
+CREATE VIEW IF NOT EXISTS image_similarity_members AS
+  SELECT g.id AS group_id, m.content_object_id AS entry_id, 0 AS distance_score, 0 AS is_representative
+  FROM relationship_group_members m JOIN relationship_groups g ON g.id=m.group_id WHERE g.group_type='IMAGE_SIMILARITY';
 """
 
 
@@ -107,6 +184,10 @@ class Database:
                 c.execute("INSERT OR IGNORE INTO schema_migrations(version) VALUES (3)")
             if max(versions) < 4:
                 self._migrate_v3_to_v4(c)
+            if max(versions) < 5:
+                self._migrate_v4_to_v5(c)
+            if max(versions) < 6:
+                c.execute("INSERT OR IGNORE INTO schema_migrations(version) VALUES (6)")
         c.commit()
 
     @staticmethod
@@ -233,6 +314,22 @@ class Database:
             "UPDATE migration_progress SET status='COMPLETED',updated_at=CURRENT_TIMESTAMP WHERE migration_version=4"
         )
         c.execute("INSERT OR IGNORE INTO schema_migrations(version) VALUES (4)")
+
+    @staticmethod
+    def _migrate_v4_to_v5(c: sqlite3.Connection) -> None:
+        """Additive: backfill role-based canonical assignments from the single canonical copy.
+
+        Existing exact-duplicate groups and their canonical entries stay valid; each is given a
+        CANONICAL_LOCATION role so richer roles can be added later without losing the original.
+        """
+        c.execute(
+            """INSERT OR IGNORE INTO canonical_assignments(target_group_type,target_group_id,canonical_role,entry_id,content_object_id,source)
+               SELECT 'EXACT_DUPLICATE_GROUP', g.id, 'CANONICAL_LOCATION', g.canonical_entry_id,
+                      (SELECT content_object_id FROM entry_content_links WHERE entry_id=g.canonical_entry_id),
+                      'migration'
+               FROM exact_duplicate_groups g WHERE g.canonical_entry_id IS NOT NULL"""
+        )
+        c.execute("INSERT OR IGNORE INTO schema_migrations(version) VALUES (5)")
 
     def backup(self, output: Path) -> Path:
         """Create a consistent SQLite backup without modifying the source database."""

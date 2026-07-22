@@ -7,6 +7,9 @@ PROJECTION_TYPES = {
     "image-cluster",
     "selected-directory",
     "content",
+    "content-equivalence",
+    "partial-overlap",
+    "derivation-family",
 }
 
 

@@ -8,10 +8,10 @@ import secrets
 from typing import Annotated
 
 
-def create_app(database, read_only: bool = False):
+def create_app(database, read_only: bool = False, contact_sheet_dir: Path | None = None):
     try:
         from fastapi import FastAPI, Form, Header, HTTPException, Path as ApiPath, Query
-        from fastapi.responses import HTMLResponse
+        from fastapi.responses import FileResponse, HTMLResponse
         from fastapi.staticfiles import StaticFiles
     except ImportError as exc:
         raise RuntimeError(
@@ -51,10 +51,17 @@ def create_app(database, read_only: bool = False):
                     ("", "Overview"),
                     ("review", "Review"),
                     ("duplicates", "Duplicates"),
+                    ("advanced-duplicates", "Advanced dupes"),
+                    ("chunk-overlap", "Chunk overlap"),
+                    ("derivations", "Derivations"),
                     ("backups", "Backups"),
                     ("documents", "Documents"),
                     ("images", "Images"),
                     ("projects", "Projects"),
+                    ("events", "Events"),
+                    ("record-series", "Record series"),
+                    ("preservation", "Preservation"),
+                    ("learning", "Learning"),
                     ("jobs", "Jobs"),
                     ("graph", "Graph"),
                     ("manifests", "Manifests"),
@@ -303,6 +310,36 @@ def create_app(database, read_only: bool = False):
             title, f"<p>Bounded explorer; results are read-only.</p>{rows_table(rows, headings)}"
         )
 
+    def linked_rows_table(rows, headings: list[str], id_key: str, href_prefix: str) -> str:
+        """A rows_table with a trailing detail-link column.
+
+        The href is built exclusively from ``int(row[id_key])`` so no row value can inject markup.
+        """
+        header = "".join(f"<th>{escape(h)}</th>" for h in [*headings, "detail"])
+        body = ""
+        for row in rows:
+            cells = "".join(
+                f"<td>{escape(str(row[h] if h in row.keys() and row[h] is not None else ''))}</td>"
+                for h in headings
+            )
+            body += f"<tr>{cells}<td><a href='{href_prefix}/{int(row[id_key])}'>open</a></td></tr>"
+        return f"<table><thead><tr>{header}</tr></thead><tbody>{body or '<tr><td colspan=99>No results</td></tr>'}</tbody></table>"
+
+    def directory_card(entry_id: int) -> dict | None:
+        entry = database.fetch_one(
+            "SELECT id,name,relative_path,source_root_id FROM filesystem_entries WHERE id=? AND entry_type='directory'",
+            (entry_id,),
+        )
+        if not entry:
+            return None
+        summary = database.fetch_one(
+            "SELECT recursive_file_count,recursive_directory_count,recursive_size_bytes,"
+            "unique_full_hash_count,duplicate_file_count,earliest_modified_at,latest_modified_at "
+            "FROM directory_summaries WHERE entry_id=?",
+            (entry_id,),
+        )
+        return {**dict(entry), **(dict(summary) if summary else {})}
+
     @app.get("/duplicates", response_class=HTMLResponse)
     def duplicates(limit: int = Query(100, ge=1, le=500)):
         return explorer(
@@ -330,21 +367,167 @@ def create_app(database, read_only: bool = False):
             )
         )
 
+    @app.get("/advanced-duplicates", response_class=HTMLResponse)
+    def advanced_duplicates(limit: int = Query(100, ge=1, le=500)):
+        return explorer(
+            "advanced-duplicates",
+            "Advanced duplicate explorer (tiered relationships)",
+            "SELECT relationship_type,evidence_tier,source_id,target_id,round(confidence,3) confidence,explanation FROM content_relationships WHERE status='ACTIVE' ORDER BY evidence_tier,id LIMIT ?",
+            ["relationship_type", "evidence_tier", "source_id", "target_id", "confidence", "explanation"],
+            limit,
+        )
+
+    @app.get("/chunk-overlap", response_class=HTMLResponse)
+    def chunk_overlap(limit: int = Query(100, ge=1, le=500)):
+        return explorer(
+            "chunk-overlap",
+            "Partial-content overlap explorer",
+            "SELECT content_object_a_id,content_object_b_id,shared_chunk_bytes,round(overlap_a_in_b,3) overlap_a_in_b,round(overlap_b_in_a,3) overlap_b_in_a,round(weighted_jaccard,3) weighted_jaccard FROM content_overlap_results ORDER BY shared_chunk_bytes DESC LIMIT ?",
+            ["content_object_a_id", "content_object_b_id", "shared_chunk_bytes", "overlap_a_in_b", "overlap_b_in_a", "weighted_jaccard"],
+            limit,
+        )
+
+    @app.get("/derivations", response_class=HTMLResponse)
+    def derivations(limit: int = Query(100, ge=1, le=500)):
+        rows = database.fetch_all(
+            "SELECT relationship_type,evidence_tier,source_id,target_id,round(confidence,3) confidence,explanation"
+            " FROM content_relationships WHERE status='ACTIVE' AND relationship_type LIKE 'LIKELY_%' ORDER BY id LIMIT ?",
+            (limit,),
+        )
+        table = linked_rows_table(
+            rows,
+            ["relationship_type", "evidence_tier", "source_id", "target_id", "confidence", "explanation"],
+            "source_id",
+            "/derivations",
+        )
+        return page(
+            "Derivation-family explorer",
+            "<p>Bounded explorer; results are read-only. "
+            "Open a source object for its derivation timeline.</p>" + table,
+        )
+
+    def _representative_entry(content_object_id: int) -> dict | None:
+        row = database.fetch_one(
+            "SELECT e.name,e.relative_path,e.modified_at FROM entry_content_links l "
+            "JOIN filesystem_entries e ON e.id=l.entry_id WHERE l.content_object_id=? ORDER BY e.id LIMIT 1",
+            (content_object_id,),
+        )
+        return dict(row) if row else None
+
+    @app.get("/derivations/{content_object_id}", response_class=HTMLResponse)
+    def derivation_timeline(content_object_id: Annotated[int, ApiPath(ge=1)]):
+        relationships = database.fetch_all(
+            "SELECT * FROM content_relationships WHERE status='ACTIVE' AND relationship_type LIKE 'LIKELY_%'"
+            " AND source_type='CONTENT_OBJECT' AND (source_id=? OR target_id=?) ORDER BY id LIMIT 200",
+            (content_object_id, content_object_id),
+        )
+        if not relationships:
+            raise HTTPException(404, "no derivation relationships for that content object")
+        items = []
+        for relationship in relationships:
+            source = _representative_entry(int(relationship["source_id"]))
+            target = _representative_entry(int(relationship["target_id"]))
+            evidence = json.loads(relationship["evidence_json"] or "{}")
+            items.append(
+                {
+                    "relationship_type": relationship["relationship_type"],
+                    "evidence_tier": relationship["evidence_tier"],
+                    "confidence": round(float(relationship["confidence"]), 3),
+                    "source": source or {"name": f"content object {relationship['source_id']}"},
+                    "target": target or {"name": f"content object {relationship['target_id']}"},
+                    "gap_seconds": evidence.get("modified_gap_seconds"),
+                    "explanation": relationship["explanation"],
+                }
+            )
+        # Chronological by the derived side's modified time; unknown times sort last.
+        items.sort(key=lambda item: item["target"].get("modified_at") or float("inf"))
+        return template_page(
+            "Derivation timeline",
+            "derivation_timeline.html",
+            content_object_id=content_object_id,
+            items=items,
+        )
+
+    @app.get("/events", response_class=HTMLResponse)
+    def events(limit: int = Query(100, ge=1, le=500)):
+        return explorer(
+            "events",
+            "Event & collection explorer",
+            "SELECT id,cluster_type,name,round(confidence,3) confidence,summary_json FROM collection_clusters ORDER BY id DESC LIMIT ?",
+            ["id", "cluster_type", "name", "confidence", "summary_json"],
+            limit,
+        )
+
+    @app.get("/record-series", response_class=HTMLResponse)
+    def record_series(limit: int = Query(100, ge=1, le=500)):
+        return explorer(
+            "record-series",
+            "Record-series explorer",
+            "SELECT s.name,COUNT(a.id) assigned FROM record_series s LEFT JOIN record_series_assignments a ON a.series_id=s.id AND a.target_type='ENTRY' GROUP BY s.name ORDER BY assigned DESC LIMIT ?",
+            ["name", "assigned"],
+            limit,
+        )
+
+    @app.get("/preservation", response_class=HTMLResponse)
+    def preservation(limit: int = Query(100, ge=1, le=500)):
+        return explorer(
+            "preservation",
+            "Preservation queue (separate from clutter review)",
+            "SELECT target_id,recommended_action,format_risk,encryption_risk,integrity_risk,accessibility_risk FROM preservation_assessments ORDER BY id LIMIT ?",
+            ["target_id", "recommended_action", "format_risk", "encryption_risk", "integrity_risk", "accessibility_risk"],
+            limit,
+        )
+
+    @app.get("/learning", response_class=HTMLResponse)
+    def learning(limit: int = Query(100, ge=1, le=500)):
+        return explorer(
+            "learning",
+            "Active-learning models (suggestions only; cannot approve movement)",
+            "SELECT id,model_type,model_version,training_count,active,metrics_json FROM review_learning_models ORDER BY id DESC LIMIT ?",
+            ["id", "model_type", "model_version", "training_count", "active", "metrics_json"],
+            limit,
+        )
+
     @app.get("/backups", response_class=HTMLResponse)
     def backups(limit: int = Query(100, ge=1, le=500)):
-        return explorer(
-            "backups",
+        rows = database.fetch_all(
+            "SELECT id,source_type,source_id,target_type,target_id,relationship_type,round(confidence,3) confidence"
+            " FROM relationships WHERE relationship_type LIKE '%BACKUP%' OR relationship_type='MOSTLY_CONTAINED_IN'"
+            " ORDER BY confidence DESC,id LIMIT ?",
+            (limit,),
+        )
+        table = linked_rows_table(
+            rows,
+            ["id", "source_type", "source_id", "target_type", "target_id", "relationship_type", "confidence"],
+            "id",
+            "/backups",
+        )
+        return page(
             "Backup comparison",
-            "SELECT source_type,source_id,target_type,target_id,relationship_type,confidence FROM relationships WHERE relationship_type LIKE '%BACKUP%' ORDER BY confidence DESC,id LIMIT ?",
-            [
-                "source_type",
-                "source_id",
-                "target_type",
-                "target_id",
-                "relationship_type",
-                "confidence",
-            ],
-            limit,
+            "<p>Bounded explorer; results are read-only. "
+            "Open a relationship for a side-by-side directory comparison.</p>" + table,
+        )
+
+    @app.get("/backups/{relationship_id}", response_class=HTMLResponse)
+    def backup_compare(relationship_id: Annotated[int, ApiPath(ge=1)]):
+        relationship = database.fetch_one(
+            "SELECT * FROM relationships WHERE id=? AND source_type='DIRECTORY' AND target_type='DIRECTORY'",
+            (relationship_id,),
+        )
+        if not relationship:
+            raise HTTPException(404, "directory relationship not found")
+        left = directory_card(int(relationship["source_id"]))
+        right = directory_card(int(relationship["target_id"]))
+        if not left or not right:
+            raise HTTPException(404, "directory entries not found")
+        evidence = json.loads(relationship["evidence_json"] or "{}")
+        return template_page(
+            "Backup compare",
+            "backup_compare.html",
+            relationship=dict(relationship),
+            left=left,
+            right=right,
+            evidence=evidence,
         )
 
     @app.get("/documents", response_class=HTMLResponse)
@@ -359,13 +542,83 @@ def create_app(database, read_only: bool = False):
 
     @app.get("/images", response_class=HTMLResponse)
     def images(limit: int = Query(100, ge=1, le=500)):
-        return explorer(
-            "images",
-            "Image-similarity explorer",
-            "SELECT content_object_id,analyzer_version,status,completed_at,error_code FROM analysis_artifacts WHERE analyzer_name='images' ORDER BY completed_at DESC LIMIT ?",
-            ["content_object_id", "analyzer_version", "status", "completed_at", "error_code"],
-            limit,
+        groups = database.fetch_all(
+            "SELECT g.id,g.group_key,COUNT(m.content_object_id) member_count FROM relationship_groups g"
+            " JOIN relationship_group_members m ON m.group_id=g.id"
+            " WHERE g.group_type='IMAGE_SIMILARITY' GROUP BY g.id ORDER BY member_count DESC,g.id LIMIT ?",
+            (limit,),
         )
+        artifacts = database.fetch_all(
+            "SELECT content_object_id,analyzer_version,status,completed_at,error_code FROM analysis_artifacts WHERE analyzer_name='images' ORDER BY completed_at DESC LIMIT ?",
+            (limit,),
+        )
+        groups_table = linked_rows_table(
+            groups, ["id", "group_key", "member_count"], "id", "/images"
+        )
+        artifacts_table = rows_table(
+            artifacts,
+            ["content_object_id", "analyzer_version", "status", "completed_at", "error_code"],
+        )
+        return page(
+            "Image-similarity explorer",
+            "<p>Bounded explorer; results are read-only. "
+            "Open a group for its members and contact sheet.</p>"
+            f"<h2>Similarity groups</h2>{groups_table}"
+            f"<h2>Analysis artifacts</h2>{artifacts_table}",
+        )
+
+    def _contact_sheet_file(group_id: int) -> Path | None:
+        if contact_sheet_dir is None:
+            return None
+        # The path is derived only from the validated integer id — never from request text.
+        candidate = contact_sheet_dir / f"group_{group_id}.jpg"
+        return candidate if candidate.is_file() else None
+
+    @app.get("/images/{group_id}", response_class=HTMLResponse)
+    def image_group_detail(group_id: Annotated[int, ApiPath(ge=1)]):
+        group = database.fetch_one(
+            "SELECT id,group_key,evidence_json,created_at FROM relationship_groups"
+            " WHERE id=? AND group_type='IMAGE_SIMILARITY'",
+            (group_id,),
+        )
+        if not group:
+            raise HTTPException(404, "image similarity group not found")
+        members = database.fetch_all(
+            """SELECT m.content_object_id,
+                      (SELECT e.relative_path FROM entry_content_links l JOIN filesystem_entries e ON e.id=l.entry_id
+                       WHERE l.content_object_id=m.content_object_id ORDER BY e.id LIMIT 1) relative_path,
+                      (SELECT a.artifact_json FROM analysis_artifacts a
+                       WHERE a.analyzer_name='images' AND a.content_object_id=m.content_object_id
+                       AND a.status='COMPLETED' LIMIT 1) artifact_json
+               FROM relationship_group_members m WHERE m.group_id=? ORDER BY m.content_object_id LIMIT 200""",
+            (group_id,),
+        )
+        detailed = []
+        for member in members:
+            artifact = json.loads(member["artifact_json"] or "{}")
+            detailed.append(
+                {
+                    "content_object_id": member["content_object_id"],
+                    "relative_path": member["relative_path"],
+                    "format": artifact.get("format"),
+                    "width": artifact.get("width"),
+                    "height": artifact.get("height"),
+                }
+            )
+        return template_page(
+            "Image group",
+            "image_group.html",
+            group=dict(group),
+            members=detailed,
+            has_contact_sheet=_contact_sheet_file(group_id) is not None,
+        )
+
+    @app.get("/contact-sheets/{group_id}.jpg")
+    def contact_sheet_image(group_id: Annotated[int, ApiPath(ge=1)]):
+        sheet = _contact_sheet_file(group_id)
+        if sheet is None:
+            raise HTTPException(404, "contact sheet not rendered")
+        return FileResponse(sheet, media_type="image/jpeg")
 
     @app.get("/projects", response_class=HTMLResponse)
     def projects(limit: int = Query(100, ge=1, le=500)):

@@ -1,0 +1,26 @@
+<p><a href="/images">&larr; All image groups</a></p>
+<h2>Image similarity group {{ group.id }}</h2>
+<p>Perceptually similar images (hash prefix <code>{{ group.group_key }}</code>). Similarity is a
+review signal only; members are distinct content objects, never merged automatically.</p>
+{% if has_contact_sheet %}
+<p><img src="/contact-sheets/{{ group.id }}.jpg" alt="Contact sheet for image group {{ group.id }}" style="max-width:100%"></p>
+{% else %}
+<p>No contact sheet rendered yet. Run <code>housekeeper analyze contact-sheets</code> to generate
+one from the stored thumbnails.</p>
+{% endif %}
+<table>
+  <thead>
+    <tr><th>Content object</th><th>Representative path</th><th>Format</th><th>Width</th><th>Height</th></tr>
+  </thead>
+  <tbody>
+    {% for member in members %}
+    <tr>
+      <td>{{ member.content_object_id }}</td>
+      <td>{{ member.relative_path }}</td>
+      <td>{{ member.format }}</td>
+      <td>{{ member.width }}</td>
+      <td>{{ member.height }}</td>
+    </tr>
+    {% endfor %}
+  </tbody>
+</table>

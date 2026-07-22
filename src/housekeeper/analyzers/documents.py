@@ -45,7 +45,7 @@ def _structured_document(path: Path, suffix: str, config):
         if suffix == "docx":
             from docx import Document  # type: ignore[import-not-found]
 
-            document = Document(path)
+            document = Document(str(path))
             parts = [paragraph.text for paragraph in document.paragraphs]
             for table in document.tables:
                 parts.extend(cell.text for row in table.rows for cell in row.cells)
@@ -67,7 +67,7 @@ def _structured_document(path: Path, suffix: str, config):
         elif suffix == "pptx":
             from pptx import Presentation  # type: ignore[import-not-found]
 
-            presentation = Presentation(path)
+            presentation = Presentation(str(path))
             parts = [
                 shape.text
                 for slide in presentation.slides
@@ -76,7 +76,7 @@ def _structured_document(path: Path, suffix: str, config):
             ]
             structured = {"document_type": "pptx", "slide_count": len(presentation.slides)}
         elif suffix == "pdf":
-            import fitz  # type: ignore[import-not-found]
+            import fitz  # type: ignore[import-untyped, import-not-found]
 
             document = fitz.open(path)
             parts = [page.get_text("text") for page in document]
@@ -98,19 +98,40 @@ def _structured_document(path: Path, suffix: str, config):
             "extraction_status": "UNSUPPORTED",
             "extraction_error": f"optional parser unavailable: {exc.name}",
         }
-    except (OSError, ValueError, RuntimeError) as exc:
-        return {"extraction_status": "ERROR", "extraction_error": str(exc)}
+    except Exception as exc:  # noqa: BLE001 - a malformed document is isolated and recorded, never fatal
+        # A parser failure (corrupt zip container, bad XML, package error) is preserved as an
+        # ERROR so it is never mistaken for clutter.  The failure is isolated to one file.
+        return {"extraction_status": "ERROR", "extraction_error": f"{type(exc).__name__}: {exc}"}
+
+
+def extract_docx_metadata(path: Path, config):
+    return _structured_document(path, "docx", config)
+
+
+def extract_xlsx_metadata(path: Path, config):
+    return _structured_document(path, "xlsx", config)
+
+
+def extract_pptx_metadata(path: Path, config):
+    return _structured_document(path, "pptx", config)
+
+
+def extract_pdf_metadata(path: Path, config):
+    return _structured_document(path, "pdf", config)
 
 
 def extract_document(path: Path, file_type: str, config):
+    # ``file_type`` may arrive as ``.txt`` (from ``Path.suffix``) or ``txt``; normalize the
+    # leading dot so plaintext extraction is reachable regardless of the caller's convention.
+    normalized_type = file_type.lower().lstrip(".")
     return (
         extract_plaintext_metadata(path, config)
-        if file_type in {"txt", "md", "csv", "rst", "log", "text"}
-        else _structured_document(path, file_type.lower().lstrip("."), config)
+        if normalized_type in {"txt", "md", "csv", "rst", "log", "text"}
+        else _structured_document(path, normalized_type, config)
     )
 
 
-def run_document_analysis(database, config):
+def run_document_analysis(database, config, scope=None, job_id=None):
     from .registry import run_content_analysis
 
-    return run_content_analysis(database, config, "documents")
+    return run_content_analysis(database, config, "documents", job_id=job_id)

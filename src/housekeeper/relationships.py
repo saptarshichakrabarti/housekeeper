@@ -73,6 +73,87 @@ def upsert_relationship(
     return int(row[0])
 
 
+def upsert_content_relationship(
+    database,
+    source_type: str,
+    source_id: int,
+    target_type: str,
+    target_id: int,
+    relationship_type: str,
+    evidence_tier: str,
+    confidence: float,
+    algorithm: str,
+    algorithm_version: str,
+    configuration_fingerprint: str,
+    evidence: dict,
+    explanation: str,
+) -> int:
+    """Write a tiered, provenance-carrying relationship into ``content_relationships``.
+
+    Symmetric relationships are stored with a canonical ordering (source_id <= target_id) so a
+    pair is never duplicated in both directions. This never touches the legacy ``relationships``
+    table, so existing exact-duplicate behavior and the graph are unaffected.
+    """
+    if not 0 <= confidence <= 1:
+        raise ValueError("confidence must be between 0 and 1")
+    if source_type == target_type and source_id > target_id:
+        source_id, target_id = target_id, source_id
+    conn = database.connect()
+    conn.execute(
+        """INSERT INTO content_relationships(source_type,source_id,target_type,target_id,relationship_type,
+           evidence_tier,confidence,algorithm,algorithm_version,configuration_fingerprint,evidence_json,explanation)
+           VALUES(?,?,?,?,?,?,?,?,?,?,?,?)
+           ON CONFLICT(source_type,source_id,target_type,target_id,relationship_type,algorithm,algorithm_version,configuration_fingerprint)
+           DO UPDATE SET evidence_tier=excluded.evidence_tier,confidence=excluded.confidence,
+           evidence_json=excluded.evidence_json,explanation=excluded.explanation,status='ACTIVE',
+           updated_at=CURRENT_TIMESTAMP,invalidated_at=NULL""",
+        (
+            source_type,
+            source_id,
+            target_type,
+            target_id,
+            relationship_type,
+            evidence_tier,
+            confidence,
+            algorithm,
+            algorithm_version,
+            configuration_fingerprint,
+            json.dumps(evidence, sort_keys=True),
+            explanation,
+        ),
+    )
+    row = conn.execute(
+        """SELECT id FROM content_relationships WHERE source_type=? AND source_id=? AND target_type=? AND target_id=?
+           AND relationship_type=? AND algorithm=? AND algorithm_version=? AND configuration_fingerprint=?""",
+        (
+            source_type,
+            source_id,
+            target_type,
+            target_id,
+            relationship_type,
+            algorithm,
+            algorithm_version,
+            configuration_fingerprint,
+        ),
+    ).fetchone()
+    conn.commit()
+    assert row is not None
+    return int(row[0])
+
+
+def invalidate_content_relationships(
+    database, algorithm: str, algorithm_version: str, configuration_fingerprint: str
+) -> int:
+    """Mark superseded tiered relationships invalid when an algorithm/config version changes."""
+    cur = database.connect().execute(
+        """UPDATE content_relationships SET status='INVALIDATED',invalidated_at=CURRENT_TIMESTAMP
+           WHERE algorithm=? AND (algorithm_version<>? OR configuration_fingerprint<>?) AND status='ACTIVE'""",
+        (algorithm, algorithm_version, configuration_fingerprint),
+    )
+    database.connect().commit()
+    return cur.rowcount
+
+
 def invalidate_relationships(
     database, relationship_type: str | None = None, version: str | None = None
 ) -> int:

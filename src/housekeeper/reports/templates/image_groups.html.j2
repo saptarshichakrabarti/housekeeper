@@ -1,0 +1,11 @@
+{% extends "_base.html.j2" %}
+{% block content %}
+<div class="cards">
+  <div class="card"><b>{{ pixel_identical }}</b> pixel-identical pairs (Tier 2)</div>
+  <div class="card"><b>{{ perceptual_groups | length }}</b> perceptual-similarity groups (review-only)</div>
+</div>
+<p class="warn">A perceptual match never proves one image is disposable. Pixel-identical means the
+decoded pixels match even though the bytes/metadata differ — richer EXIF is preserved.</p>
+<h2>Perceptual-similarity groups</h2>
+<ul>{% for g in perceptual_groups %}<li class="path">{{ g.group_key }}</li>{% else %}<li>None.</li>{% endfor %}</ul>
+{% endblock %}
