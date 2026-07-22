@@ -7,7 +7,11 @@
   var THEMES = [
     ["sober", "Sober"],
     ["hybrid", "Hybrid"],
+    ["hybrid-dark", "Hybrid Dark"],
+    ["hybrid-solar", "Hybrid Solarized"],
     ["brutal", "Brutal"],
+    ["brutal-dark", "Brutal Dark"],
+    ["dark", "Dark"],
   ];
   var STORAGE_KEY = "hk-dashboard-theme";
   var DEFAULT = "sober";

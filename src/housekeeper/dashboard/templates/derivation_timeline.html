@@ -9,7 +9,7 @@ file's modified time. These are review candidates, never proof of redundancy.</p
     &rarr; <strong>{{ item.target.name }}</strong>
     ({{ item.relationship_type }}, {{ item.evidence_tier }}, confidence {{ item.confidence }})
     {% if item.gap_seconds is not none %}<br>modified {{ item.gap_seconds }}s apart{% endif %}
-    {% if item.target.modified_at %}<br>derived file modified at {{ item.target.modified_at }}{% endif %}
+    {% if item.target.modified_at %}<br>derived file modified {{ item.target.modified_at | relativetime }}{% endif %}
     {% if item.explanation %}<br><small>{{ item.explanation }}</small>{% endif %}
   </li>
   {% endfor %}

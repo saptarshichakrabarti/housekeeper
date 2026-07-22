@@ -15,11 +15,11 @@ one from the stored thumbnails.</p>
   <tbody>
     {% for member in members %}
     <tr>
-      <td>{{ member.content_object_id }}</td>
+      <td>{{ member.content_object_id | thousands }}</td>
       <td>{{ member.relative_path }}</td>
       <td>{{ member.format }}</td>
-      <td>{{ member.width }}</td>
-      <td>{{ member.height }}</td>
+      <td>{{ member.width | thousands }}</td>
+      <td>{{ member.height | thousands }}</td>
     </tr>
     {% endfor %}
   </tbody>

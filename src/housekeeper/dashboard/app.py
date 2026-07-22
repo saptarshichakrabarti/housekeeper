@@ -6,6 +6,7 @@ import json
 from pathlib import Path
 import secrets
 from typing import Annotated
+from urllib.parse import urlencode
 
 from ..config import AppConfig
 from ..core.progress import eta_seconds, format_duration, seconds_since, throughput
@@ -27,7 +28,7 @@ def create_app(
         ) from exc
     from ..graph.builder import build_projection
     from ..review.decisions import record_decision
-    from .filters import ReviewFilter
+    from .filters import ReviewFilter, filesizeformat, relativetime, thousands
     from .services import DashboardService
     from jinja2 import Environment, FileSystemLoader, select_autoescape
     from markupsafe import Markup
@@ -38,9 +39,19 @@ def create_app(
         loader=FileSystemLoader(Path(__file__).with_name("templates")),
         autoescape=select_autoescape(["html", "xml"]),
     )
+    templates.filters.update(
+        filesizeformat=filesizeformat,
+        thousands=thousands,
+        relativetime=relativetime,
+    )
     app = FastAPI(title="drive_housekeeper", docs_url=None, redoc_url=None)
     app.mount("/static", StaticFiles(directory=static_dir), name="static")
-    service = DashboardService(database)
+    # Every read-only surface (the service and all GET endpoints) goes through the per-thread
+    # read-only connection pool; only the writer connection (`database`) records decisions, runs
+    # control operations, and reconciles jobs. WAL lets the many readers run without serializing
+    # against each other or the background runner's writes.
+    reader = database.reader()
+    service = DashboardService(reader)
     runner = None
     if config is not None and not read_only:
         from .runner import OperationRunner
@@ -65,27 +76,45 @@ def create_app(
     # Reap jobs stranded by a previous process (a killed CLI run, a restarted dashboard) up front,
     # so the very first page load already shows honest state instead of stale "running" rows.
     maybe_reconcile()
-    navigation: list[tuple[str, str]] = [("", "Overview")]
+    navigation: list[dict[str, object]] = []
+    action_items: list[tuple[str, str]] = []
     if runner is not None:
-        navigation.append(("control", "Run"))
+        action_items.append(("control", "Run"))
+    if action_items:
+        navigation.append({"label": "Actions", "items": action_items})
     navigation.extend(
         [
-            ("review", "Review"),
-            ("duplicates", "Duplicates"),
-            ("advanced-duplicates", "Advanced dupes"),
-            ("chunk-overlap", "Chunk overlap"),
-            ("derivations", "Derivations"),
-            ("backups", "Backups"),
-            ("documents", "Documents"),
-            ("images", "Images"),
-            ("projects", "Projects"),
-            ("events", "Events"),
-            ("record-series", "Record series"),
-            ("preservation", "Preservation"),
-            ("learning", "Learning"),
-            ("jobs", "Jobs"),
-            ("graph", "Graph"),
-            ("manifests", "Manifests"),
+            {
+                "label": "Review",
+                "items": [
+                    ("review", "Review"),
+                    ("duplicates", "Duplicates"),
+                    ("advanced-duplicates", "Advanced dupes"),
+                    ("chunk-overlap", "Chunk overlap"),
+                ],
+            },
+            {
+                "label": "Insights",
+                "items": [
+                    ("documents", "Documents"),
+                    ("images", "Images"),
+                    ("projects", "Projects"),
+                    ("events", "Events"),
+                    ("derivations", "Derivations"),
+                    ("backups", "Backups"),
+                    ("record-series", "Record series"),
+                    ("preservation", "Preservation"),
+                ],
+            },
+            {
+                "label": "System",
+                "items": [
+                    ("jobs", "Jobs"),
+                    ("graph", "Graph"),
+                    ("learning", "Learning"),
+                    ("manifests", "Manifests"),
+                ],
+            },
         ]
     )
 
@@ -95,7 +124,9 @@ def create_app(
         if token != csrf_token:
             raise HTTPException(403, "CSRF validation failed")
 
-    def page(title: str, body: str, *, scripts: str = "") -> HTMLResponse:
+    def page(
+        title: str, body: str, *, scripts: str = "", active_path: str = ""
+    ) -> HTMLResponse:
         return HTMLResponse(
             templates.get_template("base.html").render(
                 title=title,
@@ -105,27 +136,85 @@ def create_app(
                 theme_switch_version=(static_dir / "theme-switch.js").stat().st_mtime_ns,
                 csrf_token=csrf_token,
                 navigation=navigation,
+                active_path=active_path,
+                dashboard_js_version=(static_dir / "dashboard.js").stat().st_mtime_ns,
             )
         )
 
     def template_page(
-        title: str, template_name: str, *, scripts: str = "", **context
+        title: str,
+        template_name: str,
+        *,
+        scripts: str = "",
+        active_path: str = "",
+        **context,
     ) -> HTMLResponse:
         body = templates.get_template(template_name).render(**context)
-        return page(title, body, scripts=scripts)
+        return page(title, body, scripts=scripts, active_path=active_path)
 
-    def rows_table(rows, headings: list[str]) -> str:
+    BYTE_COLUMNS = {
+        "bytes",
+        "size_bytes",
+        "shared_chunk_bytes",
+        "source_size_bytes",
+        "generated_size_bytes",
+        "environment_size_bytes",
+        "recursive_size_bytes",
+        "reclaimable_bytes",
+        "bytes_seen",
+    }
+    TIME_COLUMNS = {"updated_at", "completed_at", "created_at", "modified_at", "started_at"}
+    COUNT_COLUMNS = {
+        "id",
+        "files",
+        "count",
+        "member_count",
+        "assigned",
+        "training_count",
+        "files_seen",
+        "success_count",
+        "skip_count",
+        "error_count",
+        "processed_count",
+        "total_estimate",
+    }
+
+    def display_cell(heading: str, value: object) -> str:
+        if value is None or value == "":
+            return ""
+        if heading in BYTE_COLUMNS or heading.endswith("_bytes"):
+            return str(filesizeformat(value))
+        if heading in TIME_COLUMNS or heading.endswith("_at"):
+            return str(relativetime(value))
+        if heading in COUNT_COLUMNS or heading.endswith("_count"):
+            return escape(thousands(value))
+        return escape(str(value))
+
+    def rows_table(
+        rows,
+        headings: list[str],
+        empty_message: str | None = None,
+    ) -> str:
         header = "".join(f"<th>{escape(h)}</th>" for h in headings)
         body = "".join(
             "<tr>"
             + "".join(
-                f"<td>{escape(str(row[h] if h in row.keys() and row[h] is not None else ''))}</td>"
+                f"<td>{display_cell(h, row[h] if h in row.keys() else None)}</td>"
                 for h in headings
             )
             + "</tr>"
             for row in rows
         )
-        return f"<table><thead><tr>{header}</tr></thead><tbody>{body or '<tr><td colspan=99>No results</td></tr>'}</tbody></table>"
+        if empty_message is None:
+            empty_html = (
+                'No results yet — run the relevant analysis from the <a href="/control">Run page</a>.'
+                if runner is not None
+                else "No results yet — analysis has not produced matching records."
+            )
+        else:
+            empty_html = escape(empty_message)
+        empty = f'<tr><td class="empty-state" colspan="99">{empty_html}</td></tr>'
+        return f'<div class="table-scroll"><table><thead><tr>{header}</tr></thead><tbody>{body or empty}</tbody></table></div>'
 
     # Human labels for jobs that are not actively being worked. A stopped job must read as stopped.
     STOPPED_LABELS = {
@@ -215,15 +304,35 @@ def create_app(
             cells = "".join(
                 f"<td>{progress_cell(row)}</td>"
                 if heading == "progress"
-                else f"<td>{escape(str(row[heading] if row[heading] is not None else ''))}</td>"
+                else f"<td>{display_cell(heading, row[heading])}</td>"
                 for heading in headings
             )
             controls = job_controls(row["id"], row["status"])
             body += f"<tr>{cells}<td>{controls}</td></tr>"
-        return f"<table><thead><tr>{header}</tr></thead><tbody>{body or '<tr><td colspan=99>No results</td></tr>'}</tbody></table>"
+        running = any(row["status"] in {"PENDING", "RUNNING", "PAUSING", "CANCELLING"} for row in rows)
+        completed_count = next(
+            (
+                row["success_count"] or row["processed_count"] or 0
+                for row in rows
+                if row["status"] in {"COMPLETED", "COMPLETED_WITH_ERRORS"}
+            ),
+            0,
+        )
+        empty_message = (
+            'No jobs yet — start a scan or analysis from the <a href="/control">Run page</a>.'
+            if runner is not None
+            else "No jobs have been recorded yet."
+        )
+        empty = f'<tr><td class="empty-state" colspan="99">{empty_message}</td></tr>'
+        return (
+            f'<div class="jobs-status" data-running="{str(running).lower()}" '
+            f'data-completed-count="{int(completed_count)}">'
+            f'<div class="table-scroll"><table><thead><tr>{header}</tr></thead>'
+            f"<tbody>{body or empty}</tbody></table></div></div>"
+        )
 
     def decision_manifest_records(session_id: int) -> list[dict[str, object]]:
-        rows = database.fetch_all(
+        rows = reader.fetch_all(
             """SELECT e.id,e.absolute_path,e.relative_path,e.size_bytes,c.classification,c.confidence,c.reason_codes_json,c.explanation,s.full_hash,d.decision,d.stale
                FROM review_decisions d JOIN filesystem_entries e ON d.target_type='ENTRY' AND d.target_id=e.id
                LEFT JOIN classifications c ON c.entry_id=e.id LEFT JOIN file_signatures s ON s.entry_id=e.id
@@ -278,7 +387,7 @@ def create_app(
             where += " AND EXISTS(SELECT 1 FROM review_decisions d WHERE d.target_type='ENTRY' AND d.target_id=e.id AND d.current=1 AND d.stale=?)"
             params.append(int(stale))
         params.append(limit)
-        return database.fetch_all(
+        return reader.fetch_all(
             f"SELECT e.id,e.name,e.relative_path,e.size_bytes,e.modified_at,c.classification,c.confidence FROM filesystem_entries e LEFT JOIN classifications c ON c.entry_id=e.id WHERE {where} ORDER BY e.id LIMIT ?",
             tuple(params),
         )
@@ -300,7 +409,26 @@ def create_app(
 
     @app.get("/", response_class=HTMLResponse)
     def overview():
-        return template_page("Housekeeper overview", "overview.html", model=service.overview())
+        return template_page(
+            "Housekeeper overview",
+            "overview.html",
+            model=service.overview(),
+            can_refresh=not read_only,
+            has_run_page=runner is not None,
+            active_path="",
+        )
+
+    @app.post("/refresh", response_class=HTMLResponse)
+    def refresh_overview(x_csrf_token: str | None = Header(default=None)):
+        # Recompute the materialized summaries on demand (the only path that runs the full-table
+        # aggregates during a session). Non-read-only and CSRF-guarded via `guard`.
+        guard(x_csrf_token)
+        database.refresh_materialized_summaries()
+        service.invalidate_overview()
+        body = templates.get_template("overview.html").render(
+            model=service.overview(), can_refresh=True, has_run_page=runner is not None
+        )
+        return HTMLResponse(body)
 
     @app.get("/review", response_class=HTMLResponse)
     def review(
@@ -338,17 +466,84 @@ def create_app(
             maximum_age_timestamp=modified_before,
         )
         rows = service.review_rows(filters, limit, after_id)
-        query = f"?limit={limit}&after_id={after_id}" + (
-            f"&classification={classification}" if classification else ""
-        )
+        filter_values: dict[str, object] = {
+            "classification": classification,
+            "extension": extension,
+            "minimum_size": minimum_size,
+            "maximum_size": maximum_size,
+            "stale": stale,
+            "source_root_id": source_root_id,
+            "decision": decision,
+            "reason_code": reason_code,
+            "duplicate_only": duplicate_only or None,
+            "project_only": project_only or None,
+            "protected": protected,
+            "top_level_directory": top_level_directory,
+            "modified_after": modified_after,
+            "modified_before": modified_before,
+        }
+        active_params = {
+            key: value for key, value in filter_values.items() if value is not None and value != ""
+        }
+        chip_labels = {
+            "classification": "Classification",
+            "extension": "Extension",
+            "minimum_size": "Minimum size",
+            "maximum_size": "Maximum size",
+            "stale": "Stale",
+            "source_root_id": "Source",
+            "decision": "Decision",
+            "reason_code": "Reason",
+            "duplicate_only": "Duplicates only",
+            "project_only": "Projects only",
+            "protected": "Protected",
+            "top_level_directory": "Top-level directory",
+            "modified_after": "Modified after",
+            "modified_before": "Modified before",
+        }
+        chips = []
+        for key, value in active_params.items():
+            remaining = {name: item for name, item in active_params.items() if name != key}
+            chips.append(
+                {
+                    "label": chip_labels[key],
+                    "value": value,
+                    "remove_url": "/review" + (f"?{urlencode(remaining)}" if remaining else ""),
+                }
+            )
         next_id = rows[-1].entry_id if rows else None
+        next_params = {"limit": limit, **active_params, "after_id": next_id}
+        classifications = [
+            str(row["classification"])
+            for row in reader.fetch_all(
+                "SELECT DISTINCT classification FROM classifications WHERE classification IS NOT NULL ORDER BY classification"
+            )
+        ]
+        top_level_directories = [
+            str(row["top_level"])
+            for row in reader.fetch_all(
+                "SELECT DISTINCT CASE WHEN instr(relative_path,'/')=0 THEN relative_path ELSE substr(relative_path,1,instr(relative_path,'/')-1) END top_level FROM filesystem_entries WHERE entry_type='file' ORDER BY top_level LIMIT 500"
+            )
+        ]
         return template_page(
             "Review queue",
             "review.html",
             rows=rows,
             next_id=next_id,
-            next_url=f"/review?limit={limit}&after_id={next_id}" if next_id else "",
-            active_filter=query,
+            next_url=f"/review?{urlencode(next_params)}" if next_id else "",
+            filters=filter_values,
+            chips=chips,
+            classifications=classifications,
+            top_level_directories=top_level_directories,
+            available_image_groups={
+                row.image_group_id
+                for row in rows
+                if row.image_group_id is not None
+                and _contact_sheet_file(row.image_group_id) is not None
+            },
+            has_run_page=runner is not None,
+            read_only=read_only,
+            active_path="review",
         )
 
     @app.get("/fragments/review", response_class=HTMLResponse)
@@ -372,7 +567,7 @@ def create_app(
 
     @app.get("/fragments/entry/{entry_id}", response_class=HTMLResponse)
     def entry_detail_fragment(entry_id: Annotated[int, ApiPath(ge=1)]):
-        entry = database.fetch_one(
+        entry = reader.fetch_one(
             """SELECT e.id,e.name,e.relative_path,e.size_bytes,s.full_hash,s.hash_status,c.classification
                FROM filesystem_entries e LEFT JOIN file_signatures s ON s.entry_id=e.id
                LEFT JOIN classifications c ON c.entry_id=e.id WHERE e.id=?""",
@@ -380,7 +575,7 @@ def create_app(
         )
         if not entry:
             raise HTTPException(404, "entry not found")
-        artifacts = database.fetch_all(
+        artifacts = reader.fetch_all(
             """SELECT a.analyzer_name,a.status,a.completed_at FROM entry_content_links l
                JOIN analysis_artifacts a ON a.content_object_id=l.content_object_id
                WHERE l.entry_id=? ORDER BY a.completed_at DESC""",
@@ -388,7 +583,9 @@ def create_app(
         )
         return HTMLResponse(
             templates.get_template("fragments/entry_detail.html").render(
-                entry=dict(entry), artifacts=[dict(artifact) for artifact in artifacts]
+                entry=dict(entry),
+                artifacts=[dict(artifact) for artifact in artifacts],
+                has_run_page=runner is not None,
             )
         )
 
@@ -419,9 +616,11 @@ def create_app(
     def explorer(
         path: str, title: str, query: str, headings: list[str], limit: int
     ) -> HTMLResponse:
-        rows = database.fetch_all(query, (limit,))
+        rows = reader.fetch_all(query, (limit,))
         return page(
-            title, f"<p>Bounded explorer; results are read-only.</p>{rows_table(rows, headings)}"
+            title,
+            f"<p>Bounded explorer; results are read-only.</p>{rows_table(rows, headings)}",
+            active_path=path,
         )
 
     def linked_rows_table(rows, headings: list[str], id_key: str, href_prefix: str) -> str:
@@ -433,20 +632,26 @@ def create_app(
         body = ""
         for row in rows:
             cells = "".join(
-                f"<td>{escape(str(row[h] if h in row.keys() and row[h] is not None else ''))}</td>"
+                f"<td>{display_cell(h, row[h] if h in row.keys() else None)}</td>"
                 for h in headings
             )
             body += f"<tr>{cells}<td><a href='{href_prefix}/{int(row[id_key])}'>open</a></td></tr>"
-        return f"<table><thead><tr>{header}</tr></thead><tbody>{body or '<tr><td colspan=99>No results</td></tr>'}</tbody></table>"
+        empty_message = (
+            'No results yet — run the relevant analysis from the <a href="/control">Run page</a>.'
+            if runner is not None
+            else "No results yet — analysis has not produced matching records."
+        )
+        empty = f'<tr><td class="empty-state" colspan="99">{empty_message}</td></tr>'
+        return f'<div class="table-scroll"><table><thead><tr>{header}</tr></thead><tbody>{body or empty}</tbody></table></div>'
 
     def directory_card(entry_id: int) -> dict | None:
-        entry = database.fetch_one(
+        entry = reader.fetch_one(
             "SELECT id,name,relative_path,source_root_id FROM filesystem_entries WHERE id=? AND entry_type='directory'",
             (entry_id,),
         )
         if not entry:
             return None
-        summary = database.fetch_one(
+        summary = reader.fetch_one(
             "SELECT recursive_file_count,recursive_directory_count,recursive_size_bytes,"
             "unique_full_hash_count,duplicate_file_count,earliest_modified_at,latest_modified_at "
             "FROM directory_summaries WHERE entry_id=?",
@@ -455,21 +660,50 @@ def create_app(
         return {**dict(entry), **(dict(summary) if summary else {})}
 
     @app.get("/duplicates", response_class=HTMLResponse)
-    def duplicates(limit: int = Query(100, ge=1, le=500)):
-        return explorer(
-            "duplicates",
+    def duplicates(
+        limit: int = Query(100, ge=1, le=500), sort: str = Query("reclaimable")
+    ):
+        order_by = {
+            "reclaimable": "reclaimable_bytes DESC,g.id",
+            "members": "g.member_count DESC,g.id",
+            "size": "g.size_bytes DESC,g.id",
+        }
+        if sort not in order_by:
+            raise HTTPException(422, "invalid duplicate sort")
+        rows = reader.fetch_all(
+            f"""SELECT g.id,g.full_hash,g.member_count,g.size_bytes,
+                       g.size_bytes*(g.member_count-1) reclaimable_bytes,g.canonical_entry_id,
+                       (SELECT rg.id FROM exact_duplicate_members dm
+                        JOIN entry_content_links ecl ON ecl.entry_id=dm.entry_id
+                        JOIN relationship_group_members rgm ON rgm.content_object_id=ecl.content_object_id
+                        JOIN relationship_groups rg ON rg.id=rgm.group_id AND rg.group_type='IMAGE_SIMILARITY'
+                        WHERE dm.group_id=g.id ORDER BY rg.id LIMIT 1) image_group_id
+                FROM exact_duplicate_groups g ORDER BY {order_by[sort]} LIMIT ?""",
+            (limit,),
+        )
+        groups = []
+        for row in rows:
+            group = dict(row)
+            image_group_id = group.get("image_group_id")
+            group["has_contact_sheet"] = bool(
+                image_group_id and _contact_sheet_file(int(image_group_id)) is not None
+            )
+            groups.append(group)
+        return template_page(
             "Duplicate explorer",
-            "SELECT id,full_hash,member_count,size_bytes,canonical_entry_id FROM exact_duplicate_groups ORDER BY member_count DESC,id LIMIT ?",
-            ["id", "full_hash", "member_count", "size_bytes", "canonical_entry_id"],
-            limit,
+            "duplicates.html",
+            groups=groups,
+            sort=sort,
+            has_run_page=runner is not None,
+            active_path="duplicates",
         )
 
     @app.get("/fragments/duplicates/{group_id}", response_class=HTMLResponse)
     def duplicate_detail_fragment(group_id: Annotated[int, ApiPath(ge=1)]):
-        group = database.fetch_one("SELECT * FROM exact_duplicate_groups WHERE id=?", (group_id,))
+        group = reader.fetch_one("SELECT * FROM exact_duplicate_groups WHERE id=?", (group_id,))
         if not group:
             raise HTTPException(404, "duplicate group not found")
-        members = database.fetch_all(
+        members = reader.fetch_all(
             """SELECT e.relative_path,e.modified_at,m.is_canonical,m.readable
                FROM exact_duplicate_members m JOIN filesystem_entries e ON e.id=m.entry_id
                WHERE m.group_id=? ORDER BY m.is_canonical DESC,e.relative_path""",
@@ -503,7 +737,7 @@ def create_app(
 
     @app.get("/derivations", response_class=HTMLResponse)
     def derivations(limit: int = Query(100, ge=1, le=500)):
-        rows = database.fetch_all(
+        rows = reader.fetch_all(
             "SELECT relationship_type,evidence_tier,source_id,target_id,round(confidence,3) confidence,explanation"
             " FROM content_relationships WHERE status='ACTIVE' AND relationship_type LIKE 'LIKELY_%' ORDER BY id LIMIT ?",
             (limit,),
@@ -518,10 +752,11 @@ def create_app(
             "Derivation-family explorer",
             "<p>Bounded explorer; results are read-only. "
             "Open a source object for its derivation timeline.</p>" + table,
+            active_path="derivations",
         )
 
     def _representative_entry(content_object_id: int) -> dict | None:
-        row = database.fetch_one(
+        row = reader.fetch_one(
             "SELECT e.name,e.relative_path,e.modified_at FROM entry_content_links l "
             "JOIN filesystem_entries e ON e.id=l.entry_id WHERE l.content_object_id=? ORDER BY e.id LIMIT 1",
             (content_object_id,),
@@ -530,7 +765,7 @@ def create_app(
 
     @app.get("/derivations/{content_object_id}", response_class=HTMLResponse)
     def derivation_timeline(content_object_id: Annotated[int, ApiPath(ge=1)]):
-        relationships = database.fetch_all(
+        relationships = reader.fetch_all(
             "SELECT * FROM content_relationships WHERE status='ACTIVE' AND relationship_type LIKE 'LIKELY_%'"
             " AND source_type='CONTENT_OBJECT' AND (source_id=? OR target_id=?) ORDER BY id LIMIT 200",
             (content_object_id, content_object_id),
@@ -560,6 +795,7 @@ def create_app(
             "derivation_timeline.html",
             content_object_id=content_object_id,
             items=items,
+            active_path="derivations",
         )
 
     @app.get("/events", response_class=HTMLResponse)
@@ -604,7 +840,7 @@ def create_app(
 
     @app.get("/backups", response_class=HTMLResponse)
     def backups(limit: int = Query(100, ge=1, le=500)):
-        rows = database.fetch_all(
+        rows = reader.fetch_all(
             "SELECT id,source_type,source_id,target_type,target_id,relationship_type,round(confidence,3) confidence"
             " FROM relationships WHERE relationship_type LIKE '%BACKUP%' OR relationship_type='MOSTLY_CONTAINED_IN'"
             " ORDER BY confidence DESC,id LIMIT ?",
@@ -620,11 +856,12 @@ def create_app(
             "Backup comparison",
             "<p>Bounded explorer; results are read-only. "
             "Open a relationship for a side-by-side directory comparison.</p>" + table,
+            active_path="backups",
         )
 
     @app.get("/backups/{relationship_id}", response_class=HTMLResponse)
     def backup_compare(relationship_id: Annotated[int, ApiPath(ge=1)]):
-        relationship = database.fetch_one(
+        relationship = reader.fetch_one(
             "SELECT * FROM relationships WHERE id=? AND source_type='DIRECTORY' AND target_type='DIRECTORY'",
             (relationship_id,),
         )
@@ -642,6 +879,7 @@ def create_app(
             left=left,
             right=right,
             evidence=evidence,
+            active_path="backups",
         )
 
     @app.get("/documents", response_class=HTMLResponse)
@@ -656,13 +894,13 @@ def create_app(
 
     @app.get("/images", response_class=HTMLResponse)
     def images(limit: int = Query(100, ge=1, le=500)):
-        groups = database.fetch_all(
+        groups = reader.fetch_all(
             "SELECT g.id,g.group_key,COUNT(m.content_object_id) member_count FROM relationship_groups g"
             " JOIN relationship_group_members m ON m.group_id=g.id"
             " WHERE g.group_type='IMAGE_SIMILARITY' GROUP BY g.id ORDER BY member_count DESC,g.id LIMIT ?",
             (limit,),
         )
-        artifacts = database.fetch_all(
+        artifacts = reader.fetch_all(
             "SELECT content_object_id,analyzer_version,status,completed_at,error_code FROM analysis_artifacts WHERE analyzer_name='images' ORDER BY completed_at DESC LIMIT ?",
             (limit,),
         )
@@ -679,6 +917,7 @@ def create_app(
             "Open a group for its members and contact sheet.</p>"
             f"<h2>Similarity groups</h2>{groups_table}"
             f"<h2>Analysis artifacts</h2>{artifacts_table}",
+            active_path="images",
         )
 
     def _contact_sheet_file(group_id: int) -> Path | None:
@@ -690,14 +929,14 @@ def create_app(
 
     @app.get("/images/{group_id}", response_class=HTMLResponse)
     def image_group_detail(group_id: Annotated[int, ApiPath(ge=1)]):
-        group = database.fetch_one(
+        group = reader.fetch_one(
             "SELECT id,group_key,evidence_json,created_at FROM relationship_groups"
             " WHERE id=? AND group_type='IMAGE_SIMILARITY'",
             (group_id,),
         )
         if not group:
             raise HTTPException(404, "image similarity group not found")
-        members = database.fetch_all(
+        members = reader.fetch_all(
             """SELECT m.content_object_id,
                       (SELECT e.relative_path FROM entry_content_links l JOIN filesystem_entries e ON e.id=l.entry_id
                        WHERE l.content_object_id=m.content_object_id ORDER BY e.id LIMIT 1) relative_path,
@@ -725,6 +964,7 @@ def create_app(
             group=dict(group),
             members=detailed,
             has_contact_sheet=_contact_sheet_file(group_id) is not None,
+            active_path="images",
         )
 
     @app.get("/contact-sheets/{group_id}.jpg")
@@ -754,21 +994,34 @@ def create_app(
 
     @app.get("/jobs", response_class=HTMLResponse)
     def jobs(limit: int = Query(100, ge=1, le=500)):
+        # Only a one-shot load: the fragment itself decides whether to keep polling (see below).
         return page(
             "Jobs",
-            f"<section hx-get='/fragments/jobs?limit={limit}' hx-trigger='load, every 3s'>Loading…</section>",
+            f"<section hx-get='/fragments/jobs?limit={limit}' hx-trigger='load'>Loading…</section>",
+            active_path="jobs",
         )
+
+    ACTIVE_JOB_STATES = {"PENDING", "RUNNING", "PAUSING", "CANCELLING"}
 
     @app.get("/fragments/jobs", response_class=HTMLResponse)
     def jobs_fragment(limit: int = Query(100, ge=1, le=500)):
         # The jobs fragment is polled by both the Jobs page and the overview, so it is the natural
         # heartbeat for reaping orphans: within one poll interval a dead worker's row turns honest.
         maybe_reconcile()
-        rows = database.fetch_all(
+        rows = reader.fetch_all(
             "SELECT id,job_type,status,processed_count,total_estimate,success_count,skip_count,error_count,current_item,started_at,updated_at FROM jobs ORDER BY id DESC LIMIT ?",
             (limit,),
         )
-        return HTMLResponse(jobs_table(rows))
+        # Self-suspending poll: keep the 3s cadence only while a job is actually active. When idle
+        # the fragment re-arms on the `job-started` event alone (dispatched by the control endpoints
+        # when an operation begins) so an idle dashboard issues no repeating job queries at all.
+        active = any(row["status"] in ACTIVE_JOB_STATES for row in rows)
+        trigger = "every 3s" if active else "job-started from:body"
+        wrapper = (
+            f"<div id='jobs-fragment' hx-get='/fragments/jobs?limit={limit}' "
+            f"hx-trigger='{trigger}' hx-swap='outerHTML'>{jobs_table(rows)}</div>"
+        )
+        return HTMLResponse(wrapper)
 
     @app.post("/fragments/jobs/{job_id}/control", response_class=HTMLResponse)
     def job_control_fragment(
@@ -793,7 +1046,7 @@ def create_app(
         # If the worker behind this job is already gone, finalize it now so the row the user gets
         # back reflects reality immediately instead of sitting in PAUSING/CANCELLING until a poll.
         maybe_reconcile()
-        row = database.fetch_one(
+        row = reader.fetch_one(
             "SELECT id,job_type,status,processed_count,total_estimate,success_count,skip_count,error_count,current_item,started_at,updated_at FROM jobs WHERE id=?",
             (job_id,),
         )
@@ -805,8 +1058,8 @@ def create_app(
     if runner is not None:
         from .runner import ANALYZE_KINDS, REPORT_KINDS
 
-        def control_fragment() -> HTMLResponse:
-            return HTMLResponse(
+        def control_fragment(job_started: bool = False) -> HTMLResponse:
+            response = HTMLResponse(
                 templates.get_template("fragments/control.html").render(
                     status=runner.status(),
                     read_only=read_only,
@@ -814,6 +1067,10 @@ def create_app(
                     report_kinds=REPORT_KINDS,
                 )
             )
+            if job_started:
+                # Wake the (possibly suspended) jobs poll on any page that shows it.
+                response.headers["HX-Trigger"] = "job-started"
+            return response
 
         @app.get("/control", response_class=HTMLResponse)
         def control_page():
@@ -826,6 +1083,7 @@ def create_app(
                 report_kinds=REPORT_KINDS,
                 status=runner.status(),
                 scripts=f"<script defer src='/static/folder-picker.js?v={folder_picker_version}'></script>",
+                active_path="control",
             )
 
         @app.get("/fragments/control", response_class=HTMLResponse)
@@ -841,7 +1099,7 @@ def create_app(
                 raise HTTPException(422, "path must be an existing directory")
             if runner.submit("quickstart", source=path) == "busy":
                 raise HTTPException(409, "an operation is already running")
-            return control_fragment()
+            return control_fragment(job_started=True)
 
         @app.post("/control/analyze", response_class=HTMLResponse)
         def control_analyze(
@@ -852,14 +1110,14 @@ def create_app(
                 raise HTTPException(422, "invalid analyze kind")
             if runner.submit("analyze", kind=kind) == "busy":
                 raise HTTPException(409, "an operation is already running")
-            return control_fragment()
+            return control_fragment(job_started=True)
 
         @app.post("/control/classify", response_class=HTMLResponse)
         def control_classify(x_csrf_token: str | None = Header(default=None)):
             guard(x_csrf_token)
             if runner.submit("classify") == "busy":
                 raise HTTPException(409, "an operation is already running")
-            return control_fragment()
+            return control_fragment(job_started=True)
 
         @app.post("/control/report", response_class=HTMLResponse)
         def control_report(
@@ -870,7 +1128,7 @@ def create_app(
                 raise HTTPException(422, "invalid report kind")
             if runner.submit("report", kind=kind) == "busy":
                 raise HTTPException(409, "an operation is already running")
-            return control_fragment()
+            return control_fragment(job_started=True)
 
     @app.get("/graph", response_class=HTMLResponse)
     def graph_page():
@@ -879,6 +1137,7 @@ def create_app(
             "Graph",
             body,
             scripts="<script defer src='/static/vendor/cytoscape.min.js'></script><script defer src='/static/app.js'></script>",
+            active_path="graph",
         )
 
     @app.get("/manifests", response_class=HTMLResponse)
@@ -890,6 +1149,26 @@ def create_app(
             ["id", "name", "status", "base_scan_run_id", "analysis_snapshot_id", "updated_at"],
             limit,
         )
+
+    @app.get("/search", response_class=HTMLResponse)
+    def search(q: str = Query(..., min_length=1, max_length=500), limit: int = Query(100, ge=1, le=500)):
+        escaped_prefix = q.replace("\\", "\\\\").replace("%", "\\%").replace("_", "\\_")
+        rows = reader.fetch_all(
+            "SELECT id,name,relative_path,size_bytes,modified_at FROM filesystem_entries "
+            "WHERE relative_path LIKE ? ESCAPE '\\' OR name LIKE ? ESCAPE '\\' "
+            "ORDER BY relative_path LIMIT ?",
+            (f"{escaped_prefix}%", f"{escaped_prefix}%", limit),
+        )
+        body = (
+            f"<p>{thousands(len(rows))} matches for <strong>{escape(q)}</strong>. "
+            "Search is prefix-based and read-only.</p>"
+            + rows_table(
+                rows,
+                ["id", "name", "relative_path", "size_bytes", "modified_at"],
+                "No paths begin with that search. Try a shorter prefix.",
+            )
+        )
+        return page("Search", body, active_path="search")
 
     @app.get("/api/overview")
     def api_overview():
@@ -925,7 +1204,7 @@ def create_app(
 
     @app.get("/api/entry/{entry_id}")
     def entry_detail(entry_id: int):
-        row = database.fetch_one(
+        row = reader.fetch_one(
             "SELECT e.*,s.full_hash,s.hash_status,c.classification,c.confidence,c.explanation FROM filesystem_entries e LEFT JOIN file_signatures s ON s.entry_id=e.id LEFT JOIN classifications c ON c.entry_id=e.id WHERE e.id=?",
             (entry_id,),
         )
@@ -1002,7 +1281,7 @@ def create_app(
     def api_duplicates(limit: int = Query(100, ge=1, le=500), after_id: int = Query(0, ge=0)):
         return [
             dict(row)
-            for row in database.fetch_all(
+            for row in reader.fetch_all(
                 "SELECT id,full_hash,member_count,size_bytes,canonical_entry_id FROM exact_duplicate_groups WHERE id>? ORDER BY id LIMIT ?",
                 (after_id, limit),
             )
@@ -1010,10 +1289,10 @@ def create_app(
 
     @app.get("/api/duplicates/{group_id}")
     def duplicate_detail(group_id: Annotated[int, ApiPath(ge=1)]):
-        group = database.fetch_one("SELECT * FROM exact_duplicate_groups WHERE id=?", (group_id,))
+        group = reader.fetch_one("SELECT * FROM exact_duplicate_groups WHERE id=?", (group_id,))
         if not group:
             raise HTTPException(404, "duplicate group not found")
-        members = database.fetch_all(
+        members = reader.fetch_all(
             "SELECT e.id,e.name,e.relative_path,e.absolute_path,e.modified_at,m.is_canonical,m.readable FROM exact_duplicate_members m JOIN filesystem_entries e ON e.id=m.entry_id WHERE m.group_id=? ORDER BY m.is_canonical DESC,e.relative_path",
             (group_id,),
         )
@@ -1023,7 +1302,7 @@ def create_app(
     def api_jobs(limit: int = Query(100, ge=1, le=500)):
         return [
             dict(row)
-            for row in database.fetch_all(
+            for row in reader.fetch_all(
                 "SELECT id,job_type,status,processed_count,total_estimate,current_item,updated_at FROM jobs ORDER BY id DESC LIMIT ?",
                 (limit,),
             )
@@ -1051,7 +1330,7 @@ def create_app(
 
     @app.get("/api/manifests/{session_id}")
     def api_manifest(session_id: int):
-        session = database.fetch_one(
+        session = reader.fetch_one(
             "SELECT id,status,analysis_snapshot_id FROM review_sessions WHERE id=?", (session_id,)
         )
         if not session:

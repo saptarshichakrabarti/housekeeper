@@ -1,5 +1,51 @@
-<p>Cursor-paginated review queue. Decisions are recorded only with a review session; this page cannot move files.</p>
+<p>Cursor-paginated review queue. Decisions are recorded to a review session; this page never moves files.</p>
+
+<form class="filter-bar" action="/review" method="get" hx-get="/review" hx-target="main" hx-select="main" hx-swap="outerHTML" hx-push-url="true">
+  <h2>Filter review</h2>
+  <div class="filter-grid">
+    <label>Classification
+      <select name="classification">
+        <option value="">Any</option>
+        {% for option in classifications %}<option value="{{ option }}"{% if filters.classification == option %} selected{% endif %}>{{ option }}</option>{% endfor %}
+      </select>
+    </label>
+    <label>Extension <input name="extension" value="{{ filters.extension or '' }}" placeholder=".pdf"></label>
+    <label>Minimum bytes <input name="minimum_size" type="number" min="0" value="{{ filters.minimum_size if filters.minimum_size is not none else '' }}"></label>
+    <label>Maximum bytes <input name="maximum_size" type="number" min="0" value="{{ filters.maximum_size if filters.maximum_size is not none else '' }}"></label>
+    <label>Top-level directory
+      <select name="top_level_directory">
+        <option value="">Any</option>
+        {% for option in top_level_directories %}<option value="{{ option }}"{% if filters.top_level_directory == option %} selected{% endif %}>{{ option }}</option>{% endfor %}
+      </select>
+    </label>
+    <label>Protected
+      <select name="protected">
+        <option value="">Any</option><option value="true"{% if filters.protected is sameas true %} selected{% endif %}>Protected only</option><option value="false"{% if filters.protected is sameas false %} selected{% endif %}>Exclude protected</option>
+      </select>
+    </label>
+    <label>Stale decision
+      <select name="stale">
+        <option value="">Any</option><option value="true"{% if filters.stale is sameas true %} selected{% endif %}>Stale only</option><option value="false"{% if filters.stale is sameas false %} selected{% endif %}>Current only</option>
+      </select>
+    </label>
+    <label class="check-filter"><input name="duplicate_only" type="checkbox" value="true"{% if filters.duplicate_only %} checked{% endif %}> Duplicate members only</label>
+    <label class="check-filter"><input name="project_only" type="checkbox" value="true"{% if filters.project_only %} checked{% endif %}> Project roots only</label>
+  </div>
+  <div class="filter-actions"><button type="submit">Apply filters</button>{% if chips %}<a href="/review">Clear all</a>{% endif %}</div>
+</form>
+
+{% if chips %}<div class="filter-chips" aria-label="Active filters">{% for chip in chips %}<a class="filter-chip" href="{{ chip.remove_url }}" aria-label="Remove {{ chip.label }} filter">{{ chip.label }}{% if chip.value is not sameas true %}: {{ chip.value }}{% endif %} <span aria-hidden="true">×</span></a>{% endfor %}</div>{% endif %}
+
+<details class="shortcut-legend" open>
+  <summary>Keyboard shortcuts</summary>
+  <span><kbd>j</kbd>/<kbd>k</kbd> next/previous row</span>
+  <span><kbd>1</kbd> defer</span><span><kbd>2</kbd> keep</span><span><kbd>3</kbd> protect</span>
+  <span><kbd>4</kbd> more analysis</span><span><kbd>5</kbd> approve for review</span><span><kbd>6</kbd> reject</span>
+</details>
+<div id="review-announcer" class="sr-only" aria-live="polite"></div>
 <aside id="detail-drawer" aria-live="polite">Select an entry for details.</aside>
-<table><thead><tr><th>ID</th><th>Name</th><th>Path</th><th>Source</th><th>Top level</th><th>Classification</th><th>Decision</th><th>Reasons</th><th>Notes</th><th>Bytes</th><th>Flags</th></tr></thead>
-<tbody>{% for row in rows %}<tr><td><button hx-get="/fragments/entry/{{ row.entry_id }}" hx-target="#detail-drawer">{{ row.entry_id }}</button></td><td>{{ row.name }}</td><td>{{ row.relative_path }}</td><td>{{ row.source_root }}</td><td>{{ row.top_level_directory }}</td><td>{{ row.classification or '' }}</td><td>{{ row.decision or '' }}</td><td>{{ row.reason_codes }}</td><td>{{ row.notes }}</td><td>{{ row.size_bytes }}</td><td>{% if row.duplicate_member %}duplicate {% endif %}{% if row.project_member %}project {% endif %}{% if row.stale %}stale{% endif %}</td></tr>{% else %}<tr><td colspan="11">No results</td></tr>{% endfor %}</tbody></table>
+<div class="table-scroll">
+<table class="review-table"><thead><tr><th>ID</th><th>Preview</th><th>Name</th><th>Path</th><th>Source</th><th>Top level</th><th>Classification</th><th>Decision</th><th>Reasons</th><th>Notes</th><th>Size</th><th>Modified</th><th>Flags</th></tr></thead>
+<tbody>{% for row in rows %}<tr class="review-row" tabindex="0" data-entry-url="/fragments/entry/{{ row.entry_id }}" aria-label="{{ row.name }}, {{ row.size_bytes | filesizeformat | striptags }}"><td><button class="review-detail-button" hx-get="/fragments/entry/{{ row.entry_id }}" hx-target="#detail-drawer" aria-label="Inspect {{ row.name }}">{{ row.entry_id | thousands }}</button></td><td>{% if row.image_group_id and row.image_group_id in available_image_groups %}<a href="/images/{{ row.image_group_id }}"><img class="review-thumbnail" src="/contact-sheets/{{ row.image_group_id }}.jpg" alt="Visual comparison available"></a>{% else %}<span aria-hidden="true">—</span>{% endif %}</td><td>{{ row.name }}</td><td>{{ row.relative_path }}</td><td>{{ row.source_root }}</td><td>{{ row.top_level_directory }}</td><td>{{ row.classification or '' }}</td><td>{{ row.decision or '' }}</td><td>{{ row.reason_codes }}</td><td>{{ row.notes }}</td><td>{{ row.size_bytes | filesizeformat }}</td><td>{{ row.modified_at | relativetime }}</td><td>{% if row.duplicate_member %}duplicate {% endif %}{% if row.project_member %}project {% endif %}{% if row.stale %}stale{% endif %}</td></tr>{% else %}<tr><td class="empty-state" colspan="13">No matching review entries. Adjust the filters{% if has_run_page %}, or run Analyze → exact-duplicates from the <a href="/control">Run page</a>{% endif %}.</td></tr>{% endfor %}</tbody></table>
+</div>
 {% if next_id %}<p><a href="{{ next_url }}">Next page</a></p>{% endif %}

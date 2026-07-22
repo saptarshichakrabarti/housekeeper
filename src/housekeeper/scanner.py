@@ -457,4 +457,12 @@ class DriveScanner:
             success_count=sum(counts.values()),
         )
         self.db.refresh_materialized_summaries(run_id)
+        # After the first completed scan the planner has no statistics; ANALYZE once so the new
+        # dashboard indexes are actually chosen. Every scan also settles the WAL a big write left
+        # behind so later dashboard reads stay fast.
+        completed_scans = self.db.fetch_one(
+            "SELECT COUNT(*) n FROM scan_runs WHERE status='COMPLETE'"
+        )
+        first_scan = int(completed_scans["n"] if completed_scans else 0) == 1
+        self.db.optimize_after_write(analyze=first_scan)
         return counts

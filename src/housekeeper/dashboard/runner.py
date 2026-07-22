@@ -108,6 +108,11 @@ class OperationRunner:
                 self._run_report(database, kwargs["kind"])
             else:
                 raise ValueError(f"unknown operation: {operation}")
+            # Analyze/classify change the counts and charts the overview shows, so refresh the
+            # materialized summaries here too (scan already did its own), then settle the WAL and
+            # planner stats so the next dashboard load stays fast on a large inventory.
+            database.refresh_materialized_summaries()
+            database.optimize_after_write()
             with self._lock:
                 self._status["state"] = "idle"
         except (JobCancelled, JobPaused) as exc:

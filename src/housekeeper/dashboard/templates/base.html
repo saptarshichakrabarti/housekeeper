@@ -7,12 +7,20 @@
     <script defer src="/static/vendor/htmx.min.js"></script>
     <script defer src="/static/htmx-controls.js"></script>
     <script defer src="/static/theme-switch.js?v={{ theme_switch_version }}"></script>
+    <script defer src="/static/dashboard.js?v={{ dashboard_js_version }}"></script>
     {{ scripts | safe }}
   </head>
   <body data-csrf-token="{{ csrf_token }}">
-    <header>
-      <h1>{{ title }}</h1>
-      <nav>{% for path, label in navigation %}<a href="/{{ path }}">{{ label }}</a>{% if not loop.last %} · {% endif %}{% endfor %}</nav>
+    <header class="site-header">
+      <div class="header-title"><a href="/"{% if active_path == '' %} aria-current="page"{% endif %}>Housekeeper</a><h1>{{ title }}</h1></div>
+      <form class="global-search" action="/search" method="get" role="search">
+        <label class="sr-only" for="global-search">Search by path or name prefix</label>
+        <input id="global-search" name="q" type="search" placeholder="Search paths…" autocomplete="off" required>
+        <button type="submit">Search</button>
+      </form>
+      <nav aria-label="Dashboard">
+        {% for group in navigation %}<div class="nav-group"><span class="nav-heading">{{ group.label }}</span><div class="nav-links">{% for path, label in group['items'] %}<a href="/{{ path }}"{% if active_path == path %} aria-current="page"{% endif %}>{{ label }}</a>{% if not loop.last %}<span class="nav-separator" aria-hidden="true">·</span>{% endif %}{% endfor %}</div></div>{% endfor %}
+      </nav>
     </header>
     <main>{{ body | safe }}</main>
   </body>
