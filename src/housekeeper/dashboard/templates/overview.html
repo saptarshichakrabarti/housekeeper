@@ -1,8 +1,17 @@
 <p>Local query and review surface. Database integrity: {{ model.integrity }}. File movement is CLI-only.</p>
+<p class="overview-refresh">Summary {% if model.refreshed_at %}refreshed {{ model.refreshed_at | relativetime }}{% else %}not yet computed{% endif %}.{% if can_refresh %}
+<button hx-post="/refresh" hx-target="main" hx-swap="innerHTML">Refresh now</button>{% endif %}</p>
+<a class="hero-card card card--ok" href="/duplicates">
+  <strong>Reclaimable space</strong>
+  <b>{{ model.reclaimable_bytes | filesizeformat }}</b>
+  <span>Logical bytes minus unique bytes — review duplicate copies</span>
+</a>
 <div class="cards">
-{% for metric in model.metrics %}<section class="card"><strong>{{ metric.label }}</strong><b>{{ metric.value }}</b></section>{% endfor %}
+{% for metric in model.metrics %}{% if metric.href %}<a class="card metric-card" href="{{ metric.href }}">{% else %}<section class="card">{% endif %}<strong>{{ metric.label }}</strong><b>{% if metric.kind == 'bytes' %}{{ metric.value | filesizeformat }}{% else %}{{ metric.value | thousands }}{% endif %}</b>{% if metric.href %}<span class="card-link-hint">Explore <span aria-hidden="true">→</span></span></a>{% else %}</section>{% endif %}{% endfor %}
 </div>
-<section hx-get="/fragments/jobs" hx-trigger="load, every 5s">Loading job status…</section>
+<section hx-get="/fragments/jobs" hx-trigger="load">Loading job status…</section>
 {% for chart in model.charts %}
-<section><h2>{{ chart.title }}</h2><table><thead><tr>{% for column in chart.columns %}<th>{{ column }}</th>{% endfor %}</tr></thead><tbody>{% for row in chart.rows %}<tr>{% for value in row %}<td>{{ value }}</td>{% endfor %}</tr>{% else %}<tr><td colspan="99">No data</td></tr>{% endfor %}</tbody></table></section>
+{% set byte_index = chart.columns.index('bytes') if 'bytes' in chart.columns else -1 %}
+{% set max_bytes = chart.rows | map(attribute=byte_index) | map('int') | max if chart.rows and byte_index >= 0 else 0 %}
+<section><h2>{{ chart.title }}</h2><div class="table-scroll"><table><thead><tr>{% for column in chart.columns %}<th>{{ column }}</th>{% endfor %}</tr></thead><tbody>{% for row in chart.rows %}<tr>{% for value in row %}<td>{% set column = chart.columns[loop.index0] %}{% if column == 'bytes' %}{{ value | filesizeformat }}{% if chart.title in ['File types', 'Top-level directories'] and max_bytes %}<span class="bar" style="width: {{ ((value | int) / max_bytes * 100) | round(1) }}%" title="{{ value | int | thousands }} bytes"></span>{% endif %}{% elif column in ['files', 'count', 'files_seen', 'id'] %}{{ value | thousands }}{% elif column.endswith('_at') %}{{ value | relativetime }}{% else %}{{ value }}{% endif %}</td>{% endfor %}</tr>{% else %}<tr><td class="empty-state" colspan="99">No data yet{% if has_run_page %} — run a scan or analysis from the <a href="/control">Run page</a>{% endif %}.</td></tr>{% endfor %}</tbody></table></div></section>
 {% endfor %}

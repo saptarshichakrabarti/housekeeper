@@ -8,13 +8,13 @@ review; nothing on this page moves or removes data.</p>
   </thead>
   <tbody>
     <tr><td>Relative path</td><td>{{ left.relative_path }}</td><td>{{ right.relative_path }}</td></tr>
-    <tr><td>Files (recursive)</td><td>{{ left.recursive_file_count }}</td><td>{{ right.recursive_file_count }}</td></tr>
-    <tr><td>Directories (recursive)</td><td>{{ left.recursive_directory_count }}</td><td>{{ right.recursive_directory_count }}</td></tr>
-    <tr><td>Bytes (recursive)</td><td>{{ left.recursive_size_bytes }}</td><td>{{ right.recursive_size_bytes }}</td></tr>
-    <tr><td>Unique content hashes</td><td>{{ left.unique_full_hash_count }}</td><td>{{ right.unique_full_hash_count }}</td></tr>
-    <tr><td>Duplicate files inside</td><td>{{ left.duplicate_file_count }}</td><td>{{ right.duplicate_file_count }}</td></tr>
-    <tr><td>Earliest modified</td><td>{{ left.earliest_modified_at }}</td><td>{{ right.earliest_modified_at }}</td></tr>
-    <tr><td>Latest modified</td><td>{{ left.latest_modified_at }}</td><td>{{ right.latest_modified_at }}</td></tr>
+    <tr><td>Files (recursive)</td><td>{{ left.recursive_file_count | thousands }}</td><td>{{ right.recursive_file_count | thousands }}</td></tr>
+    <tr><td>Directories (recursive)</td><td>{{ left.recursive_directory_count | thousands }}</td><td>{{ right.recursive_directory_count | thousands }}</td></tr>
+    <tr><td>Size (recursive)</td><td>{{ left.recursive_size_bytes | filesizeformat }}</td><td>{{ right.recursive_size_bytes | filesizeformat }}</td></tr>
+    <tr><td>Unique content hashes</td><td>{{ left.unique_full_hash_count | thousands }}</td><td>{{ right.unique_full_hash_count | thousands }}</td></tr>
+    <tr><td>Duplicate files inside</td><td>{{ left.duplicate_file_count | thousands }}</td><td>{{ right.duplicate_file_count | thousands }}</td></tr>
+    <tr><td>Earliest modified</td><td>{{ left.earliest_modified_at | relativetime }}</td><td>{{ right.earliest_modified_at | relativetime }}</td></tr>
+    <tr><td>Latest modified</td><td>{{ left.latest_modified_at | relativetime }}</td><td>{{ right.latest_modified_at | relativetime }}</td></tr>
   </tbody>
 </table>
 <h3>Relationship evidence</h3>

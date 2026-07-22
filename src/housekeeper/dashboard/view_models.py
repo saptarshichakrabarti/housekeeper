@@ -7,6 +7,8 @@ from dataclasses import dataclass
 class Metric:
     label: str
     value: int
+    kind: str = "count"
+    href: str | None = None
 
 
 @dataclass(frozen=True)
@@ -19,8 +21,10 @@ class Chart:
 @dataclass(frozen=True)
 class OverviewViewModel:
     integrity: str
+    reclaimable_bytes: int
     metrics: tuple[Metric, ...]
     charts: tuple[Chart, ...]
+    refreshed_at: str | None = None
 
 
 @dataclass(frozen=True)
@@ -40,3 +44,4 @@ class ReviewRow:
     stale: bool
     duplicate_member: bool
     project_member: bool
+    image_group_id: int | None

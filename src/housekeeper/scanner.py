@@ -10,7 +10,7 @@ from .constants import EntryType
 from .database import Database
 from .models import FileStatRecord
 from .path_utils import is_hidden_path, normalize_absolute_path, safe_relative_path
-from .jobs import JobCancelled, check_cancelled, create_job, update_job
+from .jobs import JobCancelled, JobPaused, check_cancelled, create_job, update_job
 from .core.scan_identity import discover_source_identity
 from .hashing import compute_quick_hash
 
@@ -394,7 +394,10 @@ class DriveScanner:
                         "scan_run_id": run_id,
                     },
                 )
-        except JobCancelled:
+        except (JobCancelled, JobPaused):
+            # A scan that stops early — cancelled outright or paused at a checkpoint — leaves an
+            # incomplete inventory; mark the run INTERRUPTED so it is never mistaken for a full scan.
+            # (check_cancelled has already settled the job row itself to CANCELLED/PAUSED.)
             self.db.execute("UPDATE scan_runs SET status='INTERRUPTED' WHERE id=?", (run_id,))
             self.db.connect().commit()
             raise
@@ -454,4 +457,12 @@ class DriveScanner:
             success_count=sum(counts.values()),
         )
         self.db.refresh_materialized_summaries(run_id)
+        # After the first completed scan the planner has no statistics; ANALYZE once so the new
+        # dashboard indexes are actually chosen. Every scan also settles the WAL a big write left
+        # behind so later dashboard reads stay fast.
+        completed_scans = self.db.fetch_one(
+            "SELECT COUNT(*) n FROM scan_runs WHERE status='COMPLETE'"
+        )
+        first_scan = int(completed_scans["n"] if completed_scans else 0) == 1
+        self.db.optimize_after_write(analyze=first_scan)
         return counts

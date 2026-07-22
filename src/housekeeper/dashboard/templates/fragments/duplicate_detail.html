@@ -1,5 +1,5 @@
 <section class="detail">
   <h2>Duplicate group {{ group.id }}</h2>
-  <p>{{ group.member_count }} verified members · <code>{{ group.full_hash }}</code></p>
-  <table><thead><tr><th>Path</th><th>Modified</th><th>Canonical</th><th>Readable</th></tr></thead><tbody>{% for member in members %}<tr><td>{{ member.relative_path }}</td><td>{{ member.modified_at or '' }}</td><td>{{ member.is_canonical }}</td><td>{{ member.readable }}</td></tr>{% endfor %}</tbody></table>
+  <p>{{ group.member_count | thousands }} verified members · {{ group.size_bytes | filesizeformat }} each · <code>{{ group.full_hash }}</code></p>
+  <table><thead><tr><th>Path</th><th>Modified</th><th>Canonical</th><th>Readable</th></tr></thead><tbody>{% for member in members %}<tr><td>{{ member.relative_path }}</td><td>{{ member.modified_at | relativetime }}</td><td>{{ member.is_canonical }}</td><td>{{ member.readable }}</td></tr>{% endfor %}</tbody></table>
 </section>

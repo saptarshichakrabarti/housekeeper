@@ -43,6 +43,9 @@ CREATE TABLE IF NOT EXISTS canonical_overrides(id INTEGER PRIMARY KEY, duplicate
 CREATE TABLE IF NOT EXISTS materialized_summaries(summary_key TEXT PRIMARY KEY, value_json TEXT NOT NULL, source_scan_run_id INTEGER REFERENCES scan_runs(id), refreshed_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP);
 CREATE INDEX IF NOT EXISTS idx_content_hash ON content_objects(hash_algorithm,full_hash,size_bytes); CREATE INDEX IF NOT EXISTS idx_link_content ON entry_content_links(content_object_id); CREATE INDEX IF NOT EXISTS idx_artifact_lookup ON analysis_artifacts(content_object_id,analyzer_name,analyzer_version,configuration_fingerprint); CREATE INDEX IF NOT EXISTS idx_jobs_status ON jobs(status,updated_at); CREATE INDEX IF NOT EXISTS idx_review_queue ON review_decisions(review_session_id,current,decision,stale); CREATE INDEX IF NOT EXISTS idx_relationship_source ON relationships(source_type,source_id,relationship_type); CREATE INDEX IF NOT EXISTS idx_relationship_target ON relationships(target_type,target_id,relationship_type); CREATE INDEX IF NOT EXISTS idx_relationship_group_members_content ON relationship_group_members(content_object_id,group_id);
 CREATE INDEX IF NOT EXISTS idx_entries_run_relative ON filesystem_entries(scan_run_id,relative_path); CREATE INDEX IF NOT EXISTS idx_changes_run_status ON scan_entry_changes(scan_run_id,change_status); CREATE INDEX IF NOT EXISTS idx_artifacts_name_status ON analysis_artifacts(analyzer_name,status,completed_at);
+-- Hot-path indexes for dashboard review/overview queries (see database.refresh_materialized_summaries and DashboardService).
+-- The filesystem_entries(suffix,...) indexes are created in initialize() *after* legacy columns are added, since `suffix` is one of them.
+CREATE INDEX IF NOT EXISTS idx_review_decisions_target ON review_decisions(target_type,target_id,current); CREATE INDEX IF NOT EXISTS idx_dupe_members_entry ON exact_duplicate_members(entry_id);
 CREATE TABLE IF NOT EXISTS normalization_profiles(id INTEGER PRIMARY KEY, name TEXT NOT NULL, content_kind TEXT NOT NULL, algorithm TEXT NOT NULL, algorithm_version TEXT NOT NULL, configuration_json TEXT NOT NULL DEFAULT '{}', configuration_fingerprint TEXT NOT NULL, loss_characteristics_json TEXT NOT NULL DEFAULT '[]', created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP, deprecated_at TEXT, UNIQUE(name, algorithm_version, configuration_fingerprint));
 CREATE TABLE IF NOT EXISTS normalized_content_artifacts(id INTEGER PRIMARY KEY, content_object_id INTEGER NOT NULL REFERENCES content_objects(id) ON DELETE CASCADE, normalization_profile_id INTEGER NOT NULL REFERENCES normalization_profiles(id), status TEXT NOT NULL, normalized_hash TEXT, normalized_size_bytes INTEGER, structural_fingerprint TEXT, artifact_json TEXT NOT NULL DEFAULT '{}', created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP, error_code TEXT, error_message TEXT, UNIQUE(content_object_id, normalization_profile_id));
 CREATE TABLE IF NOT EXISTS content_relationships(id INTEGER PRIMARY KEY, source_type TEXT NOT NULL, source_id INTEGER NOT NULL, target_type TEXT NOT NULL, target_id INTEGER NOT NULL, relationship_type TEXT NOT NULL, evidence_tier TEXT NOT NULL, confidence REAL NOT NULL, algorithm TEXT NOT NULL, algorithm_version TEXT NOT NULL, configuration_fingerprint TEXT NOT NULL DEFAULT '', evidence_json TEXT NOT NULL DEFAULT '{}', explanation TEXT NOT NULL DEFAULT '', status TEXT NOT NULL DEFAULT 'ACTIVE', created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP, updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP, invalidated_at TEXT, UNIQUE(source_type,source_id,target_type,target_id,relationship_type,algorithm,algorithm_version,configuration_fingerprint));
@@ -128,6 +131,10 @@ class Database:
         self.path = Path(path)
         self.conn: sqlite3.Connection | None = None
         self._lock = threading.RLock()
+        # Read-only connections are thread-local: WAL supports many concurrent readers, so each
+        # dashboard worker thread gets its own connection that never contends with the writer or
+        # with sibling readers. Never shared across threads, so check_same_thread can stay on.
+        self._local = threading.local()
 
     def connect(self) -> sqlite3.Connection:
         if self.conn is None:
@@ -152,6 +159,12 @@ class Database:
         c.execute(
             "CREATE INDEX IF NOT EXISTS idx_entries_source_root ON filesystem_entries(source_root_id,id)"
         )
+        # Dashboard hot-path indexes on `suffix` — created here (not in SCHEMA) because `suffix` is
+        # one of the legacy columns just backfilled above, so it may not exist when SCHEMA runs.
+        c.execute(
+            "CREATE INDEX IF NOT EXISTS idx_entries_type_suffix_size ON filesystem_entries(entry_type,suffix,size_bytes)"
+        )
+        c.execute("CREATE INDEX IF NOT EXISTS idx_entries_suffix ON filesystem_entries(suffix)")
         c.execute(
             """INSERT OR IGNORE INTO source_roots(display_name,source_fingerprint,last_mount_path)
                SELECT COALESCE(NULLIF(MAX(source_root),''),'legacy source'),source_root_fingerprint,
@@ -349,17 +362,57 @@ class Database:
         row = self.fetch_one("PRAGMA integrity_check")
         return str(row[0]) if row else "unknown"
 
+    # Pragmas tuned for read workloads over a multi-GB file: memory-map the first 256MB so hot
+    # pages skip the syscall path, give the page cache 64MB, and keep sort/temp scratch in RAM.
+    _READ_PRAGMAS = (
+        "PRAGMA query_only=ON",
+        "PRAGMA busy_timeout=5000",
+        "PRAGMA mmap_size=268435456",
+        "PRAGMA cache_size=-65536",
+        "PRAGMA temp_store=MEMORY",
+    )
+
+    def _open_read_connection(self) -> sqlite3.Connection:
+        conn = sqlite3.connect(f"file:{self.path.resolve()}?mode=ro", uri=True)
+        conn.row_factory = sqlite3.Row
+        for pragma in self._READ_PRAGMAS:
+            conn.execute(pragma)
+        return conn
+
+    def _read_conn(self) -> sqlite3.Connection:
+        """The calling thread's pooled read-only connection, opened on first use."""
+        conn = getattr(self._local, "read_conn", None)
+        if conn is None:
+            conn = self._open_read_connection()
+            self._local.read_conn = conn
+        return conn
+
+    def reader(self) -> "_ReadDB":
+        """A read-only view whose fetch_* route through the per-thread read pool."""
+        return _ReadDB(self)
+
     @contextmanager
     def read_connection(self) -> Iterator[sqlite3.Connection]:
-        """Independent read-only connection for dashboard/report workloads."""
-        uri = f"file:{self.path.resolve()}?mode=ro"
-        conn = sqlite3.connect(uri, uri=True)
-        conn.row_factory = sqlite3.Row
-        conn.execute("PRAGMA query_only=ON")
+        """Independent, short-lived read-only connection for report/backup workloads."""
+        conn = self._open_read_connection()
         try:
             yield conn
         finally:
             conn.close()
+
+    def optimize_after_write(self, analyze: bool = False) -> None:
+        """Settle the file after a large write job so later reads stay fast.
+
+        ``PRAGMA optimize`` refreshes stale query-planner stats; a TRUNCATE checkpoint keeps a giant
+        WAL left by a scan from slowing every subsequent reader. ``analyze=True`` runs a full
+        ``ANALYZE`` — worth it once after the first scan so the planner has real statistics.
+        """
+        c = self.connect()
+        if analyze:
+            c.execute("ANALYZE")
+        c.execute("PRAGMA optimize")
+        c.commit()
+        self.checkpoint_wal("TRUNCATE")
 
     def checkpoint_wal(self, mode: str = "PASSIVE") -> tuple[int, int, int]:
         if mode not in {"PASSIVE", "FULL", "RESTART", "TRUNCATE"}:
@@ -380,18 +433,60 @@ class Database:
             raise OSError("insufficient free disk space for VACUUM")
         self.connect().execute("VACUUM")
 
+    # The five overview charts, stored verbatim so the dashboard never re-runs these full-table
+    # aggregates on a page load. Column order matches what DashboardService renders.
+    _CHART_QUERIES = {
+        "file_types": (
+            ("suffix", "files", "bytes"),
+            "SELECT COALESCE(suffix,'(none)') suffix,COUNT(*) files,SUM(size_bytes) bytes FROM filesystem_entries WHERE entry_type='file' GROUP BY suffix ORDER BY bytes DESC LIMIT 20",
+        ),
+        "classification_bytes": (
+            ("classification", "files", "bytes"),
+            "SELECT COALESCE(c.classification,'UNCLASSIFIED') classification,COUNT(*) files,SUM(e.size_bytes) bytes FROM filesystem_entries e LEFT JOIN classifications c ON c.entry_id=e.id WHERE e.entry_type='file' GROUP BY c.classification ORDER BY bytes DESC LIMIT 20",
+        ),
+        "top_level": (
+            ("top_level", "files", "bytes"),
+            "SELECT CASE WHEN instr(relative_path,'/')=0 THEN relative_path ELSE substr(relative_path,1,instr(relative_path,'/')-1) END top_level,COUNT(*) files,SUM(size_bytes) bytes FROM filesystem_entries WHERE entry_type='file' GROUP BY top_level ORDER BY bytes DESC LIMIT 20",
+        ),
+        "scan_history": (
+            ("id", "status", "files_seen", "bytes_seen", "completed_at"),
+            "SELECT id,status,files_seen,bytes_seen,COALESCE(completed_at,'') completed_at FROM scan_runs ORDER BY id DESC LIMIT 20",
+        ),
+        "analyzer_completion": (
+            ("analyzer_name", "status", "count"),
+            "SELECT analyzer_name,status,COUNT(*) count FROM analysis_artifacts GROUP BY analyzer_name,status ORDER BY analyzer_name,status",
+        ),
+    }
+
     def refresh_materialized_summaries(self, scan_run_id: int | None = None) -> dict[str, int]:
         c = self.connect()
+
+        def scalar(sql: str) -> int:
+            return int(c.execute(sql).fetchone()[0])
+
+        charts = {
+            key: {
+                "columns": list(columns),
+                "rows": [
+                    [str(row[column]) if row[column] is not None else "" for column in columns]
+                    for row in c.execute(sql).fetchall()
+                ],
+            }
+            for key, (columns, sql) in self._CHART_QUERIES.items()
+        }
         values = {
             "overview": {
-                "logical_bytes": c.execute(
+                "logical_bytes": scalar(
                     "SELECT COALESCE(SUM(size_bytes),0) FROM filesystem_entries WHERE entry_type='file'"
-                ).fetchone()[0],
-                "unique_content_bytes": c.execute(
-                    "SELECT COALESCE(SUM(size_bytes),0) FROM content_objects"
-                ).fetchone()[0],
-                "entries": c.execute("SELECT COUNT(*) FROM filesystem_entries").fetchone()[0],
+                ),
+                "unique_content_bytes": scalar("SELECT COALESCE(SUM(size_bytes),0) FROM content_objects"),
+                "entries": scalar("SELECT COUNT(*) FROM filesystem_entries"),
+                "content_objects": scalar("SELECT COUNT(*) FROM content_objects"),
+                "analysis_artifacts": scalar("SELECT COUNT(*) FROM analysis_artifacts"),
+                "sources": scalar("SELECT COUNT(*) FROM source_roots"),
+                "duplicate_groups": scalar("SELECT COUNT(*) FROM exact_duplicate_groups"),
             },
+            "charts": charts,
             "classifications": {
                 str(r[0]): int(r[1])
                 for r in c.execute(
@@ -421,7 +516,7 @@ class Database:
                 (key, json.dumps(value, sort_keys=True), scan_run_id),
             )
         c.commit()
-        return {key: len(value) for key, value in values.items()}
+        return {key: len(value) if isinstance(value, dict) else 0 for key, value in values.items()}
 
     def database_stats(self, check_integrity: bool = True) -> dict[str, int | str]:
         """Cheap COUNT-based stats, plus a full ``PRAGMA integrity_check`` unless disabled.
@@ -549,3 +644,30 @@ class Database:
         )
         assert cur.lastrowid is not None
         return cur.lastrowid
+
+
+class _ReadDB:
+    """Read-only view over a :class:`Database` exposing the fetch API the dashboard uses.
+
+    It mirrors ``Database.fetch_one``/``fetch_all``/``iter_rows`` so read-only consumers (the
+    dashboard service and GET endpoints) need no code change — they just receive this instead of
+    the writer. Every query runs on the caller thread's pooled read-only connection.
+    """
+
+    def __init__(self, database: Database) -> None:
+        self._db = database
+
+    def fetch_one(self, sql: str, params: tuple | dict = ()) -> sqlite3.Row | None:
+        return self._db._read_conn().execute(sql, params).fetchone()
+
+    def fetch_all(self, sql: str, params: tuple | dict = ()) -> list[sqlite3.Row]:
+        return self._db._read_conn().execute(sql, params).fetchall()
+
+    def iter_rows(
+        self, sql: str, params: tuple | dict = (), batch_size: int = 1_000
+    ) -> Iterator[sqlite3.Row]:
+        if batch_size < 1:
+            raise ValueError("batch_size must be positive")
+        cursor = self._db._read_conn().execute(sql, params)
+        while batch := cursor.fetchmany(batch_size):
+            yield from batch
