@@ -3,9 +3,10 @@
   <head>
     <meta charset="utf-8">
     <title>{{ title }}</title>
-    <link rel="stylesheet" href="/static/app.css">
+    <link rel="stylesheet" href="/static/app.css?v={{ app_css_version }}">
     <script defer src="/static/vendor/htmx.min.js"></script>
     <script defer src="/static/htmx-controls.js"></script>
+    <script defer src="/static/theme-switch.js?v={{ theme_switch_version }}"></script>
     {{ scripts | safe }}
   </head>
   <body data-csrf-token="{{ csrf_token }}">

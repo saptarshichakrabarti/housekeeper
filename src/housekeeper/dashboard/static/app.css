@@ -1,12 +1,283 @@
-body { font: 14px system-ui, sans-serif; margin: 2rem; color: #20242a; max-width: 1400px; }
-header { display: flex; align-items: baseline; justify-content: space-between; gap: 1rem; flex-wrap: wrap; }
-nav a { color: #24506f; text-decoration: none; }
+/* drive_housekeeper dashboard — three selectable themes.
+ *
+ * Theme is chosen via a `data-theme` attribute on <html>:
+ *   data-theme="sober"   forensic default: muted palette, hairline rules, semantic colour only
+ *   data-theme="hybrid"  boxy, monospace, zero-radius chrome — but sober palette + strict semantic colour
+ *   data-theme="brutal"  full neobrutalism: thick borders, hard offset shadows, saturated blocks
+ *
+ * All three read from the SAME set of CSS custom properties, so the templates
+ * never change — only the variables do. Semantic colour (held/protected,
+ * approved-for-move, running-job, danger) is defined once and kept meaningful
+ * in every theme, because on a tool that never deletes, those states are the
+ * whole point.
+ *
+ * Fallback: if no data-theme is set (JS disabled / pre-paint), :root defaults
+ * to sober, so the page is always readable and never mid-transition.
+ */
+
+/* ---- shared tokens (sober default lives on :root) ---------------------- */
+:root,
+:root[data-theme="sober"] {
+  --hk-font: system-ui, sans-serif;
+  --hk-font-num: system-ui, sans-serif;
+
+  --hk-text: #20242a;
+  --hk-text-muted: #5b6570;
+  --hk-page: #ffffff;
+  --hk-surface: #f5f8fa;
+  --hk-surface-alt: #fbfcfd;
+
+  --hk-border: #d9e2e8;   /* hairline default */
+  --hk-border-strong: #c3cfd8;
+  --hk-border-w: 1px;
+  --hk-radius: 3px;
+  --hk-shadow: none;
+  --hk-shadow-card: none;
+
+  --hk-link: #24506f;
+
+  /* semantic — meaning, not decoration */
+  --hk-accent: #4f86b8;   /* running / in-progress */
+  --hk-accent-bg: #eef4f9;
+  --hk-warn: #a9711a;     /* held / protected */
+  --hk-warn-bg: #faf1de;
+  --hk-ok: #2f7d4f;       /* approved for move / integrity ok */
+  --hk-ok-bg: #e9f4ed;
+  --hk-danger: #b23a3a;
+  --hk-danger-bg: #fbecec;
+
+  --hk-header-bg: transparent;
+  --hk-header-text: var(--hk-text);
+  --hk-th-bg: transparent;
+  --hk-th-text: var(--hk-text-muted);
+}
+
+/* ---- hybrid: sober palette, brutalist chrome -------------------------- */
+:root[data-theme="hybrid"] {
+  --hk-font: ui-monospace, "SFMono-Regular", "Cascadia Mono", "Menlo", monospace;
+  --hk-font-num: ui-monospace, "SFMono-Regular", "Menlo", monospace;
+
+  --hk-text: #1b1f24;
+  --hk-text-muted: #5b6570;
+  --hk-page: #ffffff;
+  --hk-surface: #f4f6f8;
+  --hk-surface-alt: #fafbfc;
+
+  --hk-border: #cdd6dd;
+  --hk-border-strong: #3a4149;   /* the one bit of "brutal": strong dark rules */
+  --hk-border-w: 2px;
+  --hk-radius: 0;
+  --hk-shadow: none;
+  --hk-shadow-card: none;
+
+  --hk-link: #1d4c6e;
+
+  --hk-accent: #2f6ea8;
+  --hk-accent-bg: #eaf2f9;
+  --hk-warn: #9a6410;
+  --hk-warn-bg: #f7efdc;
+  --hk-ok: #256b41;
+  --hk-ok-bg: #e6f2ea;
+  --hk-danger: #a53131;
+  --hk-danger-bg: #f9eaea;
+
+  --hk-header-bg: var(--hk-page);
+  --hk-header-text: var(--hk-text);
+  --hk-th-bg: #f0f3f5;
+  --hk-th-text: var(--hk-text);
+}
+
+/* ---- brutal: full neobrutalism ---------------------------------------- */
+:root[data-theme="brutal"] {
+  --hk-font: ui-monospace, "SFMono-Regular", "Cascadia Mono", "Menlo", monospace;
+  --hk-font-num: ui-monospace, "SFMono-Regular", "Menlo", monospace;
+
+  --hk-text: #111111;
+  --hk-text-muted: #333333;
+  --hk-page: #fdfcf7;
+  --hk-surface: #a0e7e5;      /* neutral card fill */
+  --hk-surface-alt: #ffffff;
+
+  --hk-border: #111111;
+  --hk-border-strong: #111111;
+  --hk-border-w: 3px;
+  --hk-radius: 0;
+  --hk-shadow: 5px 5px 0 #111111;
+  --hk-shadow-card: 5px 5px 0 #111111;
+
+  --hk-link: #111111;
+
+  --hk-accent: #4d96ff;
+  --hk-accent-bg: #4d96ff;
+  --hk-warn: #111111;
+  --hk-warn-bg: #ff8c42;
+  --hk-ok: #111111;
+  --hk-ok-bg: #c1f27b;
+  --hk-danger: #111111;
+  --hk-danger-bg: #ff6b6b;
+
+  --hk-header-bg: #ffd23f;
+  --hk-header-text: #111111;
+  --hk-th-bg: #111111;
+  --hk-th-text: #ffffff;
+}
+
+/* ---- layout (shared; reads only the tokens above) --------------------- */
+body {
+  font: 14px var(--hk-font);
+  margin: 2rem;
+  color: var(--hk-text);
+  background: var(--hk-page);
+  max-width: 1400px;
+}
+
+header {
+  display: flex;
+  align-items: baseline;
+  justify-content: space-between;
+  gap: 1rem;
+  flex-wrap: wrap;
+  background: var(--hk-header-bg);
+  color: var(--hk-header-text);
+  border: var(--hk-border-w) solid var(--hk-border-strong);
+  border-radius: var(--hk-radius);
+  box-shadow: var(--hk-shadow);
+  padding: .6rem 1rem;
+  margin-bottom: 1.25rem;
+}
+:root[data-theme="sober"] header {
+  border: none;
+  box-shadow: none;
+  padding: 0 0 .5rem;
+  border-bottom: 1px solid var(--hk-border);
+}
+header h1 { margin: 0; font-size: 1.25rem; font-weight: 500; }
+
+nav a { color: var(--hk-link); text-decoration: none; }
 nav a:hover { text-decoration: underline; }
-.cards { display: grid; grid-template-columns: repeat(auto-fit, minmax(150px, 1fr)); gap: .75rem; margin: 1rem 0; }
-.card { background: #f5f8fa; padding: .75rem; border: 1px solid #d9e2e8; display: grid; gap: .25rem; overflow: hidden; }
-.card b { font-size: 1.5rem; }.bar { display: block; min-width: 2px; height: 5px; background: #4f86b8; }
+
+/* metric cards */
+.cards {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(150px, 1fr));
+  gap: .75rem;
+  margin: 1rem 0;
+}
+.card {
+  background: var(--hk-surface);
+  padding: .75rem;
+  border: var(--hk-border-w) solid var(--hk-border);
+  border-radius: var(--hk-radius);
+  box-shadow: var(--hk-shadow-card);
+  display: grid;
+  gap: .25rem;
+  overflow: hidden;
+}
+.card b { font-size: 1.5rem; font-family: var(--hk-font-num); font-weight: 500; }
+.card strong { font-weight: 500; color: var(--hk-text-muted); font-size: .8rem; }
+:root[data-theme="brutal"] .card strong { color: var(--hk-text); }
+
+/* semantic state on cards: add class .card--held / .card--ok / .card--danger */
+.card--held   { background: var(--hk-warn-bg); }
+.card--held b, .card--held strong { color: var(--hk-warn); }
+.card--ok     { background: var(--hk-ok-bg); }
+.card--ok b, .card--ok strong { color: var(--hk-ok); }
+.card--danger { background: var(--hk-danger-bg); }
+.card--danger b, .card--danger strong { color: var(--hk-danger); }
+
+/* mini bar */
+.bar {
+  display: block;
+  min-width: 2px;
+  height: 5px;
+  background: var(--hk-accent);
+}
+:root[data-theme="brutal"] .bar { height: 8px; border: 2px solid #111; }
+
+/* tables */
 table { border-collapse: collapse; width: 100%; }
-th, td { border-bottom: 1px solid #ddd; padding: .4rem; text-align: left; }
-#cy { height: 70vh; min-height: 480px; max-width: 1200px; border: 1px solid #ddd; background: #fbfcfd; }
+th, td {
+  border-bottom: var(--hk-border-w) solid var(--hk-border);
+  padding: .4rem;
+  text-align: left;
+}
+th {
+  background: var(--hk-th-bg);
+  color: var(--hk-th-text);
+  font-weight: 500;
+}
+:root[data-theme="brutal"] td { border-bottom-color: #111; }
+tbody tr:hover { background: var(--hk-accent-bg); }
+:root[data-theme="brutal"] tbody tr:hover { background: #fff2b8; }
+
+/* buttons inside tables (review queue) + generic controls */
+button,
+.controls button {
+  font: inherit;
+  color: var(--hk-text);
+  background: var(--hk-surface-alt);
+  border: var(--hk-border-w) solid var(--hk-border-strong);
+  border-radius: var(--hk-radius);
+  box-shadow: var(--hk-shadow);
+  padding: .25rem .6rem;
+  cursor: pointer;
+}
+button:hover { background: var(--hk-accent-bg); }
+button:active { transform: translate(1px, 1px); box-shadow: none; }
+:root[data-theme="sober"] button:active { transform: none; }
+
+/* review detail drawer */
+#detail-drawer,
+aside#detail-drawer {
+  background: var(--hk-surface);
+  border: var(--hk-border-w) solid var(--hk-border);
+  border-radius: var(--hk-radius);
+  box-shadow: var(--hk-shadow-card);
+  padding: .6rem;
+  margin: 0 0 1rem;
+}
+
+/* graph explorer */
+#cy {
+  height: 70vh;
+  min-height: 480px;
+  max-width: 1200px;
+  border: var(--hk-border-w) solid var(--hk-border);
+  border-radius: var(--hk-radius);
+  box-shadow: var(--hk-shadow-card);
+  background: var(--hk-surface-alt);
+}
 .graph-controls { display: flex; gap: .6rem; flex-wrap: wrap; margin: .8rem 0; }
-#graph-detail { white-space: pre-wrap; max-width: 1200px; min-height: 2rem; background: #f4f6f8; padding: .6rem; }
+#graph-detail {
+  white-space: pre-wrap;
+  max-width: 1200px;
+  min-height: 2rem;
+  background: var(--hk-surface);
+  border: var(--hk-border-w) solid var(--hk-border);
+  border-radius: var(--hk-radius);
+  padding: .6rem;
+}
+
+/* the theme switcher itself (injected into <header>) */
+.hk-theme-switch {
+  display: inline-flex;
+  gap: .3rem;
+  align-items: center;
+  font-family: var(--hk-font);
+  font-size: .75rem;
+}
+.hk-theme-switch label { color: var(--hk-text-muted); }
+:root[data-theme="brutal"] .hk-theme-switch label { color: var(--hk-header-text); }
+.hk-theme-switch select {
+  font: inherit;
+  color: var(--hk-text);
+  background: var(--hk-surface-alt);
+  border: var(--hk-border-w) solid var(--hk-border-strong);
+  border-radius: var(--hk-radius);
+  padding: .15rem .4rem;
+}
+
+/* honour reduced motion / no surprises */
+@media (prefers-reduced-motion: reduce) {
+  button:active { transform: none; }
+}

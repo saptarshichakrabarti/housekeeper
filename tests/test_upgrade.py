@@ -183,6 +183,9 @@ def test_dashboard_is_local_query_only_and_escaped(tmp_path):
     assert client.get("/api/overview").status_code == 200
     assert "cytoscape.min.js" in client.get("/graph").text
     assert "htmx.min.js" in client.get("/").text
+    assert "/static/app.css?v=" in client.get("/").text
+    assert "/static/theme-switch.js?v=" in client.get("/").text
+    assert client.get("/static/app.css").headers["cache-control"] == "no-cache"
     assert client.get("/static/vendor/cytoscape.min.js").status_code == 200
     htmx = client.get("/static/vendor/htmx.min.js")
     assert htmx.status_code == 200

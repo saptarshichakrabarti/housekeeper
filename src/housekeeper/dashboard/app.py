@@ -46,6 +46,8 @@ def create_app(database, read_only: bool = False, contact_sheet_dir: Path | None
                 title=title,
                 body=Markup(body),
                 scripts=Markup(scripts),
+                app_css_version=(static_dir / "app.css").stat().st_mtime_ns,
+                theme_switch_version=(static_dir / "theme-switch.js").stat().st_mtime_ns,
                 csrf_token=csrf_token,
                 navigation=(
                     ("", "Overview"),
@@ -176,6 +178,10 @@ def create_app(database, read_only: bool = False, contact_sheet_dir: Path | None
     @app.middleware("http")
     async def security_headers(request, call_next):
         response = await call_next(request)
+        if request.url.path.startswith("/static/"):
+            # StaticFiles supplies ETags; require browsers to revalidate them so
+            # dashboard CSS and JavaScript cannot get out of sync after an update.
+            response.headers["Cache-Control"] = "no-cache"
         response.headers["Content-Security-Policy"] = (
             "default-src 'self'; style-src 'self' 'unsafe-inline'; img-src 'self' data:"
         )
