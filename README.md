@@ -1,6 +1,6 @@
-# drive_housekeeper
+# housekeeper
 
-`drive_housekeeper` creates a factual, resumable SQLite inventory of a messy backup drive and produces conservative review recommendations. It never permanently deletes files. The only mutating operation is moving individually approved manifest rows into an external review folder; every move is hashed, recorded, and restorable.
+`housekeeper` creates a factual, resumable SQLite inventory of a messy backup drive and produces conservative review recommendations. It never permanently deletes files. The only mutating operation is moving individually approved manifest rows into an external review folder; every move is hashed, recorded, and restorable.
 
 Scanning is read-only, does not follow symbolic links by default, never executes content, and treats errors and unsupported formats conservatively. Exact duplicates require verified SHA-256 hashes and retain a deterministic canonical copy. Similarity is never proof of disposability. Movement requires an explicit edited manifest, revalidates size and hash immediately beforehand, refuses collisions and nested source/review roots, verifies the destination, then removes the source only after a verified copy. There is no delete or purge command.
 
