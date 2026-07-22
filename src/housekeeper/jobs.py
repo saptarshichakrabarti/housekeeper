@@ -26,7 +26,15 @@ JOB_STATES = {
     "COMPLETED",
     "COMPLETED_WITH_ERRORS",
     "FAILED",
+    "INTERRUPTED",
 }
+
+# States a finished job can never leave. A control request against one of these is a no-op.
+TERMINAL_STATES = {"CANCELLED", "COMPLETED", "COMPLETED_WITH_ERRORS", "FAILED", "INTERRUPTED"}
+
+# States that imply a live worker is (or should be) touching the row. If the worker's process is
+# gone, a job left in one of these is orphaned and the reaper settles it — see reconcile_stale_jobs.
+ACTIVE_STATES = {"RUNNING", "PAUSING", "CANCELLING"}
 
 
 def create_job(
@@ -86,7 +94,7 @@ def update_job(
     if checkpoint is not None:
         updates.append("checkpoint_json=?")
         values.append(json.dumps(checkpoint, sort_keys=True))
-    if status in {"COMPLETED", "COMPLETED_WITH_ERRORS", "FAILED", "CANCELLED"}:
+    if status in {"COMPLETED", "COMPLETED_WITH_ERRORS", "FAILED", "CANCELLED", "INTERRUPTED"}:
         updates.append("completed_at=CURRENT_TIMESTAMP")
     if status == "RUNNING":
         updates.append("started_at=COALESCE(started_at,CURRENT_TIMESTAMP)")
@@ -96,6 +104,26 @@ def update_job(
 
 
 def request_cancel(database: Database, job_id: int) -> None:
+    """Ask a worker to stop and leave the job in a durable, cancelled state.
+
+    Cancellation, like pause, is expressed through the status column so a restarted worker sees
+    the same request. The transition is validated so a stray click on an already-finished job is a
+    harmless no-op rather than a row that gets stuck in ``CANCELLING`` forever:
+
+    * a terminal job is left untouched (there is nothing to cancel);
+    * a ``PAUSED`` job has no live worker to observe the request, so it is finalized to
+      ``CANCELLED`` directly instead of waiting at ``CANCELLING`` for a worker that never runs;
+    * an active job is asked to cancel and settles at its next cooperative checkpoint.
+    """
+    row = database.fetch_one("SELECT status FROM jobs WHERE id=?", (job_id,))
+    if not row:
+        raise ValueError("job not found")
+    status = row["status"]
+    if status in TERMINAL_STATES:
+        return
+    if status == "PAUSED":
+        update_job(database, job_id, "CANCELLED")
+        return
     update_job(database, job_id, "CANCELLING")
 
 
@@ -223,3 +251,67 @@ def threading_main_thread() -> bool:
     import threading
 
     return threading.current_thread() is threading.main_thread()
+
+
+def _worker_process_alive(pid: int | None, host: str | None, this_host: str) -> bool | None:
+    """Best-effort liveness of the process that owns a job.
+
+    Returns ``True``/``False`` only when the answer is trustworthy — the job was recorded on this
+    same host and we can probe the pid. For a job from another host (a shared database on a
+    different machine) the pid is meaningless here, so we return ``None`` ("undecidable") and the
+    caller falls back to the heartbeat timeout.
+    """
+    if not pid or not host or host != this_host:
+        return None
+    try:
+        os.kill(int(pid), 0)
+    except ProcessLookupError:
+        return False
+    except PermissionError:
+        # The process exists but is owned by another user — still alive.
+        return True
+    except OSError:
+        return None
+    return True
+
+
+def reconcile_stale_jobs(
+    database: Database, heartbeat_timeout_seconds: float = 120.0
+) -> list[tuple[int, str]]:
+    """Settle jobs whose worker has died, so the UI never shows a phantom "running" operation.
+
+    Cooperative pause/cancel only works while a live worker is polling its checkpoints. If that
+    worker's process disappears (the dashboard is restarted, the machine reboots, the CLI run is
+    ``kill -9``'d) the row is stranded in ``RUNNING``/``PAUSING``/``CANCELLING`` forever — exactly
+    the "these were stopped long ago but the web UI still shows them active" symptom.
+
+    This detects an orphan two independent ways and needs only one to fire:
+
+    * **process liveness** — the job was recorded on this host and its pid is no longer running;
+    * **heartbeat** — no checkpoint has touched ``updated_at`` within ``heartbeat_timeout_seconds``
+      (covers a dead worker on another host sharing the database).
+
+    An orphaned job becomes ``INTERRUPTED`` (a terminal, honest state: "stopped without
+    finishing"). ``PENDING`` (queued, no worker yet) and ``PAUSED`` (deliberately parked at a
+    durable checkpoint) are never reaped. Returns the ``(job_id, new_status)`` pairs it changed.
+    """
+    from .core.progress import seconds_since  # local import keeps jobs.py import-cycle free
+
+    this_host = platform.node()
+    rows = database.fetch_all(
+        "SELECT id,status,host,process_id,updated_at FROM jobs WHERE status IN ('RUNNING','PAUSING','CANCELLING')"
+    )
+    reaped: list[tuple[int, str]] = []
+    for row in rows:
+        alive = _worker_process_alive(row["process_id"], row["host"], this_host)
+        if alive is True:
+            continue  # a live worker owns this job; leave it alone
+        stale_heartbeat = seconds_since(row["updated_at"]) > heartbeat_timeout_seconds
+        if alive is None and not stale_heartbeat:
+            # Undecidable pid and a recent heartbeat — assume a healthy remote/near worker.
+            continue
+        update_job(
+            database, int(row["id"]), "INTERRUPTED", current_item="worker no longer running"
+        )
+        reaped.append((int(row["id"]), "INTERRUPTED"))
+    return reaped

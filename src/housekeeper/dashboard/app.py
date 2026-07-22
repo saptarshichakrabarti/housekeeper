@@ -46,6 +46,25 @@ def create_app(
         from .runner import OperationRunner
 
         runner = OperationRunner(config)
+
+    def maybe_reconcile() -> None:
+        """Settle orphaned jobs so the UI reflects reality, never a phantom running operation.
+
+        Read-only dashboards observe without mutating, so they skip it. Everywhere else this is
+        cheap (it scans only the handful of non-terminal job rows) and must never surface an error
+        into a page render, so any failure is swallowed — a poll tick is not the place to crash."""
+        if read_only:
+            return
+        try:
+            from ..jobs import reconcile_stale_jobs
+
+            reconcile_stale_jobs(database)
+        except Exception:  # noqa: BLE001 - reconciliation is best-effort housekeeping
+            pass
+
+    # Reap jobs stranded by a previous process (a killed CLI run, a restarted dashboard) up front,
+    # so the very first page load already shows honest state instead of stale "running" rows.
+    maybe_reconcile()
     navigation: list[tuple[str, str]] = [("", "Overview")]
     if runner is not None:
         navigation.append(("control", "Run"))
@@ -108,23 +127,76 @@ def create_app(
         )
         return f"<table><thead><tr>{header}</tr></thead><tbody>{body or '<tr><td colspan=99>No results</td></tr>'}</tbody></table>"
 
+    # Human labels for jobs that are not actively being worked. A stopped job must read as stopped.
+    STOPPED_LABELS = {
+        "PENDING": "queued",
+        "PAUSED": "paused",
+        "CANCELLED": "cancelled",
+        "INTERRUPTED": "interrupted",
+        "FAILED": "failed",
+        "COMPLETED": "completed",
+        "COMPLETED_WITH_ERRORS": "completed with errors",
+    }
+    DANGER_STATES = {"FAILED", "CANCELLED", "INTERRUPTED"}
+
     def progress_cell(row) -> str:
-        """Render a job row's progress: a real percentage when a total is known, otherwise an
-        indeterminate bar with live counters. Never fabricates an ETA for an unknown total."""
+        """Render a job row's progress honestly for its status.
+
+        Only a job with a live worker (RUNNING/PAUSING/CANCELLING) shows a moving rate, an ETA, or
+        an animated indeterminate bar. Anything stopped — completed, cancelled, interrupted, failed,
+        paused, or still queued — renders as static text (and a static, valued bar when a total is
+        known), so a job the worker abandoned can never masquerade as still churning. The previous
+        version emitted a live ``<progress>`` and a ``started_at``-derived rate for every row, which
+        is why long-cancelled jobs kept animating with a decaying throughput in the UI.
+        """
+        status = row["status"]
         processed = row["processed_count"] or 0
         total = row["total_estimate"]
-        rate = throughput(processed, seconds_since(row["started_at"]))
-        danger = " class='hk-progress--danger'" if row["status"] == "FAILED" else ""
+        danger = " class='hk-progress--danger'" if status in DANGER_STATES else ""
+        if status in {"RUNNING", "PAUSING", "CANCELLING"}:
+            rate = throughput(processed, seconds_since(row["started_at"]))
+            stopping = " · stopping…" if status in {"PAUSING", "CANCELLING"} else ""
+            if total:
+                pct = min(100, int(processed * 100 / total))
+                eta = eta_seconds(processed, total, rate)
+                eta_html = f" · ETA {format_duration(eta)}" if eta is not None else ""
+                return (
+                    f"<progress value='{processed}' max='{total}'></progress> "
+                    f"{pct}% {processed:,}/{total:,} · {rate:,.1f}/s{eta_html}{stopping}"
+                )
+            current = f" · {escape(str(row['current_item']))}" if row["current_item"] else ""
+            return f"<progress></progress> {processed:,} processed · {rate:,.1f}/s{current}{stopping}"
+        # Stopped: no animation, no fabricated rate — a frozen, factual snapshot.
+        label = STOPPED_LABELS.get(status, status.lower())
         if total:
             pct = min(100, int(processed * 100 / total))
-            eta = eta_seconds(processed, total, rate)
-            eta_html = f" · ETA {format_duration(eta)}" if eta is not None else ""
             return (
                 f"<progress{danger} value='{processed}' max='{total}'></progress> "
-                f"{pct}% {processed:,}/{total:,} · {rate:,.1f}/s{eta_html}"
+                f"{label} · {pct}% {processed:,}/{total:,}"
             )
-        current = f" · {escape(str(row['current_item']))}" if row["current_item"] else ""
-        return f"<progress{danger}></progress> {processed:,} processed · {rate:,.1f}/s{current}"
+        return f"{label} · {processed:,} processed"
+
+    def job_controls(job_id: int, status: str) -> str:
+        """The control buttons a job's *current* status actually supports.
+
+        Pause is only meaningful while a worker is running; Cancel stays available right through the
+        stopping states (PAUSING/PAUSED) so a user is never left with a job they cannot stop.
+        Transitional CANCELLING and terminal states offer nothing — a live worker settles the first
+        and the reaper settles an orphan, so an extra button would be a lie about what the click
+        does."""
+        pause = (
+            f"<button hx-post='/fragments/jobs/{job_id}/control?action=pause' "
+            f"hx-target='closest tr'>Pause</button> "
+        )
+        cancel = (
+            f"<button hx-post='/fragments/jobs/{job_id}/control?action=cancel' "
+            f"hx-target='closest tr'>Cancel</button>"
+        )
+        if status in {"PENDING", "RUNNING"}:
+            return pause + cancel
+        if status in {"PAUSING", "PAUSED"}:
+            return cancel
+        return ""
 
     def jobs_table(rows) -> str:
         headings = [
@@ -146,9 +218,7 @@ def create_app(
                 else f"<td>{escape(str(row[heading] if row[heading] is not None else ''))}</td>"
                 for heading in headings
             )
-            controls = ""
-            if row["status"] in {"PENDING", "RUNNING"}:
-                controls = f"<button hx-post='/fragments/jobs/{row['id']}/control?action=pause' hx-target='closest tr'>Pause</button> <button hx-post='/fragments/jobs/{row['id']}/control?action=cancel' hx-target='closest tr'>Cancel</button>"
+            controls = job_controls(row["id"], row["status"])
             body += f"<tr>{cells}<td>{controls}</td></tr>"
         return f"<table><thead><tr>{header}</tr></thead><tbody>{body or '<tr><td colspan=99>No results</td></tr>'}</tbody></table>"
 
@@ -691,6 +761,9 @@ def create_app(
 
     @app.get("/fragments/jobs", response_class=HTMLResponse)
     def jobs_fragment(limit: int = Query(100, ge=1, le=500)):
+        # The jobs fragment is polled by both the Jobs page and the overview, so it is the natural
+        # heartbeat for reaping orphans: within one poll interval a dead worker's row turns honest.
+        maybe_reconcile()
         rows = database.fetch_all(
             "SELECT id,job_type,status,processed_count,total_estimate,success_count,skip_count,error_count,current_item,started_at,updated_at FROM jobs ORDER BY id DESC LIMIT ?",
             (limit,),
@@ -704,16 +777,22 @@ def create_app(
         x_csrf_token: str | None = Header(default=None),
     ):
         guard(x_csrf_token)
-        if action == "pause":
-            from ..jobs import request_pause
-
-            request_pause(database, job_id)
-        elif action == "cancel":
-            from ..jobs import request_cancel
-
-            request_cancel(database, job_id)
-        else:
+        if action not in {"pause", "cancel"}:
             raise HTTPException(422, "invalid job control")
+        from ..jobs import request_cancel, request_pause
+
+        try:
+            if action == "pause":
+                request_pause(database, job_id)
+            else:
+                request_cancel(database, job_id)
+        except ValueError:
+            # The job already moved past a state this action applies to (a double-click, or a
+            # worker that finished first). Re-render the row's true state rather than erroring.
+            pass
+        # If the worker behind this job is already gone, finalize it now so the row the user gets
+        # back reflects reality immediately instead of sitting in PAUSING/CANCELLING until a poll.
+        maybe_reconcile()
         row = database.fetch_one(
             "SELECT id,job_type,status,processed_count,total_estimate,success_count,skip_count,error_count,current_item,started_at,updated_at FROM jobs WHERE id=?",
             (job_id,),

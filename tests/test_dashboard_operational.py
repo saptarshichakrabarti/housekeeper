@@ -73,6 +73,37 @@ def test_submit_raising_operation_becomes_error_without_crashing(config, monkeyp
     assert "synthetic failure" in status["error"]
 
 
+def test_cancelled_operation_reports_cancelled_not_error(config, monkeypatch):
+    """A deliberate stop must not read as a failure on the Run page."""
+    from housekeeper.jobs import JobCancelled
+
+    def cancelled(self, database):
+        raise JobCancelled("job 1 cancelled")
+
+    monkeypatch.setattr(OperationRunner, "_run_classify", cancelled)
+    runner = OperationRunner(config)
+    assert runner.submit("classify") == "accepted"
+    _wait_idle(runner)
+    status = runner.status()
+    assert status["state"] == "cancelled"
+    assert status["error"] is None
+    # A cancelled run frees the worker so the next operation can start.
+    assert runner.status()["state"] != "running"
+
+
+def test_paused_operation_reports_paused_not_error(config, monkeypatch):
+    from housekeeper.jobs import JobPaused
+
+    def paused(self, database):
+        raise JobPaused("job 1 paused")
+
+    monkeypatch.setattr(OperationRunner, "_run_classify", paused)
+    runner = OperationRunner(config)
+    assert runner.submit("classify") == "accepted"
+    _wait_idle(runner)
+    assert runner.status()["state"] == "paused"
+
+
 @pytest.fixture
 def operational_client(config, database):
     pytest.importorskip("fastapi")

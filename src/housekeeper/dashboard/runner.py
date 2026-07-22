@@ -16,7 +16,7 @@ from typing import Any, Callable
 
 from ..config import AppConfig, config_fingerprint
 from ..database import Database
-from ..jobs import tracked_job
+from ..jobs import JobCancelled, JobPaused, tracked_job
 
 # The GUI's Analyze control is a curated, common-path subset of the CLI's full ~25-kind matrix
 # (scope filters like --under/--mime stay CLI-only). "all" runs every kind below in sequence.
@@ -110,6 +110,13 @@ class OperationRunner:
                 raise ValueError(f"unknown operation: {operation}")
             with self._lock:
                 self._status["state"] = "idle"
+        except (JobCancelled, JobPaused) as exc:
+            # A deliberate stop is not a failure. Surface it as its own state so the Run page shows
+            # "cancelled"/"paused" instead of a red error card for something the user asked for.
+            with self._lock:
+                self._status["state"] = (
+                    "cancelled" if isinstance(exc, JobCancelled) else "paused"
+                )
         except Exception as exc:  # noqa: BLE001 - surfaced to the GUI; the worker must never crash
             with self._lock:
                 self._status["state"] = "error"
