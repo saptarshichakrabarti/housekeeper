@@ -20,6 +20,17 @@ def _ensure_candidate_links(
     allowed_entry_ids: set[int] | None = None,
 ) -> None:
     """Hash only sizes with more than one occurrence when no verified link exists yet."""
+    if job_id:
+        # Mirrors the loop's own predicate below, so the denominator matches exactly what will be
+        # processed. Scope (``allowed_entry_ids``) is a Python-side post-filter, not part of this
+        # SQL, so a scoped run's total is an upper bound — the bar never over-reports completion.
+        total = database.fetch_one(
+            """SELECT COUNT(*) AS n FROM filesystem_entries e
+               LEFT JOIN entry_content_links l ON l.entry_id=e.id AND l.link_status='VERIFIED'
+               WHERE e.entry_type='file' AND l.entry_id IS NULL AND e.size_bytes IN
+               (SELECT size_bytes FROM filesystem_entries WHERE entry_type='file' GROUP BY size_bytes HAVING COUNT(*)>1)"""
+        )
+        update_job(database, job_id, total_estimate=int(total["n"]) if total else 0)
     sizes = database.iter_rows(
         "SELECT size_bytes FROM filesystem_entries WHERE entry_type='file' GROUP BY size_bytes HAVING COUNT(*)>1"
     )
@@ -87,6 +98,17 @@ def run_exact_duplicate_analysis(
     invalidate_relationships(database, relationship_type="EXACT_DUPLICATE_MEMBER")
     conn.execute("DELETE FROM exact_duplicate_members")
     conn.execute("DELETE FROM exact_duplicate_groups")
+    if job_id:
+        # Revises the same job's total_estimate for this second phase (candidate hashing above has
+        # a different, larger denominator) — update_job supports changing it mid-run.
+        group_total = database.fetch_one(
+            """SELECT COUNT(*) AS n FROM (
+                 SELECT co.id FROM content_objects co JOIN entry_content_links l ON l.content_object_id=co.id
+                 JOIN filesystem_entries e ON e.id=l.entry_id
+                 WHERE l.link_status='VERIFIED' AND l.hash_verified=1 AND e.entry_type='file'
+                 GROUP BY co.id,co.full_hash,co.size_bytes HAVING COUNT(*)>1)"""
+        )
+        update_job(database, job_id, total_estimate=int(group_total["n"]) if group_total else 0)
     groups = database.iter_rows(
         """SELECT co.id AS content_id,co.full_hash,co.size_bytes,COUNT(*) AS member_count
            FROM content_objects co JOIN entry_content_links l ON l.content_object_id=co.id

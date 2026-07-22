@@ -35,7 +35,7 @@ def run_quickstart(
     config,
     source_root: Path,
     generate_reports: bool = True,
-    progress: Callable[[str], None] = lambda message: None,
+    progress: Callable[[str, int, int], None] = lambda message, stage, stage_total: None,
 ) -> dict:
     """Execute the full safe pipeline against ``source_root`` and return a summary."""
     from .analyzers.archive_equivalence import run_archive_directory_analysis
@@ -67,14 +67,49 @@ def run_quickstart(
     if not source_root.is_dir():
         raise NotADirectoryError(f"source must be a directory, not a file: {source_root}")
 
+    # Named (rather than left as inline loop literals) so the stage count below is derived from
+    # their length instead of a hand-maintained magic number.
+    STRUCTURAL_ANALYZERS = (
+        ("directory-overlap", "DIRECTORY_OVERLAP", run_directory_overlap_analysis),
+        ("document-versions", "VERSION_ANALYSIS", run_document_version_analysis),
+        ("image-similarity", "IMAGE_ANALYSIS", run_image_analysis),
+        ("projects", "PROJECT_ANALYSIS", run_project_analysis),
+        ("backup-lineage", "DIRECTORY_SUMMARY", run_backup_lineage_analysis),
+        ("normalized-content", "CONTENT_ANALYSIS", run_normalized_content_analysis),
+        ("derivations", "VERSION_ANALYSIS", run_cross_format_derivation_analysis),
+    )
+    POST_CANONICAL_ANALYZERS = (
+        ("archive-of-directory", "ARCHIVE_ANALYSIS", run_archive_directory_analysis),
+        ("backup-value", "DIRECTORY_SUMMARY", run_backup_value_analysis),
+        ("record-series", "CLASSIFICATION", run_record_series_analysis),
+        ("preservation-risk", "PROJECT_ANALYSIS", run_preservation_risk_analysis),
+        ("photo-events", "IMAGE_ANALYSIS", run_photo_event_analysis),
+        ("contact-sheets", "CONTACT_SHEET_GENERATION", run_contact_sheet_generation),
+    )
+    # scan, exact-duplicates, content-analysis, canonical-roles, classify, review-priority, lifecycle.
+    FIXED_STAGE_COUNT = 7
+    stage_total = (
+        FIXED_STAGE_COUNT
+        + len(STRUCTURAL_ANALYZERS)
+        + len(POST_CANONICAL_ANALYZERS)
+        + (1 if generate_reports else 0)
+    )
+
     steps: list[dict] = []
     summary: dict = {"source_root": str(source_root), "steps": steps}
+    stage = 0
+
+    def begin_stage(label: str) -> None:
+        # Fired at the *start* of a stage (not on completion) so a live progress display's label
+        # always names whatever is actively running.
+        nonlocal stage
+        stage += 1
+        progress(f"[quickstart] {label}", stage, stage_total)
 
     def record(label: str, result: object) -> None:
         steps.append({"step": label, "result": result})
-        progress(f"[quickstart] {label}: done")
 
-    progress(f"[quickstart] scanning {source_root} (read-only; nothing is ever moved)")
+    begin_stage(f"scanning {source_root} (read-only; nothing is ever moved)")
     # The scanner creates and completes its own durable SCAN job, so it is not wrapped in
     # ``tracked_job`` (which would double-manage the lifecycle).
     scanner = DriveScanner(database, config)
@@ -85,6 +120,7 @@ def run_quickstart(
     # routine re-run. Scoping to this scan run keeps re-runs safe and idempotent.
     scan_run_id = scanner.last_run_id
     scope = AnalyzerScope(scan_run_id=scan_run_id) if scan_run_id is not None else None
+    begin_stage("exact-duplicates")
     record(
         "exact-duplicates",
         _step(
@@ -95,6 +131,7 @@ def run_quickstart(
             lambda job: run_exact_duplicate_analysis(database, config, job_id=job, scope=scope),
         ),
     )
+    begin_stage("content-analysis")
     record(
         "content-analysis",
         _step(
@@ -115,16 +152,10 @@ def run_quickstart(
         return lambda job: runner(database, config, job_id=job)
 
     # Structural analyzers over the fresh inventory (scope, then job_id, positionally).
-    for label, job_type, runner in (
-        ("directory-overlap", "DIRECTORY_OVERLAP", run_directory_overlap_analysis),
-        ("document-versions", "VERSION_ANALYSIS", run_document_version_analysis),
-        ("image-similarity", "IMAGE_ANALYSIS", run_image_analysis),
-        ("projects", "PROJECT_ANALYSIS", run_project_analysis),
-        ("backup-lineage", "DIRECTORY_SUMMARY", run_backup_lineage_analysis),
-        ("normalized-content", "CONTENT_ANALYSIS", run_normalized_content_analysis),
-        ("derivations", "VERSION_ANALYSIS", run_cross_format_derivation_analysis),
-    ):
+    for label, job_type, runner in STRUCTURAL_ANALYZERS:
+        begin_stage(label)
         record(label, _step(database, config, job_type, label, scope_positional(runner)))
+    begin_stage("canonical-roles")
     record(
         "canonical-roles",
         _step(
@@ -135,15 +166,10 @@ def run_quickstart(
             lambda job: assign_canonical_roles(database),
         ),
     )
-    for label, job_type, runner in (
-        ("archive-of-directory", "ARCHIVE_ANALYSIS", run_archive_directory_analysis),
-        ("backup-value", "DIRECTORY_SUMMARY", run_backup_value_analysis),
-        ("record-series", "CLASSIFICATION", run_record_series_analysis),
-        ("preservation-risk", "PROJECT_ANALYSIS", run_preservation_risk_analysis),
-        ("photo-events", "IMAGE_ANALYSIS", run_photo_event_analysis),
-        ("contact-sheets", "CONTACT_SHEET_GENERATION", run_contact_sheet_generation),
-    ):
+    for label, job_type, runner in POST_CANONICAL_ANALYZERS:
+        begin_stage(label)
         record(label, _step(database, config, job_type, label, job_keyword(runner)))
+    begin_stage("classify")
     record(
         "classify",
         _step(
@@ -151,9 +177,10 @@ def run_quickstart(
             config,
             "CLASSIFICATION",
             "classify",
-            lambda job: classify_all_entries(database, config),
+            lambda job: classify_all_entries(database, config, job_id=job),
         ),
     )
+    begin_stage("review-priority")
     record(
         "review-priority",
         _step(
@@ -164,6 +191,7 @@ def run_quickstart(
             lambda job: run_review_priority_analysis(database, config, job_id=job),
         ),
     )
+    begin_stage("lifecycle")
     record(
         "lifecycle",
         _step(
@@ -175,12 +203,13 @@ def run_quickstart(
         ),
     )
     if generate_reports:
+        begin_stage("reports")
         report_paths = _step(
             database,
             config,
             "REPORT_GENERATION",
             "reports",
-            lambda job: [p.as_posix() for p in generate_all_reports(database, config)],
+            lambda job: [p.as_posix() for p in generate_all_reports(database, config, job_id=job)],
         )
         record("reports", report_paths)
         summary["reports"] = report_paths

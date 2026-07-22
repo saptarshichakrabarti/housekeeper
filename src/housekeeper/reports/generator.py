@@ -8,6 +8,7 @@ from pathlib import Path
 from .contexts import CONTEXT_BUILDERS
 from .exports import export_csv, export_jsonl
 from .formatting import human_size, percent
+from ..jobs import checkpoint, update_job
 
 _TEMPLATE_DIR = Path(__file__).parent / "templates"
 
@@ -44,9 +45,17 @@ def generate_report(report_type: str, database, config) -> Path:
     return render_template(f"{report_type}.html.j2", context, _reports_dir(config) / f"{report_type}.html")
 
 
-def generate_all_reports(database, config) -> list[Path]:
+def generate_all_reports(database, config, job_id: int | None = None) -> list[Path]:
+    total = len(CONTEXT_BUILDERS) + 2  # every report type, plus the CSV and JSONL exports
+    if job_id:
+        update_job(database, job_id, total_estimate=total)
     out = _reports_dir(config)
-    paths = [generate_report(name, database, config) for name in CONTEXT_BUILDERS]
+    paths = []
+    for name in CONTEXT_BUILDERS:
+        paths.append(generate_report(name, database, config))
+        checkpoint(database, job_id, processed_count=len(paths))
     paths.append(export_csv(database, out / "recommendations.csv"))
+    checkpoint(database, job_id, processed_count=len(paths))
     paths.append(export_jsonl(database, out / "recommendations.jsonl"))
+    checkpoint(database, job_id, processed_count=len(paths))
     return paths

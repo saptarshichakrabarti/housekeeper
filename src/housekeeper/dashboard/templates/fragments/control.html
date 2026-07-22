@@ -1,0 +1,38 @@
+{% set busy = status.state == 'running' %}
+<section class="card{% if status.state == 'error' %} card--danger{% elif status.state == 'running' %} card--ok{% endif %}">
+  <strong>{{ status.state }}</strong>{% if status.operation %} — {{ status.operation }}{% endif %}
+  {% if status.stage and status.stage_total %}<br>Stage {{ status.stage }}/{{ status.stage_total }}{% if status.current_item %}: {{ status.current_item }}{% endif %}{% endif %}
+  {% if status.state == 'error' and status.error %}<br>{{ status.error }}{% endif %}
+</section>
+{% if read_only %}
+<p><em>Dashboard is read-only; operational controls are disabled.</em></p>
+{% else %}
+<section class="card">
+  <h3>Scan</h3>
+  <form hx-post="/control/scan" hx-target="#control-panel" hx-swap="innerHTML">
+    <label>Directory <input type="text" name="path" id="control-path" size="60" required{% if busy %} disabled{% endif %}></label>
+    <button type="button" id="control-pick-folder"{% if busy %} disabled{% endif %}>Choose folder…</button>
+    <div class="controls"><button type="submit"{% if busy %} disabled{% endif %}>Scan</button></div>
+  </form>
+</section>
+<section class="card">
+  <h3>Analyze</h3>
+  <form hx-post="/control/analyze" hx-target="#control-panel" hx-swap="innerHTML">
+    <label>Kind <select name="kind"{% if busy %} disabled{% endif %}><option value="all">all</option>{% for kind in analyze_kinds %}<option value="{{ kind }}">{{ kind }}</option>{% endfor %}</select></label>
+    <div class="controls"><button type="submit"{% if busy %} disabled{% endif %}>Analyze</button></div>
+  </form>
+</section>
+<section class="card">
+  <h3>Classify</h3>
+  <form hx-post="/control/classify" hx-target="#control-panel" hx-swap="innerHTML">
+    <div class="controls"><button type="submit"{% if busy %} disabled{% endif %}>Classify</button></div>
+  </form>
+</section>
+<section class="card">
+  <h3>Report</h3>
+  <form hx-post="/control/report" hx-target="#control-panel" hx-swap="innerHTML">
+    <label>Kind <select name="kind"{% if busy %} disabled{% endif %}><option value="all">all</option>{% for kind in report_kinds %}<option value="{{ kind }}">{{ kind }}</option>{% endfor %}</select></label>
+    <div class="controls"><button type="submit"{% if busy %} disabled{% endif %}>Report</button></div>
+  </form>
+</section>
+{% endif %}

@@ -66,6 +66,7 @@ def update_job(
     success_count: int | None = None,
     skip_count: int | None = None,
     error_count: int | None = None,
+    total_estimate: int | None = None,
 ) -> None:
     if status is not None and status not in JOB_STATES:
         raise ValueError(f"invalid job status: {status}")
@@ -77,6 +78,7 @@ def update_job(
         ("success_count", success_count),
         ("skip_count", skip_count),
         ("error_count", error_count),
+        ("total_estimate", total_estimate),
     ):
         if value is not None:
             updates.append(f"{key}=?")

@@ -7,8 +7,16 @@ from pathlib import Path
 import secrets
 from typing import Annotated
 
+from ..config import AppConfig
+from ..core.progress import eta_seconds, format_duration, seconds_since, throughput
 
-def create_app(database, read_only: bool = False, contact_sheet_dir: Path | None = None):
+
+def create_app(
+    database,
+    read_only: bool = False,
+    contact_sheet_dir: Path | None = None,
+    config: AppConfig | None = None,
+):
     try:
         from fastapi import FastAPI, Form, Header, HTTPException, Path as ApiPath, Query
         from fastapi.responses import FileResponse, HTMLResponse
@@ -33,6 +41,34 @@ def create_app(database, read_only: bool = False, contact_sheet_dir: Path | None
     app = FastAPI(title="drive_housekeeper", docs_url=None, redoc_url=None)
     app.mount("/static", StaticFiles(directory=static_dir), name="static")
     service = DashboardService(database)
+    runner = None
+    if config is not None:
+        from .runner import OperationRunner
+
+        runner = OperationRunner(config)
+    navigation: list[tuple[str, str]] = [("", "Overview")]
+    if runner is not None:
+        navigation.append(("control", "Run"))
+    navigation.extend(
+        [
+            ("review", "Review"),
+            ("duplicates", "Duplicates"),
+            ("advanced-duplicates", "Advanced dupes"),
+            ("chunk-overlap", "Chunk overlap"),
+            ("derivations", "Derivations"),
+            ("backups", "Backups"),
+            ("documents", "Documents"),
+            ("images", "Images"),
+            ("projects", "Projects"),
+            ("events", "Events"),
+            ("record-series", "Record series"),
+            ("preservation", "Preservation"),
+            ("learning", "Learning"),
+            ("jobs", "Jobs"),
+            ("graph", "Graph"),
+            ("manifests", "Manifests"),
+        ]
+    )
 
     def guard(token: str | None) -> None:
         if read_only:
@@ -49,31 +85,15 @@ def create_app(database, read_only: bool = False, contact_sheet_dir: Path | None
                 app_css_version=(static_dir / "app.css").stat().st_mtime_ns,
                 theme_switch_version=(static_dir / "theme-switch.js").stat().st_mtime_ns,
                 csrf_token=csrf_token,
-                navigation=(
-                    ("", "Overview"),
-                    ("review", "Review"),
-                    ("duplicates", "Duplicates"),
-                    ("advanced-duplicates", "Advanced dupes"),
-                    ("chunk-overlap", "Chunk overlap"),
-                    ("derivations", "Derivations"),
-                    ("backups", "Backups"),
-                    ("documents", "Documents"),
-                    ("images", "Images"),
-                    ("projects", "Projects"),
-                    ("events", "Events"),
-                    ("record-series", "Record series"),
-                    ("preservation", "Preservation"),
-                    ("learning", "Learning"),
-                    ("jobs", "Jobs"),
-                    ("graph", "Graph"),
-                    ("manifests", "Manifests"),
-                ),
+                navigation=navigation,
             )
         )
 
-    def template_page(title: str, template_name: str, **context) -> HTMLResponse:
+    def template_page(
+        title: str, template_name: str, *, scripts: str = "", **context
+    ) -> HTMLResponse:
         body = templates.get_template(template_name).render(**context)
-        return page(title, body)
+        return page(title, body, scripts=scripts)
 
     def rows_table(rows, headings: list[str]) -> str:
         header = "".join(f"<th>{escape(h)}</th>" for h in headings)
@@ -88,24 +108,42 @@ def create_app(database, read_only: bool = False, contact_sheet_dir: Path | None
         )
         return f"<table><thead><tr>{header}</tr></thead><tbody>{body or '<tr><td colspan=99>No results</td></tr>'}</tbody></table>"
 
+    def progress_cell(row) -> str:
+        """Render a job row's progress: a real percentage when a total is known, otherwise an
+        indeterminate bar with live counters. Never fabricates an ETA for an unknown total."""
+        processed = row["processed_count"] or 0
+        total = row["total_estimate"]
+        rate = throughput(processed, seconds_since(row["started_at"]))
+        danger = " class='hk-progress--danger'" if row["status"] == "FAILED" else ""
+        if total:
+            pct = min(100, int(processed * 100 / total))
+            eta = eta_seconds(processed, total, rate)
+            eta_html = f" · ETA {format_duration(eta)}" if eta is not None else ""
+            return (
+                f"<progress{danger} value='{processed}' max='{total}'></progress> "
+                f"{pct}% {processed:,}/{total:,} · {rate:,.1f}/s{eta_html}"
+            )
+        current = f" · {escape(str(row['current_item']))}" if row["current_item"] else ""
+        return f"<progress{danger}></progress> {processed:,} processed · {rate:,.1f}/s{current}"
+
     def jobs_table(rows) -> str:
         headings = [
             "id",
             "job_type",
             "status",
-            "processed_count",
-            "total_estimate",
+            "progress",
             "success_count",
             "skip_count",
             "error_count",
-            "current_item",
             "updated_at",
         ]
         header = "".join(f"<th>{escape(heading)}</th>" for heading in [*headings, "controls"])
         body = ""
         for row in rows:
             cells = "".join(
-                f"<td>{escape(str(row[heading] if row[heading] is not None else ''))}</td>"
+                f"<td>{progress_cell(row)}</td>"
+                if heading == "progress"
+                else f"<td>{escape(str(row[heading] if row[heading] is not None else ''))}</td>"
                 for heading in headings
             )
             controls = ""
@@ -654,7 +692,7 @@ def create_app(database, read_only: bool = False, contact_sheet_dir: Path | None
     @app.get("/fragments/jobs", response_class=HTMLResponse)
     def jobs_fragment(limit: int = Query(100, ge=1, le=500)):
         rows = database.fetch_all(
-            "SELECT id,job_type,status,processed_count,total_estimate,success_count,skip_count,error_count,current_item,updated_at FROM jobs ORDER BY id DESC LIMIT ?",
+            "SELECT id,job_type,status,processed_count,total_estimate,success_count,skip_count,error_count,current_item,started_at,updated_at FROM jobs ORDER BY id DESC LIMIT ?",
             (limit,),
         )
         return HTMLResponse(jobs_table(rows))
@@ -677,13 +715,83 @@ def create_app(database, read_only: bool = False, contact_sheet_dir: Path | None
         else:
             raise HTTPException(422, "invalid job control")
         row = database.fetch_one(
-            "SELECT id,job_type,status,processed_count,total_estimate,success_count,skip_count,error_count,current_item,updated_at FROM jobs WHERE id=?",
+            "SELECT id,job_type,status,processed_count,total_estimate,success_count,skip_count,error_count,current_item,started_at,updated_at FROM jobs WHERE id=?",
             (job_id,),
         )
         if not row:
             raise HTTPException(404, "job not found")
         table = jobs_table([row])
         return HTMLResponse(table.split("<tbody>", 1)[1].split("</tbody>", 1)[0])
+
+    if runner is not None:
+        from .runner import ANALYZE_KINDS, REPORT_KINDS
+
+        def control_fragment() -> HTMLResponse:
+            return HTMLResponse(
+                templates.get_template("fragments/control.html").render(
+                    status=runner.status(),
+                    read_only=read_only,
+                    analyze_kinds=ANALYZE_KINDS,
+                    report_kinds=REPORT_KINDS,
+                )
+            )
+
+        @app.get("/control", response_class=HTMLResponse)
+        def control_page():
+            folder_picker_version = (static_dir / "folder-picker.js").stat().st_mtime_ns
+            return template_page(
+                "Run",
+                "control.html",
+                read_only=read_only,
+                analyze_kinds=ANALYZE_KINDS,
+                report_kinds=REPORT_KINDS,
+                status=runner.status(),
+                scripts=f"<script defer src='/static/folder-picker.js?v={folder_picker_version}'></script>",
+            )
+
+        @app.get("/fragments/control", response_class=HTMLResponse)
+        def control_status_fragment():
+            return control_fragment()
+
+        @app.post("/control/scan", response_class=HTMLResponse)
+        def control_scan(
+            path: Annotated[str, Form()], x_csrf_token: str | None = Header(default=None)
+        ):
+            guard(x_csrf_token)
+            if not Path(path).is_dir():
+                raise HTTPException(422, "path must be an existing directory")
+            if runner.submit("quickstart", source=path) == "busy":
+                raise HTTPException(409, "an operation is already running")
+            return control_fragment()
+
+        @app.post("/control/analyze", response_class=HTMLResponse)
+        def control_analyze(
+            kind: Annotated[str, Form()], x_csrf_token: str | None = Header(default=None)
+        ):
+            guard(x_csrf_token)
+            if kind != "all" and kind not in ANALYZE_KINDS:
+                raise HTTPException(422, "invalid analyze kind")
+            if runner.submit("analyze", kind=kind) == "busy":
+                raise HTTPException(409, "an operation is already running")
+            return control_fragment()
+
+        @app.post("/control/classify", response_class=HTMLResponse)
+        def control_classify(x_csrf_token: str | None = Header(default=None)):
+            guard(x_csrf_token)
+            if runner.submit("classify") == "busy":
+                raise HTTPException(409, "an operation is already running")
+            return control_fragment()
+
+        @app.post("/control/report", response_class=HTMLResponse)
+        def control_report(
+            kind: Annotated[str, Form()], x_csrf_token: str | None = Header(default=None)
+        ):
+            guard(x_csrf_token)
+            if kind != "all" and kind not in REPORT_KINDS:
+                raise HTTPException(422, "invalid report kind")
+            if runner.submit("report", kind=kind) == "busy":
+                raise HTTPException(409, "an operation is already running")
+            return control_fragment()
 
     @app.get("/graph", response_class=HTMLResponse)
     def graph_page():

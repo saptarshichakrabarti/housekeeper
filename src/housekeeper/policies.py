@@ -27,6 +27,7 @@ import yaml
 from .config import AppConfig
 from .constants import PROTECTED_SUFFIXES, Classification
 from .database import Database
+from .jobs import checkpoint, update_job
 
 # Most-protective first.  Index in this list is the classification's protective rank.
 DEFAULT_PRIORITY: list[str] = [
@@ -502,7 +503,9 @@ _CLASSIFY_INSERT = (
 )
 
 
-def classify_all_entries(database: Database, config: AppConfig) -> dict[str, int]:
+def classify_all_entries(
+    database: Database, config: AppConfig, job_id: int | None = None
+) -> dict[str, int]:
     """Classify every file entry deterministically and record full audit evidence.
 
     Streaming keeps memory bounded on million-entry inventories: rows are read from an
@@ -515,9 +518,15 @@ def classify_all_entries(database: Database, config: AppConfig) -> dict[str, int
     write_conn = database.connect()
     write_conn.execute("DELETE FROM classifications")
     write_conn.commit()
+    if job_id:
+        total = database.fetch_one(
+            "SELECT COUNT(*) AS n FROM filesystem_entries WHERE entry_type='file'"
+        )
+        update_job(database, job_id, total_estimate=int(total["n"]) if total else 0)
     batch_size = max(1, int(config.section("performance")["batch_size"]))
     counts: dict[str, int] = {}
     batch: list[tuple[Any, ...]] = []
+    processed = 0
     with database.read_connection() as read_conn:
         read_cursor = read_conn.execute(_CLASSIFY_SELECT)
         while rows := read_cursor.fetchmany(batch_size):
@@ -528,5 +537,7 @@ def classify_all_entries(database: Database, config: AppConfig) -> dict[str, int
                 batch.append(result.to_row())
             write_conn.executemany(_CLASSIFY_INSERT, batch)
             write_conn.commit()
+            processed += len(batch)
+            checkpoint(database, job_id, processed_count=processed)
             batch.clear()
     return counts

@@ -95,6 +95,12 @@ def build_parser():
         action="store_true",
         help="show full tracebacks for unexpected errors",
     )
+    p.add_argument(
+        "--quiet",
+        "-q",
+        action="store_true",
+        help="suppress live progress output on stderr",
+    )
     sub = p.add_subparsers(dest="command", required=True)
     sub.add_parser("init-workspace")
     q = sub.add_parser(
@@ -318,6 +324,17 @@ def build_parser():
     dashboard.add_argument("--port", type=int, default=None)
     dashboard.add_argument("--no-open-browser", action="store_true")
     dashboard.add_argument("--read-only", action="store_true")
+    gui = sub.add_parser(
+        "gui", help="operational dashboard: pick a directory and drive the pipeline from buttons"
+    )
+    gui.add_argument("--host", default=None)
+    gui.add_argument("--port", type=int, default=None)
+    gui.add_argument("--no-open-browser", action="store_true")
+    gui.add_argument("--read-only", action="store_true")
+    app_cmd = sub.add_parser(
+        "app", help="native desktop window with a real OS folder picker (needs the desktop extra)"
+    )
+    app_cmd.add_argument("--read-only", action="store_true")
     graph = sub.add_parser("graph")
     graph_sub = graph.add_subparsers(dest="graph_command", required=True)
     gb = graph_sub.add_parser("build")
@@ -402,15 +419,22 @@ def _dispatch(args, c, d) -> int:
     if cmd == "quickstart":
         import json as _json
 
+        from .progress_line import ProgressReporter
         from .quickstart import next_steps, run_quickstart
 
-        summary = run_quickstart(
-            d,
-            c,
-            Path(args.source_root),
-            generate_reports=not args.no_reports,
-            progress=lambda message: print(message, file=sys.stderr),
-        )
+        stage_ref: dict = {}
+
+        def _note_stage(_message: str, stage: int, stage_total: int) -> None:
+            stage_ref["stage"], stage_ref["total"] = stage, stage_total
+
+        with ProgressReporter(c.database_path, quiet=args.quiet or args.json, stage_ref=stage_ref):
+            summary = run_quickstart(
+                d,
+                c,
+                Path(args.source_root),
+                generate_reports=not args.no_reports,
+                progress=_note_stage,
+            )
         if args.json:
             print(_json.dumps(summary, indent=2, sort_keys=True))
             return 0
@@ -430,15 +454,17 @@ def _dispatch(args, c, d) -> int:
             print(f"  - {step}")
         return 0
     if cmd == "scan":
-        print(
-            DriveScanner(d, c).scan(
+        from .progress_line import ProgressReporter
+
+        with ProgressReporter(c.database_path, quiet=args.quiet):
+            result = DriveScanner(d, c).scan(
                 Path(args.source_root),
                 not args.no_resume,
                 args.incremental or not args.no_resume,
                 args.changed_only,
                 args.force_rehash,
             )
-        )
+        print(result)
         return 0
     if cmd == "analyze":
         from .analyzers.scope import AnalyzerScope
@@ -719,7 +745,7 @@ def _dispatch(args, c, d) -> int:
         from .analyzers.lifecycle import run_lifecycle_analysis
         from .analyzers.review_priority import run_review_priority_analysis
 
-        _run_job(d, c, "CLASSIFICATION", {}, lambda _job: classify_all_entries(d, c))
+        _run_job(d, c, "CLASSIFICATION", {}, lambda _job: classify_all_entries(d, c, job_id=_job))
         # Prioritization and lifecycle depend on classifications, so they run right after.
         _run_job(d, c, "CLASSIFICATION", {"stage": "review-priority"},
                  lambda _job: run_review_priority_analysis(d, c, job_id=_job))
@@ -736,7 +762,7 @@ def _dispatch(args, c, d) -> int:
                 lambda _job: [
                     p.as_posix()
                     for p in (
-                        generate_all_reports(d, c)
+                        generate_all_reports(d, c, job_id=_job)
                         if args.kind == "all"
                         else [generate_report(args.kind, d, c)]
                     )
@@ -1259,5 +1285,59 @@ def _dispatch(args, c, d) -> int:
             port=args.port or c.data["dashboard"]["port"],
             log_level="info",
         )
+        return 0
+    if cmd == "gui":
+        import threading
+        import webbrowser
+
+        import uvicorn
+        from .analyzers.contact_sheets import contact_sheet_dir
+        from .dashboard.app import create_app
+
+        host = args.host or c.data["dashboard"]["host"]
+        if host not in {"127.0.0.1", "localhost", "::1"} and not c.data["dashboard"].get(
+            "allow_non_loopback", False
+        ):
+            raise SystemExit(
+                "refusing non-loopback dashboard binding; set dashboard.allow_non_loopback=true explicitly"
+            )
+        port = args.port or c.data["dashboard"]["port"]
+        if not args.no_open_browser:
+            threading.Timer(1.0, lambda: webbrowser.open(f"http://{host}:{port}")).start()
+        uvicorn.run(
+            create_app(d, args.read_only, contact_sheet_dir(c), config=c),
+            host=host,
+            port=port,
+            log_level="info",
+        )
+        return 0
+    if cmd == "app":
+        import socket
+        import threading
+        import time
+
+        import uvicorn
+        from .analyzers.contact_sheets import contact_sheet_dir
+        from .dashboard.app import create_app
+        from .desktop import Api
+
+        host, port = "127.0.0.1", c.data["dashboard"]["port"]
+        application = create_app(d, args.read_only, contact_sheet_dir(c), config=c)
+        threading.Thread(
+            target=lambda: uvicorn.run(application, host=host, port=port, log_level="warning"),
+            daemon=True,
+        ).start()
+        for _ in range(50):
+            try:
+                with socket.create_connection((host, port), timeout=0.2):
+                    break
+            except OSError:
+                time.sleep(0.1)
+        import webview
+
+        api = Api()
+        window = webview.create_window("drive_housekeeper", f"http://{host}:{port}", js_api=api)
+        api.window = window
+        webview.start()
         return 0
     return 0

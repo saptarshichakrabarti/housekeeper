@@ -194,6 +194,16 @@ nav a:hover { text-decoration: underline; }
 }
 :root[data-theme="brutal"] .bar { height: 8px; border: 2px solid #111; }
 
+/* job/pipeline progress bars: accent = running, danger = failed. Never decorative — every bar
+   maps to a real jobs.processed_count/total_estimate pair, or is left valueless (indeterminate)
+   when no honest total exists. */
+progress {
+  width: 160px;
+  vertical-align: middle;
+  accent-color: var(--hk-accent);
+}
+progress.hk-progress--danger { accent-color: var(--hk-danger); }
+
 /* tables */
 table { border-collapse: collapse; width: 100%; }
 th, td {
