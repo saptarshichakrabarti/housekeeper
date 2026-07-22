@@ -128,7 +128,7 @@ def export_snapshot(
     artifacts = database.fetch_all("SELECT analyzer_name,analyzer_version,configuration_fingerprint,COUNT(*) AS count FROM analysis_artifacts WHERE status='COMPLETED' GROUP BY analyzer_name,analyzer_version,configuration_fingerprint")
     payload = {
         "session_id": session_id,
-        "schema_version": database.database_stats()["schema_version"],
+        "schema_version": database.database_stats(check_integrity=False)["schema_version"],
         "decisions": [dict(r) for r in rows],
         "scan": dict(run) if run else None,
         "artifact_versions": [dict(row) for row in artifacts],
@@ -156,7 +156,7 @@ def session_payload(database: Database, session_id: int) -> dict[str, Any]:
     )
     return {
         "session_id": session_id,
-        "schema_version": database.database_stats()["schema_version"],
+        "schema_version": database.database_stats(check_integrity=False)["schema_version"],
         "decisions": [dict(r) for r in rows],
     }
 

@@ -124,7 +124,8 @@ def test_control_analyze_classify_report_reject_bad_kind(operational_client):
     )
 
 
-def test_control_endpoints_403_under_read_only(config, database):
+def test_control_routes_absent_under_read_only(config, database):
+    """Read-only never builds the runner, so the mutating routes are not mounted at all."""
     pytest.importorskip("fastapi")
     pytest.importorskip("httpx")
     from fastapi.testclient import TestClient
@@ -132,14 +133,13 @@ def test_control_endpoints_403_under_read_only(config, database):
 
     client = TestClient(create_app(database, read_only=True, config=config))
     headers = {"X-CSRF-Token": client.get("/api/csrf").json()["token"]}
-    assert client.post("/control/scan", data={"path": "/"}, headers=headers).status_code == 403
-    assert client.post("/control/analyze", data={"kind": "all"}, headers=headers).status_code == 403
-    assert client.post("/control/classify", headers=headers).status_code == 403
-    assert client.post("/control/report", data={"kind": "all"}, headers=headers).status_code == 403
-    # The rendered page still 200s (facts are still viewable) but shows no operational forms.
-    body = client.get("/control").text
-    assert client.get("/control").status_code == 200
-    assert "<form" not in body
+    assert client.post("/control/scan", data={"path": "/"}, headers=headers).status_code == 404
+    assert client.post("/control/analyze", data={"kind": "all"}, headers=headers).status_code == 404
+    assert client.post("/control/classify", headers=headers).status_code == 404
+    assert client.post("/control/report", data={"kind": "all"}, headers=headers).status_code == 404
+    # The control page itself is gone, and nothing links to it.
+    assert client.get("/control").status_code == 404
+    assert 'href="/control"' not in client.get("/").text
 
 
 def test_plain_dashboard_has_no_control_routes(database):

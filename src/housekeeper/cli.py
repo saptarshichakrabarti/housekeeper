@@ -494,6 +494,10 @@ def _dispatch(args, c, d) -> int:
             only_unique=args.only_unique,
             only_duplicate_candidates=args.only_duplicate_candidates,
             content_object_ids=scoped_content_ids,
+            # Standalone analysis runs over the current inventory (latest COMPLETE scan per source)
+            # rather than accumulated history, so re-scans don't group a file with its own snapshot.
+            # An explicit --scan-run means the user is targeting one run, so leave that unrestricted.
+            current_inventory=args.scan_run is None,
         )
         scope_payload = {
             **analyzer_scope.__dict__,
@@ -1333,7 +1337,12 @@ def _dispatch(args, c, d) -> int:
                     break
             except OSError:
                 time.sleep(0.1)
-        import webview
+        try:
+            import webview
+        except ImportError:
+            raise SystemExit(
+                "the desktop app needs pywebview; install it with: pip install 'drive-housekeeper[desktop]'"
+            )
 
         api = Api()
         window = webview.create_window("drive_housekeeper", f"http://{host}:{port}", js_api=api)

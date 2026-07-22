@@ -11,7 +11,9 @@ class DashboardService:
         self.database = database
 
     def overview(self) -> OverviewViewModel:
-        stats = self.database.database_stats()
+        # A full integrity check is O(database size); a page load must stay fast regardless of
+        # inventory size. Run `housekeeper database integrity-check` for an on-demand check.
+        stats = self.database.database_stats(check_integrity=False)
         query = self.database.fetch_one
         metrics = (
             Metric("Sources", int(query("SELECT COUNT(*) n FROM source_roots")["n"])),

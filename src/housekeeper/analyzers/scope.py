@@ -21,10 +21,17 @@ class AnalyzerScope:
     only_unique: bool = False
     only_duplicate_candidates: bool = False
     content_object_ids: frozenset[int] = frozenset()
+    current_inventory: bool = False
 
     def entry_query(self, entry_type: str = "file") -> tuple[str, tuple[object, ...]]:
         clauses = ["e.entry_type=?"]
         params: list[object] = [entry_type]
+        if self.current_inventory:
+            # Restrict to the latest COMPLETE scan run per source root, so two snapshots of the
+            # same physical file across re-scans are never grouped as duplicates of each other.
+            clauses.append(
+                "e.scan_run_id IN (SELECT MAX(id) FROM scan_runs WHERE status='COMPLETE' GROUP BY source_root_fingerprint)"
+            )
         if self.source_id is not None:
             clauses.append("e.source_root_id=?")
             params.append(self.source_id)

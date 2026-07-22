@@ -130,6 +130,11 @@ class OperationRunner:
         from ..analyzers.exact_duplicates import run_exact_duplicate_analysis
         from ..analyzers.projects import run_project_analysis
         from ..analyzers.registry import run_content_analysis
+        from ..analyzers.scope import AnalyzerScope
+
+        # Standalone Analyze runs unscoped over all scan history; restrict it to the current
+        # inventory so re-scanning the same drive never makes a unique file look duplicated.
+        inventory = AnalyzerScope(current_inventory=True)
 
         def content_analysis_step(name: str) -> Callable[[int], object]:
             # Named factory (rather than a lambda default-arg trick) so each closure captures its
@@ -139,11 +144,15 @@ class OperationRunner:
         dispatch: dict[str, tuple[str, Callable[[int], object]]] = {
             "exact-duplicates": (
                 "EXACT_DUPLICATES",
-                lambda job: run_exact_duplicate_analysis(database, self._config, job_id=job),
+                lambda job: run_exact_duplicate_analysis(
+                    database, self._config, job_id=job, scope=inventory
+                ),
             ),
             "directory-overlap": (
                 "DIRECTORY_OVERLAP",
-                lambda job: run_directory_overlap_analysis(database, self._config, job_id=job),
+                lambda job: run_directory_overlap_analysis(
+                    database, self._config, inventory, job_id=job
+                ),
             ),
             "projects": (
                 "PROJECT_ANALYSIS",

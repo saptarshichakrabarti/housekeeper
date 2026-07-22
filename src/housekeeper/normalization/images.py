@@ -42,7 +42,9 @@ def normalize_image(path: Path, config) -> NormalizedArtifact:
             pixel_hash = hashlib.sha256(
                 f"{base.mode}:{base.size}:".encode() + base.tobytes()
             ).hexdigest()
-            oriented = ImageOps.exif_transpose(image).convert("RGBA")
+            # exif_transpose returns None when there is nothing to transpose; fall back to the
+            # original image so the orientation hash is always computable.
+            oriented = (ImageOps.exif_transpose(image) or image).convert("RGBA")
             orientation_hash = hashlib.sha256(
                 f"{oriented.mode}:{oriented.size}:".encode() + oriented.tobytes()
             ).hexdigest()
