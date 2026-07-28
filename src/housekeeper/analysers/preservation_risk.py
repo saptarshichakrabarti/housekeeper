@@ -57,15 +57,22 @@ def run_preservation_risk_analysis(database, config, scope=None, job_id=None) ->
 
     if not config.section("preservation").get("enabled", True):
         return {"assessed": 0}
+    from .scope import resolve_scope
+
+    entry_sql, params = resolve_scope(database, scope).entry_id_sql()
     conn = database.connect()
-    conn.execute("DELETE FROM preservation_assessments WHERE target_type='ENTRY'")
+    conn.execute(
+        f"DELETE FROM preservation_assessments WHERE target_type='ENTRY' AND target_id IN ({entry_sql})",
+        params,
+    )
     assessed = 0
     scanned = 0
     for row in database.iter_rows(
-        """SELECT e.id,e.suffix,e.scan_status,
+        f"""SELECT e.id,e.suffix,e.scan_status,
                   EXISTS(SELECT 1 FROM entry_content_links l JOIN analysis_artifacts a ON a.content_object_id=l.content_object_id
                          WHERE l.entry_id=e.id AND a.status IN ('ERROR','UNSUPPORTED')) AS analysis_failed
-           FROM filesystem_entries e WHERE e.entry_type='file'"""
+           FROM filesystem_entries e WHERE e.entry_type='file' AND e.id IN ({entry_sql})""",
+        params,
     ):
         scanned += 1
         if scanned % 256 == 0:

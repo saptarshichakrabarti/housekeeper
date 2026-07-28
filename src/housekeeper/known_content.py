@@ -65,9 +65,7 @@ def assertions_for_entry(database, entry_id: int) -> list[str]:
         return []
     result: list[str] = []
     for row in database.iter_rows("SELECT assertion,scope_type,scope_value FROM known_content_assertions"):
-        if row["scope_type"] == "PATH_PATTERN" and row["scope_value"] in (entry["relative_path"] or ""):
-            result.append(row["assertion"])
-        elif (
+        if row["scope_type"] == "PATH_PATTERN" and row["scope_value"] in (entry["relative_path"] or "") or (
             row["scope_type"] == "CONTENT_OBJECT"
             and entry["content_object_id"] is not None
             and str(entry["content_object_id"]) == row["scope_value"]

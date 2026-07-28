@@ -105,12 +105,15 @@ def calculate_project_storage_breakdown(
     database, scan_run_id: int, root_relative_path: str
 ) -> dict[str, int]:
     """Split a project's recursive file bytes into source / generated / environment buckets."""
+    from ..path_utils import descendant_path_range
+
     prefix = f"{root_relative_path}/" if root_relative_path else ""
-    like = f"{prefix}%"
+    low, high = descendant_path_range(root_relative_path)
     breakdown = {"source": 0, "generated": 0, "environment": 0, "file_count": 0}
     for row in database.iter_rows(
-        "SELECT relative_path,size_bytes FROM filesystem_entries WHERE scan_run_id=? AND entry_type='file' AND relative_path LIKE ?",
-        (scan_run_id, like),
+        "SELECT relative_path,size_bytes FROM filesystem_entries WHERE scan_run_id=? AND entry_type='file'"
+        " AND relative_path>=? AND relative_path<?",
+        (scan_run_id, low, high),
     ):
         rel = str(row["relative_path"])[len(prefix) :]
         segments = set(rel.replace("\\", "/").split("/")[:-1])
@@ -126,29 +129,36 @@ def calculate_project_storage_breakdown(
 
 
 def run_project_analysis(database, config, scope=None, job_id: int | None = None):
-    from ..jobs import check_cancelled, update_job
+    from ..jobs import check_cancelled, checkpoint
     from ..relationships import upsert_relationship
+    from .scope import resolve_scope
 
+    entry_sql, params = resolve_scope(database, scope).entry_id_sql("directory")
+    # One query for the stage, not one per directory. This asked every directory in the inventory
+    # "what are your children called?" purely to intersect the answer with a 20-name set — 59,399
+    # round trips on the real inventory to identify a few hundred projects. The intersection is a
+    # join, so only candidate directories come back, each already carrying its markers.
+    #
+    # This is also why `directory_content` stays unbuilt (docs/performance.md): the per-directory
+    # queries it was proposed to replace are gone, and the one genuinely recursive step below
+    # already runs only for directories that turned out to be projects.
+    markers = sorted(PROJECT_MARKERS)
     dirs = database.fetch_all(
-        "SELECT id,name,relative_path,scan_run_id FROM filesystem_entries WHERE entry_type='directory'"
+        f"""SELECT e.id,e.name,e.relative_path,e.scan_run_id,
+                   json_group_array(child.name) AS marker_names
+            FROM filesystem_entries e
+            JOIN filesystem_entries child
+              ON child.scan_run_id=e.scan_run_id AND child.parent_entry_id=e.id
+            WHERE e.entry_type='directory' AND e.id IN ({entry_sql})
+              AND child.name IN ({",".join("?" for _ in markers)})
+            GROUP BY e.id ORDER BY e.id""",
+        (*params, *markers),
     )
-    if scope:
-        from .scope import scoped_entry_ids
-
-        allowed = scoped_entry_ids(database, scope, "directory")
-        dirs = [directory for directory in dirs if int(directory["id"]) in allowed]
 
     for index, directory in enumerate(dirs, start=1):
         if job_id:
             check_cancelled(database, job_id)
-        names = {
-            r["name"]
-            for r in database.fetch_all(
-                "SELECT name FROM filesystem_entries WHERE scan_run_id=? AND parent_entry_id=?",
-                (directory["scan_run_id"], directory["id"]),
-            )
-        }
-        found = sorted(names & PROJECT_MARKERS)
+        found = sorted(set(json.loads(directory["marker_names"])))
         # A lone README is not a project; require a real build/dependency/VCS marker.
         if not found or found == ["README"] or found == ["README.md"]:
             continue
@@ -174,7 +184,9 @@ def run_project_analysis(database, config, scope=None, job_id: int | None = None
                 "present" if signals["has_git"] else "absent",
             ),
         )
-        database.connect().commit()
+        # No commit: the SELECT below runs on the same connection, so it sees the uncommitted
+        # INSERT anyway. This was one transaction per detected project, and the stage already
+        # commits once at the end.
         project = database.fetch_one(
             "SELECT id FROM projects WHERE root_entry_id=?", (directory["id"],)
         )
@@ -190,11 +202,9 @@ def run_project_analysis(database, config, scope=None, job_id: int | None = None
                 {"markers": found, "reproducibility": signals, "storage": breakdown},
                 "1",
             )
-        if job_id:
-            update_job(
-                database,
-                job_id,
-                "RUNNING",
-                processed_count=index,
-                checkpoint={"last_directory_id": int(directory["id"])},
-            )
+        checkpoint(
+            database, job_id, processed_count=index, state={"last_directory_id": int(directory["id"])}
+        )
+    # This analyser is a stage: the write primitives no longer commit per row, so the one
+    # commit that makes its work durable belongs here.
+    database.connect().commit()

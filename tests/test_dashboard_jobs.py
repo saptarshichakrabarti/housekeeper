@@ -13,6 +13,7 @@ pytest.importorskip("httpx")
 @pytest.fixture
 def client(config, database):
     from fastapi.testclient import TestClient
+
     from housekeeper.dashboard.app import create_app
 
     # config= (not read-only) so the operational controls and the reaper are active.
@@ -115,6 +116,7 @@ def test_operational_jobs_page_has_a_launcher(client):
 def test_plain_jobs_page_has_no_launcher(database):
     # A viewer dashboard (no runner) shows the jobs list only — no way to start work.
     from fastapi.testclient import TestClient
+
     from housekeeper.dashboard.app import create_app
 
     viewer = TestClient(create_app(database))
@@ -126,6 +128,7 @@ def test_plain_jobs_page_has_no_launcher(database):
 def test_read_only_dashboard_does_not_reconcile(config, database):
     """A read-only dashboard observes without mutating — it must not reap jobs."""
     from fastapi.testclient import TestClient
+
     from housekeeper.dashboard.app import create_app
 
     job_id = create_job(database, "SCAN")

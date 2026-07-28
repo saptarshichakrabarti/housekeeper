@@ -5,7 +5,13 @@ same ``jobs`` rows, so the GUI and the CLI can never disagree about a job's prog
 
 import pytest
 
-from housekeeper.core.progress import Progress, eta_seconds, format_duration, seconds_since, throughput
+from housekeeper.core.progress import (
+    Progress,
+    eta_seconds,
+    format_duration,
+    seconds_since,
+    throughput,
+)
 from housekeeper.jobs import create_job, update_job
 from housekeeper.progress_line import format_status_line
 
@@ -135,6 +141,7 @@ def dashboard_client(tmp_path):
     pytest.importorskip("fastapi")
     pytest.importorskip("httpx")
     from fastapi.testclient import TestClient
+
     from housekeeper.dashboard.app import create_app
     from housekeeper.database import Database
 

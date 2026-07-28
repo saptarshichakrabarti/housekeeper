@@ -85,6 +85,5 @@ def test_migration_is_resumable_and_rerunnable(tmp_path):
 def test_read_only_connection_rejects_writes(tmp_path):
     db = Database(tmp_path / "db.sqlite")
     db.initialize()
-    with db.read_connection() as conn:
-        with pytest.raises(sqlite3.OperationalError):
-            conn.execute("INSERT INTO scan_runs(source_root,source_root_fingerprint,status) VALUES('x','y','z')")
+    with db.read_connection() as conn, pytest.raises(sqlite3.OperationalError):
+        conn.execute("INSERT INTO scan_runs(source_root,source_root_fingerprint,status) VALUES('x','y','z')")

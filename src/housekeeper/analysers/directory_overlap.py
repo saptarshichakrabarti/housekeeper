@@ -1,8 +1,10 @@
-from ..config import AppConfig
 import json
+
+from ..config import AppConfig
 from ..database import Database
+from ..path_utils import descendant_path_range
 from ..relationships import upsert_relationship
-from .scope import analyserScope, scoped_entry_ids
+from .scope import AnalyserScope, resolve_scope
 
 
 def calculate_containment(a: set[str], b: set[str]) -> float:
@@ -19,31 +21,38 @@ def get_directory_hash_set(directory_id: int, database: Database) -> set[str]:
     )
     if not r:
         return set()
+    low, high = descendant_path_range(r["relative_path"])
     return {
         x["full_hash"]
         for x in database.fetch_all(
-            "SELECT s.full_hash FROM filesystem_entries e JOIN file_signatures s ON s.entry_id=e.id WHERE e.relative_path LIKE ? AND s.full_hash IS NOT NULL",
-            (r["relative_path"] + "/%",),
+            "SELECT s.full_hash FROM filesystem_entries e JOIN file_signatures s ON s.entry_id=e.id WHERE e.relative_path>=? AND e.relative_path<? AND s.full_hash IS NOT NULL",
+            (low, high),
         )
     }
 
 
 def build_directory_summaries(
-    database: Database, config: AppConfig, scope: analyserScope | None = None
+    database: Database, config: AppConfig, scope: AnalyserScope | None = None
 ) -> None:
-    database.connect().execute("DELETE FROM directory_summaries")
-    dirs = database.fetch_all(
-        "SELECT id,scan_run_id,relative_path FROM filesystem_entries WHERE entry_type='directory'"
+    scope = resolve_scope(database, scope)
+    entry_sql, params = scope.entry_id_sql("directory")
+    # Only the summaries this run is about to rebuild are cleared. The old wholesale DELETE threw
+    # away every other source's summaries too, so a scoped run silently emptied the rest.
+    database.connect().execute(
+        f"DELETE FROM directory_summaries WHERE entry_id IN ({entry_sql})", params
     )
-    allowed = scoped_entry_ids(database, scope, "directory") if scope else None
+    dirs = database.fetch_all(
+        "SELECT id,scan_run_id,relative_path FROM filesystem_entries "
+        f"WHERE entry_type='directory' AND id IN ({entry_sql})",
+        params,
+    )
     for directory in dirs:
-        if allowed is not None and int(directory["id"]) not in allowed:
-            continue
-        prefix = directory["relative_path"] + "/%" if directory["relative_path"] else "%"
+        low, high = descendant_path_range(directory["relative_path"])
         files = database.fetch_all(
             """SELECT e.size_bytes,e.modified_at,s.full_hash,e.suffix FROM filesystem_entries e
-            LEFT JOIN file_signatures s ON s.entry_id=e.id WHERE e.scan_run_id=? AND e.entry_type='file' AND e.relative_path LIKE ?""",
-            (directory["scan_run_id"], prefix),
+            LEFT JOIN file_signatures s ON s.entry_id=e.id WHERE e.scan_run_id=? AND e.entry_type='file'
+            AND e.relative_path>=? AND e.relative_path<?""",
+            (directory["scan_run_id"], low, high),
         )
         hashes = {x["full_hash"] for x in files if x["full_hash"]}
         ext: dict[str, int] = {}
@@ -89,13 +98,13 @@ def _candidate_directory_hash_sets(
     )
     result: dict[int, set[str]] = {}
     for row in rows:
-        prefix = (row["relative_path"] + "/%") if row["relative_path"] else "%"
+        low, high = descendant_path_range(row["relative_path"])
         hashes = {
             r["full_hash"]
             for r in database.iter_rows(
                 "SELECT s.full_hash FROM filesystem_entries e JOIN file_signatures s ON s.entry_id=e.id "
-                "WHERE e.scan_run_id=? AND e.relative_path LIKE ? AND s.full_hash IS NOT NULL",
-                (row["scan_run_id"], prefix),
+                "WHERE e.scan_run_id=? AND e.relative_path>=? AND e.relative_path<? AND s.full_hash IS NOT NULL",
+                (row["scan_run_id"], low, high),
             )
         }
         if hashes:
@@ -127,7 +136,7 @@ def generate_candidate_directory_pairs(
 def run_directory_overlap_analysis(
     database: Database,
     config: AppConfig,
-    scope: analyserScope | None = None,
+    scope: AnalyserScope | None = None,
     job_id: int | None = None,
 ) -> None:
     from ..jobs import checkpoint
@@ -159,3 +168,6 @@ def run_directory_overlap_analysis(
                 },
                 "1",
             )
+    # This analyser is a stage: the write primitives no longer commit per row, so the one
+    # commit that makes its work durable belongs here.
+    database.connect().commit()

@@ -16,10 +16,10 @@ separate, explicit, manifest-verified command and is intentionally NOT part of q
 
 from __future__ import annotations
 
+from collections.abc import Callable
 from pathlib import Path
-from typing import Callable
 
-from .analysers.scope import analyserScope
+from .analysers.scope import AnalyserScope
 from .config import config_fingerprint
 from .jobs import tracked_job
 
@@ -69,7 +69,7 @@ def run_quickstart(
 
     # Named (rather than left as inline loop literals) so the stage count below is derived from
     # their length instead of a hand-maintained magic number.
-    STRUCTURAL_analyseRS = (
+    STRUCTURAL_ANALYSERS = (
         ("directory-overlap", "DIRECTORY_OVERLAP", run_directory_overlap_analysis),
         ("document-versions", "VERSION_ANALYSIS", run_document_version_analysis),
         ("image-similarity", "IMAGE_ANALYSIS", run_image_analysis),
@@ -78,7 +78,7 @@ def run_quickstart(
         ("normalized-content", "CONTENT_ANALYSIS", run_normalized_content_analysis),
         ("derivations", "VERSION_ANALYSIS", run_cross_format_derivation_analysis),
     )
-    POST_CANONICAL_analyseRS = (
+    POST_CANONICAL_ANALYSERS = (
         ("archive-of-directory", "ARCHIVE_ANALYSIS", run_archive_directory_analysis),
         ("backup-value", "DIRECTORY_SUMMARY", run_backup_value_analysis),
         ("record-series", "CLASSIFICATION", run_record_series_analysis),
@@ -90,8 +90,8 @@ def run_quickstart(
     FIXED_STAGE_COUNT = 7
     stage_total = (
         FIXED_STAGE_COUNT
-        + len(STRUCTURAL_analyseRS)
-        + len(POST_CANONICAL_analyseRS)
+        + len(STRUCTURAL_ANALYSERS)
+        + len(POST_CANONICAL_ANALYSERS)
         + (1 if generate_reports else 0)
     )
 
@@ -119,7 +119,11 @@ def run_quickstart(
     # current copy as a removable duplicate — marking unique, single-copy files REVIEW_SAFE on a
     # routine re-run. Scoping to this scan run keeps re-runs safe and idempotent.
     scan_run_id = scanner.last_run_id
-    scope = analyserScope(scan_run_id=scan_run_id) if scan_run_id is not None else None
+    scope = (
+        AnalyserScope.for_run(scan_run_id)
+        if scan_run_id is not None
+        else AnalyserScope.current(database)
+    )
     begin_stage("exact-duplicates")
     record(
         "exact-duplicates",
@@ -139,20 +143,21 @@ def run_quickstart(
             config,
             "CONTENT_ANALYSIS",
             "content-analysis",
-            lambda job: run_content_analysis(database, config, None, job_id=job),
+            lambda job: run_content_analysis(database, config, None, scope, job_id=job),
         ),
     )
     # Each factory binds ``runner`` as a fresh parameter (avoiding late-binding over the loop) and
-    # returns a single-argument step callback. Structural analysers receive the current-run scope so
-    # they never relate a file to its own prior-scan snapshot.
+    # returns a single-argument step callback. *Every* analyser receives the current-run scope, not
+    # just the structural ones: an analyser that can be called without a scope will be, and the six
+    # post-canonical stages used to get only a job id and so re-derived all of scan history.
     def scope_positional(runner: Callable) -> Callable[[int | None], object]:
         return lambda job: runner(database, config, scope, job)
 
     def job_keyword(runner: Callable) -> Callable[[int | None], object]:
-        return lambda job: runner(database, config, job_id=job)
+        return lambda job: runner(database, config, scope=scope, job_id=job)
 
     # Structural analysers over the fresh inventory (scope, then job_id, positionally).
-    for label, job_type, runner in STRUCTURAL_analyseRS:
+    for label, job_type, runner in STRUCTURAL_ANALYSERS:
         begin_stage(label)
         record(label, _step(database, config, job_type, label, scope_positional(runner)))
     begin_stage("canonical-roles")
@@ -166,7 +171,7 @@ def run_quickstart(
             lambda job: assign_canonical_roles(database),
         ),
     )
-    for label, job_type, runner in POST_CANONICAL_analyseRS:
+    for label, job_type, runner in POST_CANONICAL_ANALYSERS:
         begin_stage(label)
         record(label, _step(database, config, job_type, label, job_keyword(runner)))
     begin_stage("classify")
@@ -177,7 +182,7 @@ def run_quickstart(
             config,
             "CLASSIFICATION",
             "classify",
-            lambda job: classify_all_entries(database, config, job_id=job),
+            lambda job: classify_all_entries(database, config, job_id=job, scope=scope),
         ),
     )
     begin_stage("review-priority")
@@ -188,7 +193,7 @@ def run_quickstart(
             config,
             "CLASSIFICATION",
             "review-priority",
-            lambda job: run_review_priority_analysis(database, config, job_id=job),
+            lambda job: run_review_priority_analysis(database, config, scope, job_id=job),
         ),
     )
     begin_stage("lifecycle")
@@ -199,7 +204,7 @@ def run_quickstart(
             config,
             "CLASSIFICATION",
             "lifecycle",
-            lambda job: run_lifecycle_analysis(database, config, job_id=job),
+            lambda job: run_lifecycle_analysis(database, config, scope, job_id=job),
         ),
     )
     if generate_reports:
@@ -271,7 +276,9 @@ def next_steps(config) -> list[str]:
         f"Browse the generated reports under {reports_dir}",
         "Start the local dashboard:  housekeeper dashboard   (or: make dashboard)",
         "Inspect the review queue:   housekeeper review list",
-        "Everything so far was read-only. Moving files stays a separate, explicit,"
-        " manifest-verified flow: export-review -> validate-manifest -> move-to-review"
-        " (dry-run first). Nothing is ever deleted.",
+        (
+            "Everything so far was read-only. Moving files stays a separate, explicit, "
+            "manifest-verified flow: export-review -> validate-manifest -> move-to-review "
+            "(dry-run first). Nothing is ever deleted."
+        ),
     ]

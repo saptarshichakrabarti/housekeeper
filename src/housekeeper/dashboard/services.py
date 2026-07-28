@@ -65,24 +65,85 @@ class DashboardService:
         )
         logical_bytes = int(overview.get("logical_bytes", 0))
         unique_bytes = int(overview.get("unique_content_bytes", 0))
+        review_candidates = sum(
+            int(count)
+            for classification, count in classifications.items()
+            if classification.startswith("REVIEW_")
+        )
         metrics = (
-            Metric("Sources", int(overview.get("sources", 0))),
-            Metric("Entries", int(overview.get("entries", 0)), href="/review"),
-            Metric("Content objects", int(overview.get("content_objects", 0)), href="/graph"),
-            Metric("Artifacts", int(overview.get("analysis_artifacts", 0)), href="/jobs"),
+            Metric(
+                "Sources",
+                int(overview.get("sources", 0)),
+                description="Indexed storage roots",
+            ),
+            Metric(
+                "Entries",
+                int(overview.get("entries", 0)),
+                href="/review",
+                description="Files and folders indexed",
+            ),
+            Metric(
+                "Content objects",
+                int(overview.get("content_objects", 0)),
+                href="/graph",
+                description="Distinct hashed payloads",
+            ),
+            Metric(
+                "Logical bytes",
+                logical_bytes,
+                kind="bytes",
+                href="/review",
+                description="Total indexed file size",
+            ),
+            Metric(
+                "Unique bytes",
+                unique_bytes,
+                kind="bytes",
+                href="/graph",
+                description="Size after exact deduplication",
+            ),
             Metric(
                 "Duplicate groups",
                 int(overview.get("duplicate_groups", 0)),
                 href="/duplicates",
+                description="Exact-match file sets",
             ),
-            Metric("Logical bytes", logical_bytes, kind="bytes", href="/review"),
-            Metric("Unique bytes", unique_bytes, kind="bytes", href="/graph"),
+            Metric(
+                "Review candidates",
+                review_candidates,
+                href="/review",
+                description="Items suggested for review",
+            ),
             Metric(
                 "Protected",
                 int(classifications.get("PROTECTED", 0)),
                 href="/review?protected=true",
+                description="Excluded from movement",
             ),
-            Metric("Active jobs", active_jobs, href="/jobs"),
+            Metric(
+                "Kept",
+                int(classifications.get("KEEP", 0)),
+                href="/review?classification=KEEP",
+                description="Items classified to retain",
+            ),
+            Metric(
+                "Analysis errors",
+                int(classifications.get("ERROR", 0)),
+                href="/review?classification=ERROR",
+                description="Items needing attention",
+            ),
+            Metric(
+                "Artifacts",
+                int(overview.get("analysis_artifacts", 0)),
+                href="/jobs",
+                description="Stored analysis results",
+            ),
+            Metric(
+                "Active jobs",
+                active_jobs,
+                href="/jobs",
+                description="Queued or in progress",
+            ),
         )
         charts = tuple(
             Chart(
@@ -103,14 +164,14 @@ class DashboardService:
         rows = self.database.fetch_all(
             f"""SELECT e.id,e.name,e.relative_path,e.source_root,e.size_bytes,e.modified_at,c.classification,c.confidence,
                 COALESCE(d.decision,'') decision,COALESCE(c.reason_codes_json,'[]') reason_codes,COALESCE(d.user_note,'') notes,COALESCE(d.stale,0) stale,
-                EXISTS(SELECT 1 FROM exact_duplicate_members dm WHERE dm.entry_id=e.id) duplicate_member,
-                EXISTS(SELECT 1 FROM projects p WHERE p.root_entry_id=e.id) project_member,
-                (SELECT rg.id FROM exact_duplicate_members edm
+                EXISTS(SELECT 1 FROM current_exact_duplicate_members dm WHERE dm.entry_id=e.id) duplicate_member,
+                EXISTS(SELECT 1 FROM current_projects p WHERE p.root_entry_id=e.id) project_member,
+                (SELECT rg.id FROM current_exact_duplicate_members edm
                  JOIN entry_content_links ecl ON ecl.entry_id=edm.entry_id
-                 JOIN relationship_group_members rgm ON rgm.content_object_id=ecl.content_object_id
-                 JOIN relationship_groups rg ON rg.id=rgm.group_id AND rg.group_type='IMAGE_SIMILARITY'
+                 JOIN current_relationship_group_members rgm ON rgm.content_object_id=ecl.content_object_id
+                 JOIN current_relationship_groups rg ON rg.id=rgm.group_id AND rg.group_type='IMAGE_SIMILARITY'
                  WHERE edm.entry_id=e.id ORDER BY rg.id LIMIT 1) image_group_id
-                FROM filesystem_entries e LEFT JOIN classifications c ON c.entry_id=e.id
+                FROM current_entries e LEFT JOIN classifications c ON c.entry_id=e.id
                 LEFT JOIN review_decisions d ON d.target_type='ENTRY' AND d.target_id=e.id AND d.current=1
                 WHERE {where} AND e.id>? ORDER BY e.id LIMIT ?""",
             (*params, after_id, limit),

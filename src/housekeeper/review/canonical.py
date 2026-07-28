@@ -1,4 +1,5 @@
 import json
+
 from ..database import Database
 from .decisions import record_decision
 

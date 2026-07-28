@@ -2,7 +2,6 @@
 
 import time
 
-
 from housekeeper.constants import Classification
 from housekeeper.policies import (
     ClassificationResult,
@@ -97,7 +96,7 @@ def test_default_keep_when_no_rule_matches():
 
 
 def test_duplicate_rule_requires_noncanonical_and_group():
-    rules, priority, default, _ = load_policy_files(None)
+    rules, _priority, _default, _ = load_policy_files(None)
     duplicate_rule = next(r for r in rules if r.id == "exact-duplicate-noncanonical")
     # canonical member itself must not be flagged
     assert evaluate_rule(duplicate_rule, make_facts(entry_id=5, canonical_entry_id=5, group_size=2)) is None
@@ -108,14 +107,14 @@ def test_duplicate_rule_requires_noncanonical_and_group():
 
 
 def test_virtualenv_rule_needs_reproducibility():
-    rules, priority, default, _ = load_policy_files(None)
+    rules, _priority, _default, _ = load_policy_files(None)
     venv_rule = next(r for r in rules if r.id == "virtualenv-regenerable")
     assert evaluate_rule(venv_rule, make_facts(virtualenv_project_root="P", project_has_spec=False)) is None
     assert evaluate_rule(venv_rule, make_facts(virtualenv_project_root="P", project_has_spec=True)) is not None
 
 
 def test_old_installer_requires_duplicate_not_only_age():
-    rules, priority, default, _ = load_policy_files(None)
+    rules, _priority, _default, _ = load_policy_files(None)
     installer_rule = next(r for r in rules if r.id == "old-duplicate-installer")
     ancient = time.time() - 2 * 365 * 24 * 3600
     # Old but unique -> age alone is insufficient.

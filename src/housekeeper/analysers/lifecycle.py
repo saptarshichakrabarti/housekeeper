@@ -30,18 +30,21 @@ def assign_state(classification: str, modified_at, now: float) -> tuple[str, str
 
 def run_lifecycle_analysis(database, config, scope=None, job_id=None) -> dict[str, int]:
     from ..jobs import checkpoint
+    from .scope import resolve_scope
 
     now = time.time()
+    entry_sql, params = resolve_scope(database, scope).entry_id_sql()
     conn = database.connect()
-    conn.execute("DELETE FROM entry_lifecycle")
+    # Scoped: `DELETE FROM entry_lifecycle` discarded every other source root's states as well.
+    conn.execute(f"DELETE FROM entry_lifecycle WHERE entry_id IN ({entry_sql})", params)
     counts: dict[str, int] = {}
-    scanned = 0
-    for row in database.iter_rows(
-        """SELECT e.id,e.modified_at,COALESCE(c.classification,'KEEP') AS classification
+    rows = database.iter_rows(
+        f"""SELECT e.id,e.modified_at,COALESCE(c.classification,'KEEP') AS classification
            FROM filesystem_entries e LEFT JOIN classifications c ON c.entry_id=e.id
-           WHERE e.entry_type='file'"""
-    ):
-        scanned += 1
+           WHERE e.entry_type='file' AND e.id IN ({entry_sql})""",
+        params,
+    )
+    for scanned, row in enumerate(rows, start=1):
         if scanned % 256 == 0:
             checkpoint(database, job_id, processed_count=scanned)
         state, recommendation = assign_state(row["classification"], row["modified_at"], now)

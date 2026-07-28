@@ -1,6 +1,7 @@
 import argparse
 import time
 from pathlib import Path
+
 from housekeeper.hashing import compute_full_hash
 
 parser = argparse.ArgumentParser()

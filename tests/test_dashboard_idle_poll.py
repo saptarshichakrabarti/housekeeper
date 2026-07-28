@@ -17,6 +17,7 @@ pytest.importorskip("httpx")
 @pytest.fixture
 def client(config, database):
     from fastapi.testclient import TestClient
+
     from housekeeper.dashboard.app import create_app
 
     return TestClient(create_app(database, config=config))

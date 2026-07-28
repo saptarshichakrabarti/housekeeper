@@ -4,11 +4,13 @@ import json
 import os
 import sqlite3
 import threading
+from collections.abc import Iterator
 from contextlib import contextmanager
 from pathlib import Path
-from typing import Any, Iterator
+from typing import Any, ClassVar
 
 from .constants import SCHEMA_VERSION
+from .core import counters
 
 SCHEMA = """
 CREATE TABLE IF NOT EXISTS schema_migrations(version INTEGER PRIMARY KEY);
@@ -18,17 +20,17 @@ CREATE TABLE IF NOT EXISTS filesystem_entries(id INTEGER PRIMARY KEY, scan_run_i
 CREATE TABLE IF NOT EXISTS file_signatures(entry_id INTEGER PRIMARY KEY REFERENCES filesystem_entries(id) ON DELETE CASCADE, extension_mime TEXT, detected_mime TEXT, detected_type TEXT, signature_source TEXT, quick_hash TEXT, full_hash TEXT, hash_algorithm TEXT, hash_status TEXT, hash_error TEXT, full_hash_computed_at TEXT);
 CREATE TABLE IF NOT EXISTS classifications(entry_id INTEGER PRIMARY KEY REFERENCES filesystem_entries(id) ON DELETE CASCADE, classification TEXT NOT NULL, confidence REAL, primary_reason_code TEXT, reason_codes_json TEXT, rule_ids_json TEXT, explanation TEXT, canonical_entry_id INTEGER, requires_manual_approval INTEGER, classified_at TEXT DEFAULT CURRENT_TIMESTAMP);
 CREATE TABLE IF NOT EXISTS analysis_jobs(id INTEGER PRIMARY KEY, job_type TEXT, started_at TEXT DEFAULT CURRENT_TIMESTAMP, completed_at TEXT, status TEXT, processed_count INTEGER DEFAULT 0, error_count INTEGER DEFAULT 0, config_hash TEXT, error_summary TEXT);
-CREATE TABLE IF NOT EXISTS exact_duplicate_groups(id INTEGER PRIMARY KEY, full_hash TEXT NOT NULL, size_bytes INTEGER NOT NULL, member_count INTEGER NOT NULL, canonical_entry_id INTEGER, canonical_selection_reason TEXT, verified INTEGER DEFAULT 0);
+CREATE TABLE IF NOT EXISTS exact_duplicate_groups(id INTEGER PRIMARY KEY, content_object_id INTEGER REFERENCES content_objects(id), full_hash TEXT NOT NULL, size_bytes INTEGER NOT NULL, member_count INTEGER NOT NULL, canonical_entry_id INTEGER, canonical_selection_reason TEXT, verified INTEGER DEFAULT 0);
 CREATE TABLE IF NOT EXISTS exact_duplicate_members(group_id INTEGER REFERENCES exact_duplicate_groups(id) ON DELETE CASCADE, entry_id INTEGER REFERENCES filesystem_entries(id) ON DELETE CASCADE, is_canonical INTEGER, readable INTEGER, PRIMARY KEY(group_id,entry_id));
 CREATE TABLE IF NOT EXISTS directory_summaries(entry_id INTEGER PRIMARY KEY REFERENCES filesystem_entries(id) ON DELETE CASCADE, recursive_file_count INTEGER, recursive_directory_count INTEGER, recursive_size_bytes INTEGER, unique_full_hash_count INTEGER, duplicate_file_count INTEGER, extension_distribution_json TEXT, earliest_modified_at REAL, latest_modified_at REAL, content_signature TEXT);
 CREATE TABLE IF NOT EXISTS move_transactions(id INTEGER PRIMARY KEY, transaction_run_id TEXT, source_entry_id INTEGER, source_path TEXT, destination_path TEXT, expected_size INTEGER, expected_hash TEXT, pre_move_hash TEXT, post_move_hash TEXT, status TEXT, started_at TEXT DEFAULT CURRENT_TIMESTAMP, completed_at TEXT, error TEXT, restored_at TEXT, restore_status TEXT);
-CREATE INDEX IF NOT EXISTS idx_entries_run ON filesystem_entries(scan_run_id); CREATE INDEX IF NOT EXISTS idx_entries_path ON filesystem_entries(relative_path); CREATE INDEX IF NOT EXISTS idx_entries_size ON filesystem_entries(size_bytes); CREATE INDEX IF NOT EXISTS idx_sig_full ON file_signatures(full_hash); CREATE INDEX IF NOT EXISTS idx_classification ON classifications(classification);
-CREATE TABLE IF NOT EXISTS source_roots(id INTEGER PRIMARY KEY, display_name TEXT NOT NULL, source_fingerprint TEXT NOT NULL UNIQUE, filesystem_uuid TEXT, volume_label TEXT, device_metadata_json TEXT NOT NULL DEFAULT '{}', first_seen_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP, last_seen_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP, last_mount_path TEXT NOT NULL);
+CREATE INDEX IF NOT EXISTS idx_entries_path ON filesystem_entries(relative_path); CREATE INDEX IF NOT EXISTS idx_entries_size ON filesystem_entries(size_bytes); CREATE INDEX IF NOT EXISTS idx_sig_full ON file_signatures(full_hash); CREATE INDEX IF NOT EXISTS idx_classification ON classifications(classification);
+CREATE TABLE IF NOT EXISTS source_roots(id INTEGER PRIMARY KEY, display_name TEXT NOT NULL, source_fingerprint TEXT NOT NULL UNIQUE, filesystem_uuid TEXT, volume_label TEXT, device_metadata_json TEXT NOT NULL DEFAULT '{}', first_seen_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP, last_seen_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP, last_mount_path TEXT NOT NULL, latest_complete_scan_run_id INTEGER REFERENCES scan_runs(id));
 CREATE TABLE IF NOT EXISTS content_objects(id INTEGER PRIMARY KEY, hash_algorithm TEXT NOT NULL, full_hash TEXT NOT NULL, size_bytes INTEGER NOT NULL, first_seen_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP, last_seen_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP, verification_status TEXT NOT NULL DEFAULT 'VERIFIED', readability_status TEXT NOT NULL DEFAULT 'UNKNOWN', content_kind TEXT, detected_mime TEXT, detected_type TEXT, analysis_state TEXT NOT NULL DEFAULT 'PENDING', created_by_scan_run_id INTEGER REFERENCES scan_runs(id), UNIQUE(hash_algorithm, full_hash, size_bytes));
 CREATE TABLE IF NOT EXISTS entry_content_links(entry_id INTEGER PRIMARY KEY REFERENCES filesystem_entries(id) ON DELETE CASCADE, content_object_id INTEGER NOT NULL REFERENCES content_objects(id), linked_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP, link_status TEXT NOT NULL, size_verified INTEGER NOT NULL DEFAULT 0, hash_verified INTEGER NOT NULL DEFAULT 0, entry_stat_fingerprint TEXT NOT NULL DEFAULT '');
 CREATE TABLE IF NOT EXISTS analysis_artifacts(id INTEGER PRIMARY KEY, content_object_id INTEGER NOT NULL REFERENCES content_objects(id) ON DELETE CASCADE, analyser_name TEXT NOT NULL, analyser_version TEXT NOT NULL, configuration_fingerprint TEXT NOT NULL, status TEXT NOT NULL, started_at TEXT, completed_at TEXT, artifact_json TEXT, text_blob_id INTEGER, error_code TEXT, error_message TEXT, UNIQUE(content_object_id, analyser_name, analyser_version, configuration_fingerprint));
 CREATE TABLE IF NOT EXISTS content_text_blobs(id INTEGER PRIMARY KEY, content_object_id INTEGER NOT NULL REFERENCES content_objects(id) ON DELETE CASCADE, text_kind TEXT NOT NULL, compression TEXT NOT NULL DEFAULT 'none', character_count INTEGER NOT NULL, text_hash TEXT NOT NULL, data BLOB NOT NULL, UNIQUE(content_object_id, text_kind, text_hash));
-CREATE TABLE IF NOT EXISTS scan_entry_changes(id INTEGER PRIMARY KEY, scan_run_id INTEGER NOT NULL REFERENCES scan_runs(id) ON DELETE CASCADE, entry_id INTEGER, relative_path TEXT NOT NULL, change_status TEXT NOT NULL, evidence_json TEXT NOT NULL DEFAULT '{}');
+CREATE TABLE IF NOT EXISTS scan_entry_changes(id INTEGER PRIMARY KEY, scan_run_id INTEGER NOT NULL REFERENCES scan_runs(id) ON DELETE CASCADE, entry_id INTEGER REFERENCES filesystem_entries(id) ON DELETE CASCADE, relative_path TEXT NOT NULL, change_status TEXT NOT NULL, evidence_json TEXT NOT NULL DEFAULT '{}');
 CREATE TABLE IF NOT EXISTS jobs(id INTEGER PRIMARY KEY, job_type TEXT NOT NULL, scope_json TEXT NOT NULL DEFAULT '{}', configuration_fingerprint TEXT NOT NULL DEFAULT '', status TEXT NOT NULL, created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP, started_at TEXT, updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP, completed_at TEXT, processed_count INTEGER NOT NULL DEFAULT 0, total_estimate INTEGER, success_count INTEGER NOT NULL DEFAULT 0, skip_count INTEGER NOT NULL DEFAULT 0, error_count INTEGER NOT NULL DEFAULT 0, current_item TEXT, checkpoint_json TEXT NOT NULL DEFAULT '{}', worker_count INTEGER NOT NULL DEFAULT 1, host TEXT, process_id INTEGER, parent_job_id INTEGER REFERENCES jobs(id));
 CREATE TABLE IF NOT EXISTS review_sessions(id INTEGER PRIMARY KEY, name TEXT NOT NULL UNIQUE, description TEXT NOT NULL DEFAULT '', created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP, updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP, status TEXT NOT NULL DEFAULT 'OPEN', base_scan_run_id INTEGER, policy_version TEXT NOT NULL DEFAULT '1', analysis_snapshot_id TEXT, filter_json TEXT NOT NULL DEFAULT '{}');
 CREATE TABLE IF NOT EXISTS review_decisions(id INTEGER PRIMARY KEY, review_session_id INTEGER NOT NULL REFERENCES review_sessions(id), target_type TEXT NOT NULL, target_id INTEGER NOT NULL, decision TEXT NOT NULL, created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP, updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP, current INTEGER NOT NULL DEFAULT 1, user_note TEXT NOT NULL DEFAULT '', reason TEXT NOT NULL DEFAULT '', source TEXT NOT NULL DEFAULT 'cli', stale INTEGER NOT NULL DEFAULT 0, UNIQUE(review_session_id,target_type,target_id,current));
@@ -40,9 +42,14 @@ CREATE TABLE IF NOT EXISTS relationship_group_members(group_id INTEGER NOT NULL 
 CREATE TABLE IF NOT EXISTS graph_layout_cache(cache_key TEXT PRIMARY KEY, projection_json TEXT NOT NULL, layout_json TEXT NOT NULL, relationship_version TEXT NOT NULL, created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP);
 CREATE TABLE IF NOT EXISTS projects(id INTEGER PRIMARY KEY, root_entry_id INTEGER REFERENCES filesystem_entries(id), name TEXT NOT NULL, kind TEXT NOT NULL, markers_json TEXT NOT NULL DEFAULT '[]', source_size_bytes INTEGER NOT NULL DEFAULT 0, generated_size_bytes INTEGER NOT NULL DEFAULT 0, environment_size_bytes INTEGER NOT NULL DEFAULT 0, git_status TEXT, created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP, updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP, UNIQUE(root_entry_id));
 CREATE TABLE IF NOT EXISTS canonical_overrides(id INTEGER PRIMARY KEY, duplicate_group_id INTEGER NOT NULL REFERENCES exact_duplicate_groups(id), canonical_entry_id INTEGER NOT NULL REFERENCES filesystem_entries(id), review_session_id INTEGER REFERENCES review_sessions(id), evidence_json TEXT NOT NULL DEFAULT '{}', created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP, UNIQUE(duplicate_group_id));
+-- Contact-sheet reuse keys. A rendered sheet is a pure function of its member ids and their
+-- thumbnails, so an unchanged key means the render would reproduce the file already on disk.
+-- Keyed by group and cascaded from it: replace_relationship_group deletes and reinserts groups,
+-- and a reuse key that outlived its group would authorise reusing a sheet for different members.
+CREATE TABLE IF NOT EXISTS contact_sheet_renders(group_id INTEGER PRIMARY KEY REFERENCES relationship_groups(id) ON DELETE CASCADE, input_key TEXT NOT NULL, rendered_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP);
 CREATE TABLE IF NOT EXISTS materialized_summaries(summary_key TEXT PRIMARY KEY, value_json TEXT NOT NULL, source_scan_run_id INTEGER REFERENCES scan_runs(id), refreshed_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP);
-CREATE INDEX IF NOT EXISTS idx_content_hash ON content_objects(hash_algorithm,full_hash,size_bytes); CREATE INDEX IF NOT EXISTS idx_link_content ON entry_content_links(content_object_id); CREATE INDEX IF NOT EXISTS idx_artifact_lookup ON analysis_artifacts(content_object_id,analyser_name,analyser_version,configuration_fingerprint); CREATE INDEX IF NOT EXISTS idx_jobs_status ON jobs(status,updated_at); CREATE INDEX IF NOT EXISTS idx_review_queue ON review_decisions(review_session_id,current,decision,stale); CREATE INDEX IF NOT EXISTS idx_relationship_source ON relationships(source_type,source_id,relationship_type); CREATE INDEX IF NOT EXISTS idx_relationship_target ON relationships(target_type,target_id,relationship_type); CREATE INDEX IF NOT EXISTS idx_relationship_group_members_content ON relationship_group_members(content_object_id,group_id);
-CREATE INDEX IF NOT EXISTS idx_entries_run_relative ON filesystem_entries(scan_run_id,relative_path); CREATE INDEX IF NOT EXISTS idx_changes_run_status ON scan_entry_changes(scan_run_id,change_status); CREATE INDEX IF NOT EXISTS idx_artifacts_name_status ON analysis_artifacts(analyser_name,status,completed_at);
+CREATE INDEX IF NOT EXISTS idx_link_content ON entry_content_links(content_object_id); CREATE INDEX IF NOT EXISTS idx_jobs_status ON jobs(status,updated_at); CREATE INDEX IF NOT EXISTS idx_review_queue ON review_decisions(review_session_id,current,decision,stale); CREATE INDEX IF NOT EXISTS idx_relationship_source ON relationships(source_type,source_id,relationship_type); CREATE INDEX IF NOT EXISTS idx_relationship_target ON relationships(target_type,target_id,relationship_type); CREATE INDEX IF NOT EXISTS idx_relationship_group_members_content ON relationship_group_members(content_object_id,group_id);
+CREATE INDEX IF NOT EXISTS idx_changes_run_status ON scan_entry_changes(scan_run_id,change_status); CREATE INDEX IF NOT EXISTS idx_changes_entry ON scan_entry_changes(entry_id,id); CREATE INDEX IF NOT EXISTS idx_artifacts_name_status ON analysis_artifacts(analyser_name,status,completed_at);
 -- Hot-path indexes for dashboard review/overview queries (see database.refresh_materialized_summaries and DashboardService).
 -- The filesystem_entries(suffix,...) indexes are created in initialize() *after* legacy columns are added, since `suffix` is one of them.
 CREATE INDEX IF NOT EXISTS idx_review_decisions_target ON review_decisions(target_type,target_id,current); CREATE INDEX IF NOT EXISTS idx_dupe_members_entry ON exact_duplicate_members(entry_id);
@@ -53,6 +60,11 @@ CREATE TABLE IF NOT EXISTS similarity_signatures(id INTEGER PRIMARY KEY, content
 CREATE TABLE IF NOT EXISTS canonical_assignments(id INTEGER PRIMARY KEY, target_group_type TEXT NOT NULL, target_group_id INTEGER NOT NULL, canonical_role TEXT NOT NULL, entry_id INTEGER REFERENCES filesystem_entries(id), content_object_id INTEGER REFERENCES content_objects(id), score REAL, score_components_json TEXT NOT NULL DEFAULT '{}', source TEXT NOT NULL DEFAULT 'analyser', created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP, superseded_at TEXT, UNIQUE(target_group_type,target_group_id,canonical_role,entry_id));
 CREATE INDEX IF NOT EXISTS idx_content_rel_source ON content_relationships(source_type,source_id,relationship_type,status); CREATE INDEX IF NOT EXISTS idx_content_rel_target ON content_relationships(target_type,target_id,relationship_type,status); CREATE INDEX IF NOT EXISTS idx_content_rel_tier ON content_relationships(evidence_tier,status);
 CREATE INDEX IF NOT EXISTS idx_norm_artifact_hash ON normalized_content_artifacts(normalization_profile_id,normalized_hash); CREATE INDEX IF NOT EXISTS idx_sig_lookup ON similarity_signatures(signature_type,signature_version); CREATE INDEX IF NOT EXISTS idx_canonical_group ON canonical_assignments(target_group_type,target_group_id,canonical_role);
+-- Banded LSH index over the 64-bit image descriptor: 9 bands make bucket equality complete for
+-- Hamming radius 8 (see analysers/images.py). Derived from analysis_artifacts and rebuilt by
+-- anti-join, so it is safe to drop. No secondary index: the analyser reads the whole table in
+-- bucket order, and EXPLAIN shows the planner takes the primary key either way.
+CREATE TABLE IF NOT EXISTS image_phash_bands(content_object_id INTEGER NOT NULL REFERENCES content_objects(id) ON DELETE CASCADE, band_index INTEGER NOT NULL, band_value INTEGER NOT NULL, phash TEXT NOT NULL, PRIMARY KEY(content_object_id,band_index)) WITHOUT ROWID;
 CREATE TABLE IF NOT EXISTS chunk_profiles(id INTEGER PRIMARY KEY, name TEXT NOT NULL, algorithm TEXT NOT NULL, algorithm_version TEXT NOT NULL, minimum_chunk_size INTEGER NOT NULL, average_chunk_size INTEGER NOT NULL, maximum_chunk_size INTEGER NOT NULL, hash_algorithm TEXT NOT NULL, configuration_fingerprint TEXT NOT NULL, created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP, UNIQUE(name, algorithm_version, configuration_fingerprint));
 CREATE TABLE IF NOT EXISTS content_chunks(id INTEGER PRIMARY KEY, chunking_profile_id INTEGER NOT NULL REFERENCES chunk_profiles(id), chunk_hash_algorithm TEXT NOT NULL, chunk_hash TEXT NOT NULL, size_bytes INTEGER NOT NULL, occurrence_count INTEGER NOT NULL DEFAULT 0, first_seen_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP, UNIQUE(chunking_profile_id, chunk_hash_algorithm, chunk_hash, size_bytes));
 CREATE TABLE IF NOT EXISTS chunk_occurrences(content_object_id INTEGER NOT NULL REFERENCES content_objects(id) ON DELETE CASCADE, chunk_id INTEGER NOT NULL REFERENCES content_chunks(id) ON DELETE CASCADE, sequence_index INTEGER NOT NULL, byte_offset INTEGER NOT NULL, size_bytes INTEGER NOT NULL, PRIMARY KEY(content_object_id, sequence_index));
@@ -127,6 +139,17 @@ CREATE VIEW IF NOT EXISTS image_similarity_members AS
 
 
 class Database:
+    # The insert path ran on SQLite's 2 MB default page cache while writing a multi-GB inventory,
+    # so every B-tree descent above that went back to the OS. Cache is allocated lazily, so a
+    # 256 MB ceiling costs nothing on a small database. wal_autocheckpoint is raised because a
+    # bulk scan otherwise checkpoints every ~4 MB of WAL, mid-insert.
+    _WRITE_PRAGMAS = (
+        "PRAGMA cache_size=-262144",
+        "PRAGMA mmap_size=268435456",
+        "PRAGMA temp_store=MEMORY",
+        "PRAGMA wal_autocheckpoint=4000",
+    )
+
     def __init__(self, path: Path):
         self.path = Path(path)
         self.conn: sqlite3.Connection | None = None
@@ -139,12 +162,16 @@ class Database:
     def connect(self) -> sqlite3.Connection:
         if self.conn is None:
             self.path.parent.mkdir(parents=True, exist_ok=True)
-            self.conn = sqlite3.connect(self.path, check_same_thread=False)
+            self.conn = sqlite3.connect(
+                self.path, check_same_thread=False, factory=counters.Connection
+            )
             self.conn.row_factory = sqlite3.Row
             self.conn.execute("PRAGMA foreign_keys=ON")
             self.conn.execute("PRAGMA journal_mode=WAL")
             self.conn.execute("PRAGMA busy_timeout=5000")
             self.conn.execute("PRAGMA synchronous=NORMAL")
+            for pragma in self._WRITE_PRAGMAS:
+                self.conn.execute(pragma)
         return self.conn
 
     def close(self) -> None:
@@ -165,10 +192,18 @@ class Database:
         )
         # Dashboard hot-path indexes on `suffix` — created here (not in SCHEMA) because `suffix` is
         # one of the legacy columns just backfilled above, so it may not exist when SCHEMA runs.
+        #
+        # Run-leading, and that ordering is the whole point. The predecessor was
+        # (entry_type,suffix,size_bytes), sized for a chart that aggregated every snapshot ever
+        # recorded. Now that the chart reads current_entries, that index answers it as a covering
+        # scan over all history and then discards most of it — one statement, but a cost that grows
+        # with every rescan. Leading with scan_run_id makes the same aggregate a bounded seek.
+        c.execute("DROP INDEX IF EXISTS idx_entries_type_suffix_size")
         c.execute(
-            "CREATE INDEX IF NOT EXISTS idx_entries_type_suffix_size ON filesystem_entries(entry_type,suffix,size_bytes)"
+            "CREATE INDEX IF NOT EXISTS idx_entries_run_type_suffix_size ON filesystem_entries(scan_run_id,entry_type,suffix,size_bytes)"
         )
         c.execute("CREATE INDEX IF NOT EXISTS idx_entries_suffix ON filesystem_entries(suffix)")
+        self._ensure_entry_indexes(c)
         c.execute(
             """INSERT OR IGNORE INTO source_roots(display_name,source_fingerprint,last_mount_path)
                SELECT COALESCE(NULLIF(MAX(source_root),''),'legacy source'),source_root_fingerprint,
@@ -205,7 +240,236 @@ class Database:
                 self._migrate_v4_to_v5(c)
             if max(versions) < 6:
                 c.execute("INSERT OR IGNORE INTO schema_migrations(version) VALUES (6)")
+            if max(versions) < 7:
+                self._migrate_v6_to_v7(c)
+            if max(versions) < 8:
+                self._migrate_v7_to_v8(c)
+            if max(versions) < 9:
+                self._migrate_v8_to_v9(c)
+        # After the migrations: the backfill above must settle before the index can be unique.
+        self._ensure_duplicate_group_identity(c)
+        self.refresh_current_inventory_views()
         c.commit()
+
+    def refresh_current_inventory_views(self) -> frozenset[int]:
+        """(Re)define the ``current_*`` relational layer — the drive as it is now.
+
+        Historical base rows are the audit trail and are deliberately retained. Every current-state
+        consumer reads these views instead. Scoping by *naming the right relation* rather than by
+        remembering to pass a parameter is the point: doing this only for entries/classifications
+        fixed repeated-scan double counting but still let retired duplicate groups, projects,
+        artifacts and relationships leak into reports after every current member was deleted.
+
+        The run ids are baked in as literals. The obvious alternative —
+        ``scan_run_id IN (SELECT latest_complete_scan_run_id FROM source_roots …)`` — plans as
+        ``SCAN filesystem_entries`` with a LIST SUBQUERY and post-filters, measured 4–15× slower
+        than this form on a 20-snapshot corpus and *slower than not scoping at all*. That is the
+        same defect the composite indexes above exist to prevent, so the view is refreshed in the
+        one transaction that moves the pointer instead.
+        """
+        c = self.connect()
+        # The scanner's pointer where it exists, otherwise the newest COMPLETE run of that source
+        # — the same derivation _migrate_v8_to_v9 uses to backfill the pointer. The fallback matters
+        # because a database can legitimately have entries before anything has written source_roots
+        # (a restored backup, a hand-assembled fixture); without it "current" would be empty and
+        # every report would silently show nothing at all, which is a worse failure than showing
+        # history.
+        runs = sorted(
+            int(row[0])
+            for row in c.execute(
+                """SELECT COALESCE(
+                     (SELECT sr.latest_complete_scan_run_id FROM source_roots sr
+                      WHERE sr.source_fingerprint=r.source_root_fingerprint
+                        AND sr.latest_complete_scan_run_id IS NOT NULL),
+                     MAX(r.id))
+                   FROM scan_runs r WHERE r.status='COMPLETE'
+                   GROUP BY r.source_root_fingerprint"""
+            )
+        )
+        # No completed scan yet: the current inventory is empty, not "everything ever seen".
+        where = (
+            "{alias}scan_run_id IN (" + ",".join(str(run) for run in runs) + ")" if runs else "0"
+        )
+        # Drop dependants before the two base views they reference. The whole refresh is part of the
+        # scanner's pointer transaction, so readers see either the previous complete layer or this
+        # complete replacement — never a half-defined set of views.
+        for view in (
+            "current_preservation_assessments",
+            "current_record_series_assignments",
+            "current_collection_clusters",
+            "current_collection_members",
+            "current_content_overlap_results",
+            "current_content_relationships",
+            "current_relationships",
+            "current_relationship_groups",
+            "current_relationship_group_members",
+            "current_exact_duplicate_groups",
+            "current_exact_duplicate_members",
+            "current_projects",
+            "current_analysis_artifacts",
+            "current_content_objects",
+            "current_classifications",
+            "current_entries",
+        ):
+            c.execute(f"DROP VIEW IF EXISTS {view}")
+        c.execute(
+            "CREATE VIEW current_entries AS SELECT * FROM filesystem_entries "
+            "WHERE " + where.format(alias="")
+        )
+        c.execute(
+            "CREATE VIEW current_classifications AS SELECT c.* FROM classifications c "
+            "JOIN filesystem_entries e ON e.id=c.entry_id WHERE " + where.format(alias="e.")
+        )
+        # Content identity remains global in storage, but a *current* content object must be
+        # reachable from at least one current path. Starting from current entries makes accumulated
+        # scan history irrelevant to the work of materialising this set.
+        c.execute(
+            """CREATE VIEW current_content_objects AS
+               SELECT co.* FROM content_objects co JOIN (
+                 SELECT DISTINCT l.content_object_id FROM entry_content_links l
+                 JOIN filesystem_entries e ON e.id=l.entry_id WHERE """
+            + where.format(alias="e.")
+            + ") live ON live.content_object_id=co.id"
+        )
+        c.execute(
+            """CREATE VIEW current_analysis_artifacts AS
+               SELECT a.* FROM analysis_artifacts a
+               JOIN current_content_objects co ON co.id=a.content_object_id"""
+        )
+        c.execute(
+            """CREATE VIEW current_projects AS
+               SELECT p.* FROM projects p
+               JOIN current_entries e ON e.id=p.root_entry_id"""
+        )
+        c.execute(
+            """CREATE VIEW current_exact_duplicate_members AS
+               SELECT m.* FROM exact_duplicate_members m
+               JOIN current_entries e ON e.id=m.entry_id"""
+        )
+        # The stored group row is historical identity. Its current projection recomputes cardinality
+        # from current members and ceases to be a group below two members. If an old canonical entry
+        # is no longer current, use a deterministic current fallback until the analyser next writes
+        # the group's fully evaluated canonical choice.
+        c.execute(
+            """CREATE VIEW current_exact_duplicate_groups AS
+               SELECT g.id,g.content_object_id,g.full_hash,g.size_bytes,COUNT(*) member_count,
+                      COALESCE(MAX(CASE WHEN m.entry_id=g.canonical_entry_id THEN m.entry_id END),
+                               MIN(m.entry_id)) canonical_entry_id,
+                      g.canonical_selection_reason,g.verified
+               FROM exact_duplicate_groups g
+               JOIN current_exact_duplicate_members m ON m.group_id=g.id
+               GROUP BY g.id,g.content_object_id,g.full_hash,g.size_bytes,
+                        g.canonical_selection_reason,g.verified
+               HAVING COUNT(*)>=2"""
+        )
+        c.execute(
+            """CREATE VIEW current_relationship_group_members AS
+               SELECT m.* FROM relationship_group_members m
+               JOIN current_content_objects co ON co.id=m.content_object_id"""
+        )
+        c.execute(
+            """CREATE VIEW current_relationship_groups AS
+               SELECT g.* FROM relationship_groups g
+               JOIN current_relationship_group_members m ON m.group_id=g.id
+               GROUP BY g.id,g.group_type,g.group_key,g.relationship_version,g.evidence_json,
+                        g.created_at,g.updated_at
+               HAVING COUNT(*)>=2"""
+        )
+
+        def endpoint_is_current(type_sql: str, id_sql: str) -> str:
+            return f"""(
+                ({type_sql} IN ('ENTRY','DIRECTORY','ARCHIVE') AND
+                 {id_sql} IN (SELECT id FROM current_entries))
+                OR ({type_sql}='CONTENT_OBJECT' AND
+                    {id_sql} IN (SELECT id FROM current_content_objects))
+                OR ({type_sql}='PROJECT' AND
+                    {id_sql} IN (SELECT id FROM current_projects))
+                OR ({type_sql}='DUPLICATE_GROUP' AND
+                    {id_sql} IN (SELECT id FROM current_exact_duplicate_groups))
+            )"""
+
+        # Legacy relationships use typed, polymorphic ids. Both endpoints must still be reachable
+        # from the current inventory; an edge to one retired endpoint is historical evidence only.
+        c.execute(
+            "CREATE VIEW current_relationships AS SELECT r.* FROM relationships r WHERE "
+            + endpoint_is_current("r.source_type", "r.source_id")
+            + " AND "
+            + endpoint_is_current("r.target_type", "r.target_id")
+        )
+        c.execute(
+            "CREATE VIEW current_content_relationships AS SELECT r.* FROM content_relationships r WHERE "
+            + endpoint_is_current("r.source_type", "r.source_id")
+            + " AND "
+            + endpoint_is_current("r.target_type", "r.target_id")
+        )
+        c.execute(
+            """CREATE VIEW current_content_overlap_results AS
+               SELECT r.* FROM content_overlap_results r
+               JOIN current_content_objects a ON a.id=r.content_object_a_id
+               JOIN current_content_objects b ON b.id=r.content_object_b_id"""
+        )
+        c.execute(
+            """CREATE VIEW current_collection_members AS
+               SELECT m.* FROM collection_members m WHERE
+                 (m.member_type='ENTRY' AND m.member_id IN (SELECT id FROM current_entries))
+                 OR (m.member_type='CONTENT_OBJECT' AND
+                     m.member_id IN (SELECT id FROM current_content_objects))"""
+        )
+        c.execute(
+            """CREATE VIEW current_collection_clusters AS
+               SELECT c.* FROM collection_clusters c
+               WHERE EXISTS (SELECT 1 FROM current_collection_members m WHERE m.cluster_id=c.id)"""
+        )
+        c.execute(
+            """CREATE VIEW current_record_series_assignments AS
+               SELECT a.* FROM record_series_assignments a WHERE
+                 (a.target_type='ENTRY' AND a.target_id IN (SELECT id FROM current_entries))
+                 OR (a.target_type='COLLECTION' AND
+                     a.target_id IN (SELECT id FROM current_collection_clusters))"""
+        )
+        c.execute(
+            """CREATE VIEW current_preservation_assessments AS
+               SELECT a.* FROM preservation_assessments a WHERE
+                 (a.target_type='ENTRY' AND a.target_id IN (SELECT id FROM current_entries))
+                 OR (a.target_type='CONTENT_OBJECT' AND
+                     a.target_id IN (SELECT id FROM current_content_objects))"""
+        )
+        return frozenset(runs)
+
+    # Composite indexes on filesystem_entries, plus the drops they make possible. Created here
+    # rather than in SCHEMA because parent_entry_id and source_root_id are legacy columns that
+    # _ensure_legacy_columns may only just have added.
+    _ENTRY_INDEXES = (
+        # Child-by-parent was planned as "SEARCH ... USING idx_entries_run (scan_run_id=?)" — a
+        # seek that still visits every row of the run. On a 1.3M-entry inventory that made one
+        # quickstart stage a 58-hour operation.
+        "CREATE INDEX IF NOT EXISTS idx_entries_run_parent_name ON filesystem_entries(scan_run_id,parent_entry_id,name)",
+        # Rename detection looks up by (run, size); size alone matched across every historical scan.
+        "CREATE INDEX IF NOT EXISTS idx_entries_run_size ON filesystem_entries(scan_run_id,size_bytes)",
+        # Reappearance-after-missing looks up a path within a source root.
+        "CREATE INDEX IF NOT EXISTS idx_entries_source_path ON filesystem_entries(source_root_id,relative_path)",
+    )
+    # Byte-for-byte duplicates of a UNIQUE constraint's automatic index, or a redundant prefix of
+    # one of the composites above: pure write amplification and ~365 MB on a real inventory.
+    # idx_entries_suffix is deliberately *not* here — it serves a dashboard query that filters on
+    # that column alone (see tests/test_dashboard_indexes.py).
+    _SUPERSEDED_INDEXES = (
+        "idx_entries_run_relative",  # == UNIQUE(scan_run_id,relative_path)
+        "idx_entries_run",  # prefix of idx_entries_run_parent_name and the UNIQUE index
+        # 172 MB, and it was kept as recently as the last review because the dashboard search box
+        # was the one query that planned through it. Scoping that search to current_entries made
+        # UNIQUE(scan_run_id,relative_path) serve both the filter and the ORDER BY, so the plan and
+        # the timing are now identical with and without it. Correctness bought the deletion.
+        "idx_entries_path",
+        "idx_content_hash",  # == UNIQUE(hash_algorithm,full_hash,size_bytes)
+        "idx_artifact_lookup",  # == UNIQUE(content_object_id,analyser_name,analyser_version,configuration_fingerprint)
+    )
+
+    def _ensure_entry_indexes(self, c: sqlite3.Connection) -> None:
+        for statement in self._ENTRY_INDEXES:
+            c.execute(statement)
+        for index in self._SUPERSEDED_INDEXES:
+            c.execute(f"DROP INDEX IF EXISTS {index}")
 
     @staticmethod
     def _rename_analyser_columns(c: sqlite3.Connection) -> None:
@@ -288,6 +552,16 @@ class Database:
                 "first_seen_at": "TEXT",
                 "last_seen_at": "TEXT",
             },
+        )
+        # "Which scan is the current inventory" is a stored fact, not a subquery — see
+        # _migrate_v8_to_v9 and DriveScanner.
+        self._ensure_columns(
+            c, "source_roots", {"latest_complete_scan_run_id": "INTEGER REFERENCES scan_runs(id)"}
+        )
+        # A duplicate group's identity is the content it groups, not its insertion order — see
+        # _migrate_v7_to_v8 and analysers/exact_duplicates.
+        self._ensure_columns(
+            c, "exact_duplicate_groups", {"content_object_id": "INTEGER REFERENCES content_objects(id)"}
         )
         self._ensure_columns(
             c,
@@ -376,6 +650,279 @@ class Database:
         )
         c.execute("INSERT OR IGNORE INTO schema_migrations(version) VALUES (5)")
 
+    @staticmethod
+    def _migrate_v6_to_v7(c: sqlite3.Connection) -> None:
+        """Give ``scan_entry_changes.entry_id`` the foreign key it always should have had.
+
+        Without it, a delete-and-reinsert of an entry left change rows pointing at an id that no
+        longer existed, silently. SQLite cannot add a foreign key in place, so this is a full table
+        rebuild — on a multi-GB inventory that is a multi-minute, multi-GB operation, which is why
+        it is a numbered migration and not a schema tweak. Repeating it after an interruption is
+        safe: the scratch table is dropped first and the original is only removed once the copy is
+        complete. Rows orphaned by the old behaviour keep their evidence with a NULL ``entry_id``
+        rather than being deleted.
+        """
+        referenced = {row[2] for row in c.execute("PRAGMA foreign_key_list(scan_entry_changes)")}
+        if "filesystem_entries" not in referenced:
+            c.execute("DROP TABLE IF EXISTS scan_entry_changes_rebuild")
+            c.execute(
+                """CREATE TABLE scan_entry_changes_rebuild(id INTEGER PRIMARY KEY,
+                   scan_run_id INTEGER NOT NULL REFERENCES scan_runs(id) ON DELETE CASCADE,
+                   entry_id INTEGER REFERENCES filesystem_entries(id) ON DELETE CASCADE,
+                   relative_path TEXT NOT NULL, change_status TEXT NOT NULL,
+                   evidence_json TEXT NOT NULL DEFAULT '{}')"""
+            )
+            c.execute(
+                """INSERT INTO scan_entry_changes_rebuild(id,scan_run_id,entry_id,relative_path,change_status,evidence_json)
+                   SELECT ch.id,ch.scan_run_id,
+                     CASE WHEN EXISTS(SELECT 1 FROM filesystem_entries e WHERE e.id=ch.entry_id)
+                          THEN ch.entry_id END,
+                     ch.relative_path,ch.change_status,ch.evidence_json
+                   FROM scan_entry_changes ch"""
+            )
+            c.execute("DROP TABLE scan_entry_changes")
+            c.execute("ALTER TABLE scan_entry_changes_rebuild RENAME TO scan_entry_changes")
+            c.execute(
+                "CREATE INDEX IF NOT EXISTS idx_changes_run_status ON scan_entry_changes(scan_run_id,change_status)"
+            )
+            c.execute(
+                "CREATE INDEX IF NOT EXISTS idx_changes_entry ON scan_entry_changes(entry_id,id)"
+            )
+        c.execute("INSERT OR IGNORE INTO schema_migrations(version) VALUES (7)")
+
+    @staticmethod
+    def _ensure_duplicate_group_identity(c: sqlite3.Connection) -> None:
+        """The unique index that turns ``content_object_id`` into a duplicate group's natural key.
+
+        Partial, so pre-migration rows with a NULL content object do not all collide.
+        """
+        c.execute(
+            "CREATE UNIQUE INDEX IF NOT EXISTS idx_dupe_group_content "
+            "ON exact_duplicate_groups(content_object_id) WHERE content_object_id IS NOT NULL"
+        )
+
+    #: Indexes that exist only for the duration of migration v8. Both statements below need one,
+    #: neither had one, and both were written against a toy database where that did not show.
+    _V8_HELPER_INDEXES = (
+        "CREATE INDEX IF NOT EXISTS tmp_migration_content_hash_size ON content_objects(full_hash,size_bytes)",
+        "CREATE INDEX IF NOT EXISTS tmp_migration_dupe_group_content ON exact_duplicate_groups(content_object_id)",
+    )
+    #: A lookup by (full_hash, size_bytes), which is *not* a usable prefix of
+    #: UNIQUE(hash_algorithm, full_hash, size_bytes).
+    _V8_BACKFILL = """UPDATE exact_duplicate_groups SET content_object_id=(
+                        SELECT MIN(co.id) FROM content_objects co
+                        WHERE co.full_hash=exact_duplicate_groups.full_hash
+                          AND co.size_bytes=exact_duplicate_groups.size_bytes)
+                      WHERE content_object_id IS NULL"""
+    #: Defensive: should never fire (one content object per hash+size), but a collision would make
+    #: the unique index un-creatable and block the whole upgrade. This was
+    #: ``id NOT IN (SELECT MIN(id) … GROUP BY …)``, which on 181,071 real groups did not complete
+    #: in eleven minutes. Read as "another group already claimed this content object": one indexed
+    #: probe per row.
+    _V8_DEDUPE = """UPDATE exact_duplicate_groups SET content_object_id=NULL
+                    WHERE content_object_id IS NOT NULL AND EXISTS(
+                      SELECT 1 FROM exact_duplicate_groups other
+                      WHERE other.content_object_id=exact_duplicate_groups.content_object_id
+                        AND other.id<exact_duplicate_groups.id)"""
+
+    @classmethod
+    def _migrate_v7_to_v8(cls, c: sqlite3.Connection) -> None:
+        """Backfill each duplicate group's content object so its id can stay stable.
+
+        Before this, duplicate analysis deleted every group and reinserted it, which reallocated
+        ids and — for any user who had recorded a canonical override — violated the
+        ``canonical_overrides`` foreign key, failing at stage 2 of 20 on every subsequent run.
+
+        Two throwaway indexes, built in about a second, take the whole migration from "did not
+        finish in eleven minutes" to 1.3 s on the real inventory. Same lesson as Phase 1, applied
+        to the upgrade path itself.
+        """
+        for statement in cls._V8_HELPER_INDEXES:
+            c.execute(statement)
+        c.execute(cls._V8_BACKFILL)
+        c.execute(cls._V8_DEDUPE)
+        c.execute("DROP INDEX IF EXISTS tmp_migration_content_hash_size")
+        c.execute("DROP INDEX IF EXISTS tmp_migration_dupe_group_content")
+        c.execute("INSERT OR IGNORE INTO schema_migrations(version) VALUES (8)")
+
+    @staticmethod
+    def _migrate_v8_to_v9(c: sqlite3.Connection) -> None:
+        """Backfill each source root's latest COMPLETE scan run.
+
+        From here on the scanner maintains this in the same transaction that marks a run COMPLETE,
+        so "the current inventory" is a stored fact a query can bind as a parameter rather than a
+        subquery the planner has to evaluate against the whole entries table.
+        """
+        c.execute(
+            """UPDATE source_roots SET latest_complete_scan_run_id=(
+                 SELECT MAX(run.id) FROM scan_runs run
+                 WHERE run.source_root_fingerprint=source_roots.source_fingerprint
+                   AND run.status='COMPLETE')"""
+        )
+        c.execute("INSERT OR IGNORE INTO schema_migrations(version) VALUES (9)")
+
+    #: Why a scan run may not be pruned. Each is a place something still points at it, and the value
+    #: is the reason a human sees when the prune declines. Ordered most-specific-first so the message
+    #: names the strongest reason.
+    _PRUNE_HOLDS = (
+        (
+            "current inventory",
+            "SELECT latest_complete_scan_run_id FROM source_roots WHERE latest_complete_scan_run_id IS NOT NULL",
+        ),
+        (
+            "a review session's baseline",
+            "SELECT base_scan_run_id FROM review_sessions WHERE base_scan_run_id IS NOT NULL",
+        ),
+        (
+            "a recorded review decision",
+            """SELECT e.scan_run_id FROM review_decisions d
+               JOIN filesystem_entries e ON e.id=d.target_id AND d.target_type='ENTRY'""",
+        ),
+        (
+            "a user canonical override",
+            """SELECT e.scan_run_id FROM canonical_overrides o
+               JOIN filesystem_entries e ON e.id=o.canonical_entry_id""",
+        ),
+        (
+            "a materialized summary",
+            "SELECT source_scan_run_id FROM materialized_summaries WHERE source_scan_run_id IS NOT NULL",
+        ),
+    )
+
+    #: Key inside source_roots.device_metadata_json holding the last measured hashing throughput.
+    OBSERVED_THROUGHPUT_KEY = "observed_hash_bytes_per_second"
+
+    def observed_hash_throughput(self, source_fingerprint: str) -> float | None:
+        """What hashing this source last actually achieved, in bytes per second.
+
+        Stored on the source root rather than in configuration: it is an observation about a drive,
+        not a preference, and it must not survive being written to a config file the operator then
+        copies to a different machine.
+        """
+        row = self.fetch_one(
+            "SELECT device_metadata_json FROM source_roots WHERE source_fingerprint=?",
+            (source_fingerprint,),
+        )
+        if not row:
+            return None
+        try:
+            value = json.loads(row["device_metadata_json"] or "{}").get(
+                self.OBSERVED_THROUGHPUT_KEY
+            )
+        except (TypeError, ValueError):
+            return None
+        return float(value) if isinstance(value, (int, float)) and value > 0 else None
+
+    def record_hash_throughput(self, source_fingerprint: str, bytes_per_second: float) -> None:
+        """Merge a throughput observation into the source root's device metadata."""
+        if bytes_per_second <= 0:
+            return
+        c = self.connect()
+        row = c.execute(
+            "SELECT device_metadata_json FROM source_roots WHERE source_fingerprint=?",
+            (source_fingerprint,),
+        ).fetchone()
+        if not row:
+            return
+        try:
+            metadata = json.loads(row["device_metadata_json"] or "{}")
+        except (TypeError, ValueError):
+            metadata = {}
+        if not isinstance(metadata, dict):
+            metadata = {}
+        metadata[self.OBSERVED_THROUGHPUT_KEY] = round(float(bytes_per_second), 2)
+        c.execute(
+            "UPDATE source_roots SET device_metadata_json=? WHERE source_fingerprint=?",
+            (json.dumps(metadata, sort_keys=True), source_fingerprint),
+        )
+
+    def snapshot_retention_plan(self, keep_per_source: int = 3) -> dict[str, object]:
+        """Which superseded snapshots could be pruned, which are held, and by what.
+
+        A snapshot is the drive as it was, and a superseded snapshot's verdict is the audit trail
+        this tool exists to produce — so history is *retained by default* and this is the explicit,
+        inspectable way to bound it. Nothing is deleted by computing a plan.
+
+        ``keep_per_source`` is the number of most-recent COMPLETE runs kept per source root, on top
+        of everything held for a reason below. Incomplete and interrupted runs are prunable once
+        they fall outside that window: they are not a picture of anything.
+
+        The holds matter more than the deletions. ``review_decisions.target_id`` is a bare integer,
+        not a foreign key, so deleting an entry a human made a decision about would leave the
+        decision pointing at nothing — losing exactly the evidence the tool promises to keep. This
+        refuses instead.
+        """
+        c = self.connect()
+        held: dict[int, str] = {}
+        for reason, sql in self._PRUNE_HOLDS:
+            for row in c.execute(sql):
+                if row[0] is not None:
+                    held.setdefault(int(row[0]), reason)
+
+        keep_per_source = max(0, int(keep_per_source))
+        recent: set[int] = set()
+        for row in c.execute(
+            "SELECT DISTINCT source_root_fingerprint FROM scan_runs WHERE status='COMPLETE'"
+        ):
+            recent.update(
+                int(r[0])
+                for r in c.execute(
+                    "SELECT id FROM scan_runs WHERE source_root_fingerprint=? AND status='COMPLETE' "
+                    "ORDER BY id DESC LIMIT ?",
+                    (row[0], keep_per_source),
+                )
+            )
+        for run in recent:
+            held.setdefault(run, f"within the {keep_per_source} most recent complete scans")
+
+        prunable = []
+        for row in c.execute(
+            """SELECT r.id,r.status,r.completed_at,
+                      (SELECT COUNT(*) FROM filesystem_entries e WHERE e.scan_run_id=r.id) entries
+               FROM scan_runs r ORDER BY r.id"""
+        ):
+            if int(row[0]) in held:
+                continue
+            prunable.append(
+                {
+                    "scan_run_id": int(row[0]),
+                    "status": row[1],
+                    "completed_at": row[2],
+                    "entries": int(row[3]),
+                }
+            )
+        return {
+            "keep_per_source": keep_per_source,
+            "prunable": prunable,
+            "entries_prunable": sum(int(item["entries"]) for item in prunable),
+            "held": [{"scan_run_id": run, "reason": reason} for run, reason in sorted(held.items())],
+        }
+
+    def prune_snapshots(self, keep_per_source: int = 3) -> dict[str, object]:
+        """Execute :meth:`snapshot_retention_plan`. Returns the plan that was applied.
+
+        Entries cascade to their signatures, content links, classifications and lifecycle rows;
+        ``content_objects`` are deliberately **not** touched, because content identity is
+        snapshot-independent by design — that is what makes a file recognisable across drives — and
+        an artifact keyed on content stays valid however many snapshots referenced it.
+        """
+        plan = self.snapshot_retention_plan(keep_per_source)
+        prunable = plan["prunable"]
+        assert isinstance(prunable, list)  # narrows dict[str, object] for the type checker
+        runs = [int(item["scan_run_id"]) for item in prunable]
+        if not runs:
+            return plan
+        c = self.connect()
+        placeholders = ",".join("?" for _ in runs)
+        # Entries first: ON DELETE CASCADE fans out from here, and foreign keys are enabled on this
+        # connection so a hold this method failed to spot raises rather than orphaning a row.
+        c.execute(f"DELETE FROM filesystem_entries WHERE scan_run_id IN ({placeholders})", runs)
+        c.execute(f"DELETE FROM scan_entry_changes WHERE scan_run_id IN ({placeholders})", runs)
+        c.execute(f"DELETE FROM scan_runs WHERE id IN ({placeholders})", runs)
+        self.refresh_current_inventory_views()
+        c.commit()
+        return plan
+
     def backup(self, output: Path) -> Path:
         """Create a consistent SQLite backup without modifying the source database."""
         output = Path(output)
@@ -405,7 +952,9 @@ class Database:
     )
 
     def _open_read_connection(self) -> sqlite3.Connection:
-        conn = sqlite3.connect(f"file:{self.path.resolve()}?mode=ro", uri=True)
+        conn = sqlite3.connect(
+            f"file:{self.path.resolve()}?mode=ro", uri=True, factory=counters.Connection
+        )
         conn.row_factory = sqlite3.Row
         for pragma in self._READ_PRAGMAS:
             conn.execute(pragma)
@@ -469,18 +1018,22 @@ class Database:
 
     # The five overview charts, stored verbatim so the dashboard never re-runs these full-table
     # aggregates on a page load. Column order matches what DashboardService renders.
-    _CHART_QUERIES = {
+    #
+    # All but scan_history describe the drive *now*. Artifacts are content-level and reusable across
+    # snapshots, but a current completion count still includes only artifacts reachable from a
+    # current path; otherwise deleted content accumulates forever in the dashboard metric.
+    _CHART_QUERIES: ClassVar[dict[str, tuple[tuple[str, ...], str]]] = {
         "file_types": (
             ("suffix", "files", "bytes"),
-            "SELECT COALESCE(suffix,'(none)') suffix,COUNT(*) files,SUM(size_bytes) bytes FROM filesystem_entries WHERE entry_type='file' GROUP BY suffix ORDER BY bytes DESC LIMIT 20",
+            "SELECT COALESCE(suffix,'(none)') suffix,COUNT(*) files,SUM(size_bytes) bytes FROM current_entries WHERE entry_type='file' GROUP BY suffix ORDER BY bytes DESC LIMIT 20",
         ),
         "classification_bytes": (
             ("classification", "files", "bytes"),
-            "SELECT COALESCE(c.classification,'UNCLASSIFIED') classification,COUNT(*) files,SUM(e.size_bytes) bytes FROM filesystem_entries e LEFT JOIN classifications c ON c.entry_id=e.id WHERE e.entry_type='file' GROUP BY c.classification ORDER BY bytes DESC LIMIT 20",
+            "SELECT COALESCE(c.classification,'UNCLASSIFIED') classification,COUNT(*) files,SUM(e.size_bytes) bytes FROM current_entries e LEFT JOIN classifications c ON c.entry_id=e.id WHERE e.entry_type='file' GROUP BY c.classification ORDER BY bytes DESC LIMIT 20",
         ),
         "top_level": (
             ("top_level", "files", "bytes"),
-            "SELECT CASE WHEN instr(relative_path,'/')=0 THEN relative_path ELSE substr(relative_path,1,instr(relative_path,'/')-1) END top_level,COUNT(*) files,SUM(size_bytes) bytes FROM filesystem_entries WHERE entry_type='file' GROUP BY top_level ORDER BY bytes DESC LIMIT 20",
+            "SELECT CASE WHEN instr(relative_path,'/')=0 THEN relative_path ELSE substr(relative_path,1,instr(relative_path,'/')-1) END top_level,COUNT(*) files,SUM(size_bytes) bytes FROM current_entries WHERE entry_type='file' GROUP BY top_level ORDER BY bytes DESC LIMIT 20",
         ),
         "scan_history": (
             ("id", "status", "files_seen", "bytes_seen", "completed_at"),
@@ -488,7 +1041,7 @@ class Database:
         ),
         "analyser_completion": (
             ("analyser_name", "status", "count"),
-            "SELECT analyser_name,status,COUNT(*) count FROM analysis_artifacts GROUP BY analyser_name,status ORDER BY analyser_name,status",
+            "SELECT analyser_name,status,COUNT(*) count FROM current_analysis_artifacts GROUP BY analyser_name,status ORDER BY analyser_name,status",
         ),
     }
 
@@ -511,32 +1064,34 @@ class Database:
         values = {
             "overview": {
                 "logical_bytes": scalar(
-                    "SELECT COALESCE(SUM(size_bytes),0) FROM filesystem_entries WHERE entry_type='file'"
+                    "SELECT COALESCE(SUM(size_bytes),0) FROM current_entries WHERE entry_type='file'"
                 ),
-                "unique_content_bytes": scalar("SELECT COALESCE(SUM(size_bytes),0) FROM content_objects"),
-                "entries": scalar("SELECT COUNT(*) FROM filesystem_entries"),
-                "content_objects": scalar("SELECT COUNT(*) FROM content_objects"),
-                "analysis_artifacts": scalar("SELECT COUNT(*) FROM analysis_artifacts"),
+                "unique_content_bytes": scalar(
+                    "SELECT COALESCE(SUM(size_bytes),0) FROM current_content_objects"
+                ),
+                "entries": scalar("SELECT COUNT(*) FROM current_entries"),
+                "content_objects": scalar("SELECT COUNT(*) FROM current_content_objects"),
+                "analysis_artifacts": scalar("SELECT COUNT(*) FROM current_analysis_artifacts"),
                 "sources": scalar("SELECT COUNT(*) FROM source_roots"),
-                "duplicate_groups": scalar("SELECT COUNT(*) FROM exact_duplicate_groups"),
+                "duplicate_groups": scalar("SELECT COUNT(*) FROM current_exact_duplicate_groups"),
             },
             "charts": charts,
             "classifications": {
                 str(r[0]): int(r[1])
                 for r in c.execute(
-                    "SELECT classification,COUNT(*) FROM classifications GROUP BY classification"
+                    "SELECT classification,COUNT(*) FROM current_classifications GROUP BY classification"
                 )
             },
             "sources": {
                 str(r[0]): {"files": int(r[1]), "bytes": int(r[2] or 0)}
                 for r in c.execute(
-                    "SELECT source_root,COUNT(*),COALESCE(SUM(size_bytes),0) FROM filesystem_entries WHERE entry_type='file' GROUP BY source_root"
+                    "SELECT source_root,COUNT(*),COALESCE(SUM(size_bytes),0) FROM current_entries WHERE entry_type='file' GROUP BY source_root"
                 )
             },
             "content_kinds": {
                 str(r[0] or "UNKNOWN"): int(r[1])
                 for r in c.execute(
-                    "SELECT content_kind,COUNT(*) FROM content_objects GROUP BY content_kind"
+                    "SELECT content_kind,COUNT(*) FROM current_content_objects GROUP BY content_kind"
                 )
             },
             "review_sessions": {
@@ -573,6 +1128,9 @@ class Database:
             "integrity": self.integrity_check() if check_integrity else "not checked",
         }
 
+    # The write primitives below do NOT commit. A commit per row turned a bulk stage into one
+    # fsync-bounded transaction per entry; the transaction belongs to the stage (or the batch),
+    # which is the only level that knows what a consistent unit of work is.
     def get_or_create_content_object(
         self, algorithm: str, digest: str, size: int, scan_id: int | None = None
     ) -> int:
@@ -586,7 +1144,6 @@ class Database:
             "SELECT id FROM content_objects WHERE hash_algorithm=? AND full_hash=? AND size_bytes=?",
             (algorithm, digest, size),
         ).fetchone()
-        cur.commit()
         return int(row[0])
 
     def link_entry_content(
@@ -598,7 +1155,6 @@ class Database:
             size_verified=excluded.size_verified,hash_verified=excluded.hash_verified,entry_stat_fingerprint=excluded.entry_stat_fingerprint,linked_at=CURRENT_TIMESTAMP""",
             (entry_id, content_object_id, status, stat_fingerprint),
         )
-        self.connect().commit()
 
     def is_analysis_current(
         self,
@@ -607,7 +1163,7 @@ class Database:
         analyser_version: str,
         config_fingerprint: str,
     ) -> bool:
-        return (
+        current = (
             self.fetch_one(
                 """SELECT 1 FROM analysis_artifacts WHERE content_object_id=? AND analyser_name=? AND analyser_version=?
             AND configuration_fingerprint=? AND status='COMPLETED'""",
@@ -615,6 +1171,8 @@ class Database:
             )
             is not None
         )
+        counters.count("artifact_cache_hits" if current else "artifact_cache_misses")
+        return current
 
     migrate = initialize
 
@@ -669,15 +1227,30 @@ class Database:
         assert cur.lastrowid is not None
         return cur.lastrowid
 
+    # Columns an upsert must never overwrite: the conflict target itself, and the first/last-seen
+    # bookkeeping that only makes sense as "when did we first observe this row".
+    _ENTRY_UPSERT_KEEP = frozenset({"scan_run_id", "relative_path", "first_seen_at", "last_seen_at"})
+
     def insert_entry(self, values: dict[str, Any]) -> int:
+        """Insert one entry, or refresh the existing one **in place**, returning its id.
+
+        This used to be ``INSERT OR REPLACE``, which on conflict *deletes* the existing row: its
+        ``file_signatures``, ``entry_content_links`` and ``classifications`` cascade away and the
+        id is reallocated. Resuming an interrupted scan therefore destroyed verified hashes and
+        erased ``PROTECTED`` markers — resume was a pessimisation and a safety hole. A real upsert
+        preserves the id, so everything hanging off it survives.
+        """
         keys = ",".join(values)
         marks = ",".join("?" for _ in values)
-        cur = self.connect().execute(
-            f"INSERT OR REPLACE INTO filesystem_entries({keys}) VALUES({marks})",
+        updates = [f"{key}=excluded.{key}" for key in values if key not in self._ENTRY_UPSERT_KEEP]
+        updates.append("last_seen_at=CURRENT_TIMESTAMP")
+        row = self.connect().execute(
+            f"INSERT INTO filesystem_entries({keys}) VALUES({marks}) "
+            f"ON CONFLICT(scan_run_id,relative_path) DO UPDATE SET {','.join(updates)} RETURNING id",
             tuple(values.values()),
-        )
-        assert cur.lastrowid is not None
-        return cur.lastrowid
+        ).fetchone()
+        assert row is not None
+        return int(row[0])
 
 
 class _ReadDB:

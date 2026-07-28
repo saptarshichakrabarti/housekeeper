@@ -133,7 +133,7 @@ class CollectionValue(StrEnum):
     UNRESOLVED = "UNRESOLVED"
 
 
-SCHEMA_VERSION = 6
+SCHEMA_VERSION = 9
 PROTECTED_SUFFIXES = {
     ".pem",
     ".key",

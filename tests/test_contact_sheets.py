@@ -11,13 +11,13 @@ import pytest
 
 pytest.importorskip("PIL")
 
-from housekeeper.analysers.contact_sheets import (  # noqa: E402
+from housekeeper.analysers.contact_sheets import (
     contact_sheet_path,
     run_contact_sheet_generation,
 )
-from housekeeper.analysers.images import run_image_analysis  # noqa: E402
-from housekeeper.analysers.registry import run_content_analysis  # noqa: E402
-from housekeeper.scanner import DriveScanner  # noqa: E402
+from housekeeper.analysers.images import run_image_analysis
+from housekeeper.analysers.registry import run_content_analysis
+from housekeeper.scanner import DriveScanner
 
 
 def _solid(path, color, size=(48, 48)):
@@ -85,3 +85,34 @@ def test_contact_sheet_skips_group_without_thumbnails(config, database, tmp_path
     result = run_contact_sheet_generation(database, config)
     assert result["sheets_written"] == 0
     assert result["skipped_groups"] >= 1
+
+
+def test_reuse_key_is_cascaded_when_its_group_is_replaced(config, database, tmp_path):
+    """The reason the key is a row and not a sidecar beside the sheet.
+
+    `replace_relationship_group` deletes and reinserts groups, so a sidecar file could outlive the
+    group it described and authorise reusing a sheet rendered for an entirely different set of
+    members. A cascaded row cannot.
+    """
+    from housekeeper.relationships import replace_relationship_group
+
+    conn = database.connect()
+    conn.execute(
+        "INSERT INTO content_objects(id,hash_algorithm,full_hash,size_bytes) VALUES"
+        "(1,'sha256','a',1),(2,'sha256','b',2),(3,'sha256','c',3)"
+    )
+    group_id = replace_relationship_group(database, "IMAGE_SIMILARITY", "k" * 16, [1, 2], {}, "3")
+    conn.execute(
+        "INSERT INTO contact_sheet_renders(group_id,input_key) VALUES(?, 'stale-key')", (group_id,)
+    )
+    conn.commit()
+    assert database.fetch_one("SELECT COUNT(*) n FROM contact_sheet_renders")["n"] == 1
+
+    # Same key, different membership: the group row is replaced.
+    replace_relationship_group(database, "IMAGE_SIMILARITY", "k" * 16, [1, 3], {}, "3")
+    database.connect().commit()
+    surviving = database.fetch_one(
+        "SELECT COUNT(*) n FROM contact_sheet_renders r "
+        "WHERE NOT EXISTS(SELECT 1 FROM relationship_groups g WHERE g.id=r.group_id)"
+    )["n"]
+    assert surviving == 0, "a reuse key outlived its group"

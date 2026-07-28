@@ -19,18 +19,20 @@ EDITABLE = {".docx", ".pptx", ".xlsx", ".md", ".odt", ".ipynb", ".tex"}
 EXPORT = {".pdf", ".html", ".htm"}
 
 
-def _ensure_hashed(database, config) -> None:
+def _ensure_hashed(database, config, scope) -> None:
     from ..hashing import compute_full_hash
 
     algorithm = config.section("hashing")["algorithm"]
     block = config.section("hashing")["full_hash_block_bytes"]
     suffixes = EDITABLE | EXPORT
     marks = ",".join("?" for _ in suffixes)
+    entry_sql, scope_params = scope.entry_id_sql()
     for row in database.iter_rows(
         f"""SELECT e.id,e.absolute_path FROM filesystem_entries e
             LEFT JOIN entry_content_links l ON l.entry_id=e.id
-            WHERE e.entry_type='file' AND l.entry_id IS NULL AND lower(e.suffix) IN ({marks})""",
-        tuple(suffixes),
+            WHERE e.entry_type='file' AND l.entry_id IS NULL AND lower(e.suffix) IN ({marks})
+            AND e.id IN ({entry_sql})""",
+        (*suffixes, *scope_params),
     ):
         path = Path(row["absolute_path"])
         if not path.is_file() or path.is_symlink():
@@ -49,15 +51,19 @@ def _ensure_hashed(database, config) -> None:
 
 def run_cross_format_derivation_analysis(database, config, scope=None, job_id=None) -> dict[str, int]:
     from ..jobs import checkpoint
+    from .scope import resolve_scope
 
-    _ensure_hashed(database, config)
+    scope = resolve_scope(database, scope)
+    entry_sql, scope_params = scope.entry_id_sql()
+    _ensure_hashed(database, config, scope)
     # Bucket files by (directory, normalized stem); a bucket with an editable + an export is a
     # candidate derivation pair.
     buckets: dict[tuple[int, str], list[dict]] = {}
     for row in database.iter_rows(
-        """SELECT e.id,e.parent_entry_id,e.name,e.suffix,e.modified_at,l.content_object_id
+        f"""SELECT e.id,e.parent_entry_id,e.name,e.suffix,e.modified_at,l.content_object_id
            FROM filesystem_entries e JOIN entry_content_links l ON l.entry_id=e.id
-           WHERE e.entry_type='file'"""
+           WHERE e.entry_type='file' AND e.id IN ({entry_sql})""",
+        scope_params,
     ):
         suffix = (row["suffix"] or "").lower()
         if suffix not in EDITABLE and suffix not in EXPORT:
@@ -103,4 +109,7 @@ def run_cross_format_derivation_analysis(database, config, scope=None, job_id=No
                     f"Likely {editable['suffix']} -> {export['suffix']} export (same directory, matching name); review-only.",
                 )
                 counts["pairs"] += 1
+    # This analyser is a stage: the write primitives no longer commit per row, so the one
+    # commit that makes its work durable belongs here.
+    database.connect().commit()
     return counts

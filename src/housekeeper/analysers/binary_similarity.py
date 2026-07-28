@@ -87,4 +87,7 @@ def run_binary_similarity_analysis(database, config, job_id=None) -> dict:
                     f"TLSH distance {distance} (candidate only; verify before any action).",
                 )
                 relationships += 1
+    # This analyser is a stage: the write primitives no longer commit per row, so the one
+    # commit that makes its work durable belongs here.
+    database.connect().commit()
     return {"status": "ok", **caps, "signatures": signatures, "relationships": relationships}

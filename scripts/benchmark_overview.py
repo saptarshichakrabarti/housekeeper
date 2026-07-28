@@ -19,8 +19,8 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
 
-from housekeeper.dashboard.services import DashboardService  # noqa: E402
-from housekeeper.database import Database  # noqa: E402
+from housekeeper.dashboard.services import DashboardService
+from housekeeper.database import Database
 
 # The metric + chart SQL the old overview() ran live on every load (mirrors the pre-change code).
 _LIVE_METRIC_SQL = [

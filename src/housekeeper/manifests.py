@@ -25,8 +25,9 @@ def export_review_manifest(
     database: Database, output_path: Path, classifications: set[str]
 ) -> Path:
     rows = database.fetch_all(
-        "SELECT e.id,e.absolute_path,e.relative_path,e.size_bytes,c.classification,c.confidence,c.reason_codes_json,c.explanation,c.canonical_entry_id,s.full_hash FROM filesystem_entries e JOIN classifications c ON c.entry_id=e.id LEFT JOIN file_signatures s ON s.entry_id=e.id WHERE c.classification IN (%s) ORDER BY e.relative_path"
-        % ",".join("?" * len(classifications)),
+        "SELECT e.id,e.absolute_path,e.relative_path,e.size_bytes,c.classification,c.confidence,c.reason_codes_json,c.explanation,c.canonical_entry_id,s.full_hash FROM current_entries e JOIN current_classifications c ON c.entry_id=e.id LEFT JOIN file_signatures s ON s.entry_id=e.id WHERE c.classification IN ({}) ORDER BY e.relative_path".format(
+            ",".join("?" * len(classifications))
+        ),
         tuple(classifications),
     )
     output_path.parent.mkdir(parents=True, exist_ok=True)
@@ -105,7 +106,7 @@ def export_decision_manifest(
 ) -> Path:
     rows = database.fetch_all(
         """SELECT e.id,e.absolute_path,e.relative_path,e.size_bytes,c.classification,c.confidence,c.reason_codes_json,c.explanation,s.full_hash,d.decision,d.stale
-        FROM review_decisions d JOIN filesystem_entries e ON d.target_type='ENTRY' AND d.target_id=e.id LEFT JOIN classifications c ON c.entry_id=e.id LEFT JOIN file_signatures s ON s.entry_id=e.id
+        FROM review_decisions d JOIN current_entries e ON d.target_type='ENTRY' AND d.target_id=e.id LEFT JOIN current_classifications c ON c.entry_id=e.id LEFT JOIN file_signatures s ON s.entry_id=e.id
         WHERE d.review_session_id=? AND d.current=1 ORDER BY e.relative_path""",
         (session_id,),
     )
@@ -166,6 +167,10 @@ def validate_manifest_schema(entries):
 def validate_manifest_against_database(entries, database):
     errors = []
     for e in entries:
+        # Deliberately the base table, not current_entries: this resolves an entry id a human
+        # already approved in a manifest, which may predate a later rescan. Scoping it would turn
+        # "the drive changed under you" into "missing entry", and the drift and hash checks below
+        # are what actually decide whether the move is still safe.
         r = database.fetch_one(
             """SELECT e.absolute_path,e.size_bytes,s.full_hash,s.hash_status
                FROM filesystem_entries e LEFT JOIN file_signatures s ON s.entry_id=e.id WHERE e.id=?""",

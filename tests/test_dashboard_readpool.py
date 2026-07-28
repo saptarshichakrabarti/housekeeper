@@ -19,9 +19,8 @@ def test_reader_is_pooled_and_not_the_writer(database):
 
 
 def test_read_connection_rejects_writes(database):
-    with database.read_connection() as conn:
-        with pytest.raises(sqlite3.OperationalError):
-            conn.execute("CREATE TABLE nope(x)")
+    with database.read_connection() as conn, pytest.raises(sqlite3.OperationalError):
+        conn.execute("CREATE TABLE nope(x)")
 
 
 def test_pooled_reader_rejects_writes(database):

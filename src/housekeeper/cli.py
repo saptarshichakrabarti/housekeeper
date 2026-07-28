@@ -6,6 +6,7 @@ from pathlib import Path
 from .analysers.exact_duplicates import run_exact_duplicate_analysis
 from .config import config_fingerprint, load_config
 from .database import Database
+from .jobs import tracked_job
 from .logging_utils import configure_logging
 from .manifests import (
     export_decision_manifest,
@@ -17,10 +18,9 @@ from .manifests import (
 from .policies import classify_all_entries
 from .reporting import generate_all_reports, generate_report
 from .restore import restore_transaction
+from .review.decisions import create_session, export_snapshot, record_decision, validate_session
 from .review_mover import move_approved_entries
 from .scanner import DriveScanner
-from .review.decisions import create_session, export_snapshot, record_decision, validate_session
-from .jobs import tracked_job
 
 
 def _run_job(database, config, job_type: str, scope: dict, callback):
@@ -49,7 +49,7 @@ def _print_row(row) -> None:
     if row is None:
         print("(not found)")
         return
-    for key in row.keys():
+    for key in row.keys():  # noqa: SIM118 - sqlite3.Row: `in row` tests values, not keys
         print(f"{key}: {'' if row[key] is None else row[key]}")
 
 
@@ -116,7 +116,6 @@ def build_parser():
     s.add_argument("source_root")
     s.add_argument("--no-resume", action="store_true")
     s.add_argument("--incremental", action="store_true", default=False)
-    s.add_argument("--changed-only", action="store_true")
     s.add_argument("--force-rehash", action="store_true")
     sub.add_parser("scan-status")
     sub.add_parser("stats")
@@ -243,6 +242,17 @@ def build_parser():
     dbm.add_argument("--dry-run", action="store_true")
     dbb = db_sub.add_parser("backup")
     dbb.add_argument("output")
+    dbp_prune = db_sub.add_parser(
+        "prune-snapshots",
+        help="bound retained scan history; prints a plan and changes nothing without --yes",
+    )
+    dbp_prune.add_argument(
+        "--keep-per-source",
+        type=int,
+        default=3,
+        help="most recent complete scans to keep per source root (default 3)",
+    )
+    dbp_prune.add_argument("--yes", action="store_true", help="actually delete the listed snapshots")
     review = sub.add_parser("review")
     review_sub = review.add_subparsers(dest="review_command", required=True)
     rc = review_sub.add_parser("create")
@@ -339,14 +349,15 @@ def build_parser():
     graph_sub = graph.add_subparsers(dest="graph_command", required=True)
     gb = graph_sub.add_parser("build")
     gb.add_argument("projection", default="universe", nargs="?")
-    gb.add_argument("--max-nodes", type=int, default=500)
-    gb.add_argument("--max-edges", type=int, default=2000)
+    # Unset means the configured graph.default_max_* rather than a duplicate literal here.
+    gb.add_argument("--max-nodes", type=int, default=None)
+    gb.add_argument("--max-edges", type=int, default=None)
     ge = graph_sub.add_parser("export")
     ge.add_argument("projection", default="universe", nargs="?")
     ge.add_argument("--output", required=True)
     ge.add_argument("--format", choices=["json", "svg"], default="json")
-    ge.add_argument("--max-nodes", type=int, default=500)
-    ge.add_argument("--max-edges", type=int, default=2000)
+    ge.add_argument("--max-nodes", type=int, default=None)
+    ge.add_argument("--max-edges", type=int, default=None)
     graph_sub.add_parser("cache-clear")
     benchmark = sub.add_parser("benchmark")
     benchmark.add_argument(
@@ -401,7 +412,7 @@ def main(argv=None) -> int:
         return 0
     except SystemExit:
         raise
-    except Exception as exc:  # noqa: BLE001 - single top-level guard for CLI ergonomics
+    except Exception as exc:
         if verbose:
             raise
         print(f"error: {exc}", file=sys.stderr)
@@ -461,13 +472,12 @@ def _dispatch(args, c, d) -> int:
                 Path(args.source_root),
                 not args.no_resume,
                 args.incremental or not args.no_resume,
-                args.changed_only,
                 args.force_rehash,
             )
         print(result)
         return 0
     if cmd == "analyse":
-        from .analysers.scope import analyserScope
+        from .analysers.scope import AnalyserScope, current_inventory_runs
 
         scoped_content_ids = (
             frozenset(
@@ -478,10 +488,17 @@ def _dispatch(args, c, d) -> int:
             if args.content_object_ids
             else frozenset()
         )
-        analyser_scope = analyserScope(
+        # Standalone analysis runs over the current inventory (the latest COMPLETE scan of each
+        # source) rather than accumulated history, so a re-scan never groups a file with its own
+        # snapshot. An explicit --scan-run means the user is targeting exactly that run.
+        analyser_scope = AnalyserScope(
+            scan_run_ids=(
+                frozenset({int(args.scan_run)})
+                if args.scan_run is not None
+                else current_inventory_runs(d)
+            ),
             under=args.under,
             source_id=args.source,
-            scan_run_id=args.scan_run,
             detected_mime=args.mime,
             extensions=frozenset(
                 value if value.startswith(".") else f".{value}" for value in args.extension
@@ -494,13 +511,10 @@ def _dispatch(args, c, d) -> int:
             only_unique=args.only_unique,
             only_duplicate_candidates=args.only_duplicate_candidates,
             content_object_ids=scoped_content_ids,
-            # Standalone analysis runs over the current inventory (latest COMPLETE scan per source)
-            # rather than accumulated history, so re-scans don't group a file with its own snapshot.
-            # An explicit --scan-run means the user is targeting one run, so leave that unrestricted.
-            current_inventory=args.scan_run is None,
         )
         scope_payload = {
             **analyser_scope.__dict__,
+            "scan_run_ids": sorted(analyser_scope.scan_run_ids),
             "extensions": sorted(analyser_scope.extensions),
             "content_object_ids": sorted(analyser_scope.content_object_ids),
         }
@@ -525,20 +539,12 @@ def _dispatch(args, c, d) -> int:
                         d,
                         c,
                         None if args.kind == "all" else args.kind,
-                        args.under,
+                        # The same scope object every other analyser on this command gets. It used
+                        # to receive args.scan_run — normally None — while the CLI had already
+                        # resolved the current inventory a few lines above and handed it to the
+                        # duplicate and overlap stages.
+                        analyser_scope,
                         args.changed_only,
-                        args.source,
-                        set(args.extension),
-                        args.size_min,
-                        args.size_max,
-                        args.older_than,
-                        args.newer_than,
-                        args.classification,
-                        set(scoped_content_ids) or None,
-                        args.scan_run,
-                        args.mime,
-                        args.only_unique,
-                        args.only_duplicate_candidates,
                         _job,
                     ),
                 )
@@ -902,6 +908,7 @@ def _dispatch(args, c, d) -> int:
             return 0
         if args.jobs_command == "resume":
             import json
+
             from .jobs import resume_job
 
             resume_job(d, args.job_id)
@@ -972,6 +979,23 @@ def _dispatch(args, c, d) -> int:
                     lambda _job: {"wal_checkpoint": d.checkpoint_wal(args.mode)},
                 )
             )
+        elif args.database_command == "prune-snapshots":
+            # Dry run by default: this is the only command that deletes recorded history, and the
+            # plan is the interesting output either way — it names what is held and why.
+            if not args.yes:
+                plan = d.snapshot_retention_plan(args.keep_per_source)
+                plan["dry_run"] = True
+                _emit(plan)
+            else:
+                _emit(
+                    _run_job(
+                        d,
+                        c,
+                        "DATABASE_MAINTENANCE",
+                        {"operation": "prune-snapshots", "keep": args.keep_per_source},
+                        lambda _job: d.prune_snapshots(args.keep_per_source),
+                    )
+                )
         elif args.database_command == "vacuum":
             if not args.yes:
                 raise SystemExit(
@@ -1224,8 +1248,9 @@ def _dispatch(args, c, d) -> int:
             print(backend.full_hash(args.path, args.algorithm))
         return 0
     if cmd == "graph":
-        from .graph.builder import build_projection
         import json
+
+        from .graph.builder import build_projection
 
         if args.graph_command == "cache-clear":
             _run_job(
@@ -1250,7 +1275,11 @@ def _dispatch(args, c, d) -> int:
                     "max_edges": args.max_edges,
                 },
                 lambda _job: build_projection(
-                    d, args.projection, max_nodes=args.max_nodes, max_edges=args.max_edges
+                    d,
+                    args.projection,
+                    max_nodes=args.max_nodes,
+                    max_edges=args.max_edges,
+                    config=c,
                 ),
             )
             if args.graph_command == "export":
@@ -1273,6 +1302,7 @@ def _dispatch(args, c, d) -> int:
         return 0
     if cmd == "dashboard":
         import uvicorn
+
         from .analysers.contact_sheets import contact_sheet_dir
         from .dashboard.app import create_app
 
@@ -1295,6 +1325,7 @@ def _dispatch(args, c, d) -> int:
         import webbrowser
 
         import uvicorn
+
         from .analysers.contact_sheets import contact_sheet_dir
         from .dashboard.app import create_app
 
@@ -1321,6 +1352,7 @@ def _dispatch(args, c, d) -> int:
         import time
 
         import uvicorn
+
         from .analysers.contact_sheets import contact_sheet_dir
         from .dashboard.app import create_app
         from .desktop import Api

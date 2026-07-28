@@ -11,7 +11,7 @@ import sys
 import threading
 import time
 from pathlib import Path
-from typing import Any
+from typing import Any, Self
 
 from .core.progress import eta_seconds, format_duration, seconds_since, throughput
 from .database import Database
@@ -62,7 +62,7 @@ class ProgressReporter:
         self._tty = sys.stderr.isatty()
         self._wrote_line = False
 
-    def __enter__(self) -> "ProgressReporter":
+    def __enter__(self) -> Self:
         if not self._quiet:
             self._thread = threading.Thread(target=self._loop, daemon=True)
             self._thread.start()

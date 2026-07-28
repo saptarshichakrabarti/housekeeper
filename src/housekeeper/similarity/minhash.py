@@ -26,8 +26,7 @@ def minhash_signature(shingles: set[str], num_perm: int = 128) -> list[int]:
         x = _shingle_hash(shingle)
         for i, (a, b) in enumerate(params):
             value = (a * x + b) % _PRIME
-            if value < signature[i]:
-                signature[i] = value
+            signature[i] = min(signature[i], value)
     return signature
 
 

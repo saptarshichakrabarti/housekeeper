@@ -70,10 +70,16 @@ def test_overview_metrics_match_live_counts(database, config, fixture_root):
     _scan(database, config, fixture_root)
     model = DashboardService(database.reader()).overview()
     metrics = {metric.label: metric.value for metric in model.metrics}
+    assert len(model.metrics) == 12
     assert metrics["Entries"] == database.fetch_one("SELECT COUNT(*) n FROM filesystem_entries")["n"]
     assert (
         metrics["Content objects"]
         == database.fetch_one("SELECT COUNT(*) n FROM content_objects")["n"]
+    )
+    assert metrics["Review candidates"] == int(
+        database.fetch_one(
+            "SELECT COUNT(*) n FROM current_classifications WHERE classification LIKE 'REVIEW_%'"
+        )["n"]
     )
 
 
@@ -99,6 +105,7 @@ def client(config, database):
     pytest.importorskip("fastapi")
     pytest.importorskip("httpx")
     from fastapi.testclient import TestClient
+
     from housekeeper.dashboard.app import create_app
 
     return TestClient(create_app(database, config=config))
@@ -127,6 +134,7 @@ def test_refresh_blocked_on_read_only_dashboard(database):
     pytest.importorskip("fastapi")
     pytest.importorskip("httpx")
     from fastapi.testclient import TestClient
+
     from housekeeper.dashboard.app import create_app
 
     ro = TestClient(create_app(database, read_only=True))

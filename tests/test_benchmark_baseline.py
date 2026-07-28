@@ -53,9 +53,10 @@ def test_count_regression_always_fails(tmp_path):
 def test_timing_regression_fails_only_on_same_runner(tmp_path):
     baseline = benchmarking.run_suite(tmp_path / "base", TINY)
     current = copy.deepcopy(baseline)
-    # Force the current run to look far slower than the recorded baseline.
-    baseline["profiles"]["tiny"]["seconds"] = 0.001
-    current["profiles"]["tiny"]["seconds"] = 1.0
+    # Force the current run to look far slower than the recorded baseline. Both numbers are above
+    # MINIMUM_TIMED_SECONDS, since below it timing is deliberately not compared at all.
+    baseline["profiles"]["tiny"]["seconds"] = 2.0
+    current["profiles"]["tiny"]["seconds"] = 10.0
 
     same_runner = benchmarking.compare(current, baseline, timing_tolerance=0.5)
     assert same_runner["ok"] is False

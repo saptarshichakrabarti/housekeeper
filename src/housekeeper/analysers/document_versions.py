@@ -1,10 +1,10 @@
 import re
-from difflib import SequenceMatcher
 from collections import defaultdict
+from difflib import SequenceMatcher
 
+from ..jobs import check_cancelled, checkpoint
 from ..relationships import replace_relationship_group, upsert_relationship
-from .scope import analyserScope, scoped_entry_ids
-from ..jobs import check_cancelled, update_job
+from .scope import AnalyserScope, resolve_scope
 
 
 def extract_version_tokens(filename: str) -> list[str]:
@@ -26,13 +26,16 @@ def calculate_filename_similarity(a: str, b: str) -> float:
 
 
 def run_document_version_analysis(
-    database, config, scope: analyserScope | None = None, job_id: int | None = None
+    database, config, scope: AnalyserScope | None = None, job_id: int | None = None
 ):
-    rows = database.fetch_all("""SELECT e.id,e.name,l.content_object_id FROM filesystem_entries e JOIN entry_content_links l ON l.entry_id=e.id
-        WHERE e.entry_type='file' AND e.suffix IN ('.txt','.md','.doc','.docx','.pdf','.rtf') ORDER BY e.id""")
-    allowed = scoped_entry_ids(database, scope) if scope else None
-    if allowed is not None:
-        rows = [row for row in rows if int(row["id"]) in allowed]
+    entry_sql, params = resolve_scope(database, scope).entry_id_sql()
+    rows = database.fetch_all(
+        f"""SELECT e.id,e.name,l.content_object_id FROM filesystem_entries e
+           JOIN entry_content_links l ON l.entry_id=e.id
+           WHERE e.entry_type='file' AND e.suffix IN ('.txt','.md','.doc','.docx','.pdf','.rtf')
+           AND e.id IN ({entry_sql}) ORDER BY e.id""",
+        params,
+    )
     buckets = defaultdict(list)
     for row in rows:
         # This funnel is deliberately cheap and deterministic; costly similarity is only
@@ -70,11 +73,7 @@ def run_document_version_analysis(
                         },
                         "1",
                     )
-        if job_id:
-            update_job(
-                database,
-                job_id,
-                "RUNNING",
-                processed_count=index,
-                checkpoint={"last_family_key": key},
-            )
+        checkpoint(database, job_id, processed_count=index, state={"last_family_key": key})
+    # This analyser is a stage: the write primitives no longer commit per row, so the one
+    # commit that makes its work durable belongs here.
+    database.connect().commit()

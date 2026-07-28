@@ -162,10 +162,10 @@ class ReviewFilter:
             params.append(self.maximum_age_timestamp)
         if self.duplicate_only:
             clauses.append(
-                "EXISTS(SELECT 1 FROM exact_duplicate_members dm WHERE dm.entry_id=e.id)"
+                "EXISTS(SELECT 1 FROM current_exact_duplicate_members dm WHERE dm.entry_id=e.id)"
             )
         if self.project_only:
-            clauses.append("EXISTS(SELECT 1 FROM projects p WHERE p.root_entry_id=e.id)")
+            clauses.append("EXISTS(SELECT 1 FROM current_projects p WHERE p.root_entry_id=e.id)")
         if self.stale is not None:
             clauses.append(
                 "EXISTS(SELECT 1 FROM review_decisions d WHERE d.target_type='ENTRY' AND d.target_id=e.id AND d.current=1 AND d.stale=?)"

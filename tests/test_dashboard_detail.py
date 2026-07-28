@@ -21,7 +21,8 @@ def _seed(db):
         "(1,1,NULL,'/x','directory','Original','Original','/x/Original',NULL),"
         "(2,1,NULL,'/x','directory','Backup','Backup','/x/Backup',NULL),"
         "(3,1,NULL,'/x','file','draft.docx','Original/draft.docx','/x/Original/draft.docx',1000.0),"
-        "(4,1,NULL,'/x','file','draft.pdf','Original/draft.pdf','/x/Original/draft.pdf',1120.0)"
+        "(4,1,NULL,'/x','file','draft.pdf','Original/draft.pdf','/x/Original/draft.pdf',1120.0),"
+        "(5,1,NULL,'/x','file','photo.jpg','Original/photo.jpg','/x/Original/photo.jpg',1200.0)"
     )
     conn.execute(
         "INSERT INTO directory_summaries(entry_id,recursive_file_count,recursive_directory_count,recursive_size_bytes,unique_full_hash_count,duplicate_file_count) VALUES"
@@ -39,7 +40,7 @@ def _seed(db):
     )
     conn.execute(
         "INSERT INTO entry_content_links(entry_id,content_object_id,link_status) VALUES"
-        "(3,1,'VERIFIED'),(4,2,'VERIFIED')"
+        "(3,1,'VERIFIED'),(4,2,'VERIFIED'),(5,3,'VERIFIED')"
     )
     conn.execute(
         "INSERT INTO content_relationships(source_type,source_id,target_type,target_id,relationship_type,evidence_tier,confidence,algorithm,algorithm_version,evidence_json,explanation) VALUES"
@@ -53,6 +54,7 @@ def _seed(db):
     conn.execute(
         "INSERT INTO relationship_group_members(group_id,content_object_id) VALUES(1,1),(1,3)"
     )
+    db.refresh_current_inventory_views()  # the scanner does this; a raw-SQL seed must too
     conn.commit()
 
 

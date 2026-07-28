@@ -8,11 +8,8 @@ turning into a browser or database denial of service.
 import hashlib
 import json
 
-from .model import GraphEdge, GraphNode, serialize
 from ..relationships import get_subgraph
-
-HARD_NODES = 5_000
-HARD_EDGES = 20_000
+from .model import GraphEdge, GraphNode, serialize
 
 
 def _projection_clause(projection_type: str) -> tuple[str, tuple[object, ...]]:
@@ -157,21 +154,33 @@ def build_projection(
     root_id: int | None = None,
     root_type: str | None = None,
     depth: int = 1,
-    max_nodes: int = 500,
-    max_edges: int = 2_000,
-    minimum_confidence: float = 0.7,
+    max_nodes: int | None = None,
+    max_edges: int | None = None,
+    minimum_confidence: float | None = None,
     aggregation_level: str = "auto",
     include_types: tuple[str, ...] = (),
     exclude_types: tuple[str, ...] = (),
+    config=None,
 ):
-    from .projections import validate_projection
+    """Build one bounded projection. Limits and the confidence floor come from ``config``.
+
+    ``None`` for any of the three means "use the configured value"; the builder previously carried
+    its own hard-coded 500/2,000/0.7 and a 5,000/20,000 ceiling, so the four ``graph.*_max_*`` keys
+    and ``graph.minimum_edge_confidence`` were settings nothing consulted.
+    """
+    from .projections import graph_settings, projection_limits, validate_projection
 
     validate_projection(projection_type)
+    max_nodes, max_edges = projection_limits(config, max_nodes, max_edges)
+    if minimum_confidence is None:
+        minimum_confidence = float(graph_settings(config)["minimum_edge_confidence"])
     if not 0 <= minimum_confidence <= 1 or not 1 <= depth <= 5:
         raise ValueError("confidence must be 0..1 and depth must be 1..5")
-    if max_nodes < 1 or max_edges < 1:
-        raise ValueError("graph limits must be positive")
-    max_nodes, max_edges = min(max_nodes, HARD_NODES), min(max_edges, HARD_EDGES)
+    # Relationship writers only flag the cache stale; the clear happens here (and at the end of
+    # each tracked stage) so no reader can be served a projection that predates a write.
+    from ..relationships import invalidate_graph_cache
+
+    invalidate_graph_cache(database)
     version = _relationship_version(database)
     key = _cache_key(projection_type, root_type, root_id, depth, max_nodes, max_edges, minimum_confidence, aggregation_level, include_types, exclude_types, version)
     cached = load_cached_projection(database, key)

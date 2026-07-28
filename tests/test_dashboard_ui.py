@@ -41,17 +41,31 @@ def dashboard_client(database):
         "INSERT INTO filesystem_entries(id,scan_run_id,source_root,absolute_path,relative_path,"
         "name,suffix,entry_type,size_bytes,modified_at) "
         "VALUES(1,1,'/drive','/drive/Documents/report.pdf','Documents/report.pdf',"
-        "'report.pdf','.pdf','file',12400,1721642400)"
+        "'report.pdf','.pdf','file',12400,1721642400),"
+        "(2,1,'/drive','/drive/a-1.bin','a-1.bin','a-1.bin','.bin','file',1000,1),"
+        "(3,1,'/drive','/drive/a-2.bin','a-2.bin','a-2.bin','.bin','file',1000,1),"
+        "(4,1,'/drive','/drive/a-3.bin','a-3.bin','a-3.bin','.bin','file',1000,1),"
+        "(5,1,'/drive','/drive/b-1.bin','b-1.bin','b-1.bin','.bin','file',5000,1),"
+        "(6,1,'/drive','/drive/b-2.bin','b-2.bin','b-2.bin','.bin','file',5000,1)"
     )
     conn.execute(
         "INSERT INTO content_objects(id,hash_algorithm,full_hash,size_bytes) "
         "VALUES(1,'sha256','unique',2400)"
     )
     conn.execute(
-        "INSERT INTO exact_duplicate_groups(id,full_hash,size_bytes,member_count) VALUES"
-        "(1,'aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa',1000,3),"
-        "(2,'bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb',5000,2)"
+        "INSERT INTO entry_content_links(entry_id,content_object_id,link_status) "
+        "VALUES(1,1,'VERIFIED')"
     )
+    conn.execute(
+        "INSERT INTO exact_duplicate_groups(id,full_hash,size_bytes,member_count,canonical_entry_id) VALUES"
+        "(1,'aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa',1000,3,2),"
+        "(2,'bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb',5000,2,5)"
+    )
+    conn.execute(
+        "INSERT INTO exact_duplicate_members(group_id,entry_id,is_canonical,readable) VALUES"
+        "(1,2,1,1),(1,3,0,1),(1,4,0,1),(2,5,1,1),(2,6,0,1)"
+    )
+    database.refresh_current_inventory_views()  # the scanner does this; a raw-SQL seed must too
     conn.commit()
     database.refresh_materialized_summaries()
     return TestClient(create_app(database))
@@ -61,6 +75,12 @@ def test_overview_has_grouped_navigation_hero_links_and_bars(dashboard_client) -
     body = dashboard_client.get("/").text
     assert "Reclaimable space" in body
     assert 'class="hero-card card card--ok" href="/duplicates"' in body
+    assert 'class="cards overview-metrics"' in body
+    assert body.count('class="card-description"') == 12
+    assert "Review candidates" in body
+    assert "Items suggested for review" in body
+    assert "Items classified to retain" in body
+    assert "Items needing attention" in body
     assert 'class="nav-heading">Review' in body
     assert 'class="nav-heading">Insights' in body
     assert 'class="nav-heading">System' in body

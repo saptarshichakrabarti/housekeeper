@@ -1,5 +1,5 @@
 from dataclasses import dataclass
-from datetime import datetime, timezone
+from datetime import UTC, datetime
 
 
 @dataclass
@@ -34,16 +34,16 @@ def seconds_since(sqlite_timestamp: str | None) -> float:
         return 0.0
     try:
         then = datetime.strptime(sqlite_timestamp, "%Y-%m-%d %H:%M:%S").replace(
-            tzinfo=timezone.utc
+            tzinfo=UTC
         )
     except ValueError:
         return 0.0
-    return max((datetime.now(timezone.utc) - then).total_seconds(), 0.0)
+    return max((datetime.now(UTC) - then).total_seconds(), 0.0)
 
 
 def format_duration(seconds: float) -> str:
     """Render seconds as ``mm:ss``, or ``h:mm:ss`` once it runs past an hour."""
-    total = max(0, int(round(seconds)))
+    total = max(0, round(seconds))
     hours, remainder = divmod(total, 3600)
     minutes, secs = divmod(remainder, 60)
     return f"{hours}:{minutes:02d}:{secs:02d}" if hours else f"{minutes:02d}:{secs:02d}"

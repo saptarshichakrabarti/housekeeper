@@ -312,6 +312,10 @@ nav a[aria-current="page"], .header-title a[aria-current="page"] { font-weight: 
   gap: .75rem;
   margin: 1rem 0;
 }
+.overview-metrics {
+  grid-template-columns: repeat(6, minmax(0, 1fr));
+  gap: .65rem;
+}
 .card {
   background: var(--hk-surface);
   padding: .75rem;
@@ -322,14 +326,23 @@ nav a[aria-current="page"], .header-title a[aria-current="page"] { font-weight: 
   gap: .25rem;
   overflow: hidden;
 }
+.overview-metrics .card {
+  min-width: 0;
+  min-height: 6rem;
+  padding: .6rem .7rem;
+  grid-template-rows: auto auto 1fr auto;
+  align-content: start;
+}
 .metric-card, .hero-card { color: var(--hk-text); text-decoration: none; }
 .metric-card:hover, .hero-card:hover { border-color: var(--hk-accent); }
 .metric-card:focus-visible, .hero-card:focus-visible { outline: 3px solid var(--hk-accent); outline-offset: 2px; }
 .card-link-hint { color: var(--hk-link); font-size: .78rem; }
+.card-description { color: var(--hk-text-muted); font-size: .72rem; line-height: 1.3; }
 .hero-card { margin: 1rem 0; padding: 1rem 1.15rem; grid-template-columns: 1fr auto; align-items: end; }
 .hero-card b { font-size: clamp(1.8rem, 5vw, 3rem); }
 .hero-card span { grid-column: 1 / -1; color: var(--hk-text-muted); }
 .card b { font-size: 1.5rem; font-family: var(--hk-font-num); font-weight: 500; }
+.overview-metrics .card b { font-size: clamp(1.1rem, 1.7vw, 1.4rem); overflow-wrap: anywhere; }
 .card strong { font-weight: 500; color: var(--hk-text-muted); font-size: .8rem; }
 :root[data-theme="brutal"] .card strong { color: var(--hk-text); }
 
@@ -506,6 +519,15 @@ aside#detail-drawer {
   .global-search { justify-self: stretch; width: 100%; }
   nav { grid-column: 1; }
   .nav-group { align-items: center; flex-direction: column; gap: .2rem; }
+  .overview-metrics { grid-template-columns: repeat(2, minmax(0, 1fr)); }
+}
+
+@media (min-width: 761px) and (max-width: 1100px) {
+  .overview-metrics { grid-template-columns: repeat(3, minmax(0, 1fr)); }
+}
+
+@media (max-width: 440px) {
+  .overview-metrics { grid-template-columns: 1fr; }
 }
 
 /* In-browser folder picker (the "Choose folder…" modal). */

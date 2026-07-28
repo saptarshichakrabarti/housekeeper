@@ -29,8 +29,9 @@ COMPAT_VIEWS = [
 
 def test_all_compat_views_registered_as_views(database):
     rows = database.fetch_all(
-        "SELECT name,type FROM sqlite_master WHERE name IN (%s)"
-        % ",".join("?" * len(COMPAT_VIEWS)),
+        "SELECT name,type FROM sqlite_master WHERE name IN ({})".format(
+            ",".join("?" * len(COMPAT_VIEWS))
+        ),
         tuple(COMPAT_VIEWS),
     )
     registered = {row["name"]: row["type"] for row in rows}

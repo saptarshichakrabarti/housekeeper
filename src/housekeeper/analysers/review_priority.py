@@ -54,16 +54,23 @@ def run_review_priority_analysis(database, config, scope=None, job_id=None) -> d
             "SELECT target_id FROM preservation_assessments WHERE target_type='ENTRY' AND recommended_action<>'KEEP_WITH_CHECKSUM'"
         )
     }
+    from .scope import resolve_scope
+
+    entry_sql, params = resolve_scope(database, scope).entry_id_sql()
     conn = database.connect()
-    conn.execute("DELETE FROM review_priority WHERE target_type='ENTRY'")
+    # Scoped delete: an unscoped rebuild discarded the priorities of every other source root too.
+    conn.execute(
+        f"DELETE FROM review_priority WHERE target_type='ENTRY' AND target_id IN ({entry_sql})",
+        params,
+    )
     counts: dict[str, int] = {}
-    scanned = 0
-    for row in database.iter_rows(
-        """SELECT c.entry_id,c.classification,c.primary_reason_code,e.size_bytes
+    rows = database.iter_rows(
+        f"""SELECT c.entry_id,c.classification,c.primary_reason_code,e.size_bytes
            FROM classifications c JOIN filesystem_entries e ON e.id=c.entry_id
-           WHERE c.classification LIKE 'REVIEW_%'"""
-    ):
-        scanned += 1
+           WHERE c.classification LIKE 'REVIEW_%' AND e.id IN ({entry_sql})""",
+        params,
+    )
+    for scanned, row in enumerate(rows, start=1):
         if scanned % 256 == 0:
             checkpoint(database, job_id, processed_count=scanned)
         score, category, components = score_entry(

@@ -109,6 +109,7 @@ def operational_client(config, database):
     pytest.importorskip("fastapi")
     pytest.importorskip("httpx")
     from fastapi.testclient import TestClient
+
     from housekeeper.dashboard.app import create_app
 
     return TestClient(create_app(database, config=config))
@@ -160,6 +161,7 @@ def test_control_routes_absent_under_read_only(config, database):
     pytest.importorskip("fastapi")
     pytest.importorskip("httpx")
     from fastapi.testclient import TestClient
+
     from housekeeper.dashboard.app import create_app
 
     client = TestClient(create_app(database, read_only=True, config=config))
@@ -178,6 +180,7 @@ def test_plain_dashboard_has_no_control_routes(database):
     pytest.importorskip("fastapi")
     pytest.importorskip("httpx")
     from fastapi.testclient import TestClient
+
     from housekeeper.dashboard.app import create_app
 
     client = TestClient(create_app(database))

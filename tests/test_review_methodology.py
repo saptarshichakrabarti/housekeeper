@@ -31,7 +31,7 @@ _WEIGHTS = {
 
 def test_priority_categorization():
     dup = _Row(classification="REVIEW_SAFE", primary_reason_code="EXACT_SHA256_DUPLICATE", size_bytes=1000)
-    score, category, components = score_entry(dup, _WEIGHTS, has_preservation_risk=False)
+    _score, category, components = score_entry(dup, _WEIGHTS, has_preservation_risk=False)
     assert category == ReviewPriorityCategory.QUICK_SAFE_WIN
     assert components["redundancy_confidence"] == 1.0
     # Preservation risk always dominates -> PRESERVATION_FIRST.

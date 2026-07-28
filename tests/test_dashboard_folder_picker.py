@@ -14,6 +14,7 @@ pytest.importorskip("httpx")
 @pytest.fixture
 def client(config, database):
     from fastapi.testclient import TestClient
+
     from housekeeper.dashboard.app import create_app
 
     return TestClient(create_app(database, config=config))
@@ -40,6 +41,7 @@ def test_folders_fragment_survives_a_bad_path(client):
 def test_folders_fragment_is_operational_only(database):
     # A viewer dashboard (no runner) must not expose a filesystem browser at all.
     from fastapi.testclient import TestClient
+
     from housekeeper.dashboard.app import create_app
 
     viewer = TestClient(create_app(database))

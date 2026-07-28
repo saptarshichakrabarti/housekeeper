@@ -1,11 +1,11 @@
+import json
 import os
 import shutil
 import uuid
-import json
 from pathlib import Path
 
 from .database import Database
-from .hashing import compute_full_hash
+from .hashing import compute_full_hash, verify_file_against_manifest
 from .models import ManifestEntry
 from .path_utils import is_within, normalize_absolute_path, safe_destination_path
 
@@ -85,9 +85,7 @@ def move_approved_entries(
             try:
                 if not src.is_file() or src.is_symlink():
                     raise ValueError("source is not a regular file")
-                h = compute_full_hash(src, "sha256", 8_388_608)
-                if not h.stable or h.size != e.size_bytes or h.digest != e.expected_sha256:
-                    raise ValueError("pre-move hash mismatch")
+                h = verify_file_against_manifest(src, e.size_bytes, e.expected_sha256)
                 if dest.exists():
                     raise FileExistsError(str(dest))
                 if not dry_run:
@@ -95,7 +93,7 @@ def move_approved_entries(
                     shutil.copy2(src, dest)
                     post = compute_full_hash(dest, "sha256", 8_388_608)
                     if post.digest != h.digest:
-                        raise IOError("destination verification failed")
+                        raise OSError("destination verification failed")
                     os.unlink(src)
                     result.update(
                         status="MOVED",

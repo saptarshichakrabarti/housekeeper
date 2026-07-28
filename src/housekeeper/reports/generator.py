@@ -5,10 +5,10 @@ from __future__ import annotations
 from functools import lru_cache
 from pathlib import Path
 
+from ..jobs import checkpoint, update_job
 from .contexts import CONTEXT_BUILDERS
 from .exports import export_csv, export_jsonl
 from .formatting import human_size, percent
-from ..jobs import checkpoint, update_job
 
 _TEMPLATE_DIR = Path(__file__).parent / "templates"
 
@@ -54,8 +54,8 @@ def generate_all_reports(database, config, job_id: int | None = None) -> list[Pa
     for name in CONTEXT_BUILDERS:
         paths.append(generate_report(name, database, config))
         checkpoint(database, job_id, processed_count=len(paths))
-    paths.append(export_csv(database, out / "recommendations.csv"))
+    paths.append(export_csv(database, out / "recommendations.csv", config))
     checkpoint(database, job_id, processed_count=len(paths))
-    paths.append(export_jsonl(database, out / "recommendations.jsonl"))
+    paths.append(export_jsonl(database, out / "recommendations.jsonl", config))
     checkpoint(database, job_id, processed_count=len(paths))
     return paths

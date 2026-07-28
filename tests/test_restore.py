@@ -55,7 +55,7 @@ def test_already_satisfied_when_original_matches(tmp_path):
 
 
 def test_destination_collision_stops_restore(tmp_path):
-    manifest, original, review = _transaction(tmp_path)
+    manifest, original, _review = _transaction(tmp_path)
     original.write_bytes(b"a different file at the original path")
     results = restore_transaction(manifest, dry_run=False, yes=True)
     assert results[0]["restore_status"] == "DESTINATION_EXISTS"

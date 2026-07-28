@@ -52,13 +52,15 @@ Edit `approved` to `true` only after manual review. Keep the database and review
 
 Run `pytest`, `ruff check .`, and `mypy src`. Python 3.11+ is supported on Linux, macOS, and Windows where filesystem permissions and mount behavior allow it. Estimated reviewable bytes are not guaranteed reclaimable space.
 
+**Upgrading from an earlier version: read [CHANGELOG.md](CHANGELOG.md) first.** The schema migrates automatically, but an unknown configuration key is now a startup error and twenty-one settings that never did anything were removed. [docs/performance.md](docs/performance.md) records what the performance work achieved, how it was measured, and which designs were closed by measurement rather than built.
+
 ## Second-generation platform
 
 Known sources are scanned incrementally by default. Verified full hashes are deduplicated into content objects, and analyser artifacts are reused only when content identity, analyser version, and configuration fingerprint match.
 
 ```bash
 housekeeper sources list
-housekeeper scan /path/to/source --incremental --changed-only
+housekeeper scan /path/to/source --incremental
 housekeeper diff 1 2
 housekeeper analyse all --changed-only
 housekeeper jobs list

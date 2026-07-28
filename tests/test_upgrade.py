@@ -62,9 +62,54 @@ def test_v1_database_backfills_verified_hashes(tmp_path):
     conn.close()
     db = Database(old)
     db.initialize()
-    assert db.database_stats()["schema_version"] == 6
+    from housekeeper.constants import SCHEMA_VERSION
+
+    assert db.database_stats()["schema_version"] == SCHEMA_VERSION
     assert db.fetch_one("SELECT COUNT(*) AS n FROM content_objects")["n"] == 1
     assert db.fetch_one("SELECT COUNT(*) AS n FROM entry_content_links")["n"] == 1
+
+
+def test_v6_database_gains_change_foreign_key_and_group_identity(tmp_path):
+    """Both v7 and v8 rebuild/backfill on a live inventory; neither may lose a row.
+
+    v7 rebuilds ``scan_entry_changes`` to add the foreign key SQLite cannot add in place, and v8
+    backfills each duplicate group's content object so its id can stay stable across reruns.
+    """
+    import sqlite3
+
+    old = tmp_path / "v6.sqlite"
+    conn = sqlite3.connect(old)
+    conn.executescript("""CREATE TABLE schema_migrations(version INTEGER PRIMARY KEY);
+        INSERT INTO schema_migrations VALUES(6);
+        CREATE TABLE scan_runs(id INTEGER PRIMARY KEY, source_root TEXT NOT NULL, source_root_fingerprint TEXT NOT NULL, status TEXT NOT NULL);
+        CREATE TABLE filesystem_entries(id INTEGER PRIMARY KEY, scan_run_id INTEGER NOT NULL, source_root TEXT NOT NULL, absolute_path TEXT NOT NULL, relative_path TEXT NOT NULL, name TEXT NOT NULL, entry_type TEXT NOT NULL, size_bytes INTEGER, UNIQUE(scan_run_id,relative_path));
+        CREATE TABLE scan_entry_changes(id INTEGER PRIMARY KEY, scan_run_id INTEGER NOT NULL, entry_id INTEGER, relative_path TEXT NOT NULL, change_status TEXT NOT NULL, evidence_json TEXT NOT NULL DEFAULT '{}');
+        CREATE TABLE content_objects(id INTEGER PRIMARY KEY, hash_algorithm TEXT NOT NULL, full_hash TEXT NOT NULL, size_bytes INTEGER NOT NULL, UNIQUE(hash_algorithm,full_hash,size_bytes));
+        CREATE TABLE exact_duplicate_groups(id INTEGER PRIMARY KEY, full_hash TEXT NOT NULL, size_bytes INTEGER NOT NULL, member_count INTEGER NOT NULL, canonical_entry_id INTEGER, canonical_selection_reason TEXT, verified INTEGER DEFAULT 0);
+        INSERT INTO scan_runs VALUES(1,'/old','finger','COMPLETE');
+        INSERT INTO filesystem_entries VALUES(1,1,'/old','/old/a.txt','a.txt','a.txt','file',9);
+        INSERT INTO content_objects VALUES(1,'sha256','bb','9'||'');
+        INSERT INTO scan_entry_changes VALUES(1,1,1,'a.txt','NEW','{}');
+        INSERT INTO scan_entry_changes VALUES(2,1,4242,'ghost.txt','MISSING','{\"orphan\":true}');
+        INSERT INTO exact_duplicate_groups VALUES(1,'bb',9,2,1,'legacy',1);""")
+    conn.commit()
+    conn.close()
+
+    db = Database(old)
+    db.initialize()
+    referenced = {row[2] for row in db.connect().execute("PRAGMA foreign_key_list(scan_entry_changes)")}
+    assert "filesystem_entries" in referenced
+    # Both change rows survive; the one whose entry no longer exists keeps its evidence with a
+    # NULL entry_id rather than being thrown away.
+    rows = {
+        row["relative_path"]: row["entry_id"]
+        for row in db.fetch_all("SELECT relative_path,entry_id FROM scan_entry_changes")
+    }
+    assert rows == {"a.txt": 1, "ghost.txt": None}
+    group = db.fetch_one("SELECT content_object_id,canonical_entry_id FROM exact_duplicate_groups")
+    assert group["content_object_id"] == 1, "group identity was not backfilled from its content"
+    assert group["canonical_entry_id"] == 1, "the recorded canonical choice was lost"
+    db.close()
 
 
 def test_bounded_xlsx_extraction(tmp_path):
@@ -72,6 +117,7 @@ def test_bounded_xlsx_extraction(tmp_path):
 
     pytest.importorskip("openpyxl")
     from openpyxl import Workbook
+
     from housekeeper.analysers.documents import extract_document
     from housekeeper.config import load_config
 
@@ -86,6 +132,7 @@ def test_bounded_xlsx_extraction(tmp_path):
 
 def test_archive_path_traversal_is_error(tmp_path):
     import zipfile
+
     from housekeeper.analysers.archives import inspect_archive
     from housekeeper.config import load_config
 
@@ -113,7 +160,7 @@ def test_incremental_scan_reuses_verified_content_and_full_analysis_hashes_inven
     ]
     run_content_analysis(db, config, "all")
     assert db.fetch_one("SELECT COUNT(*) AS n FROM content_objects")["n"] == 1
-    scanner.scan(source, incremental=True, changed_only=True)
+    scanner.scan(source, incremental=True)
     assert (
         db.fetch_one(
             "SELECT COUNT(*) AS n FROM scan_entry_changes WHERE change_status='UNCHANGED'"
@@ -124,6 +171,7 @@ def test_incremental_scan_reuses_verified_content_and_full_analysis_hashes_inven
 
 def test_duplicate_movement_refuses_last_verified_copy(tmp_path):
     import pytest
+
     from housekeeper.analysers.exact_duplicates import run_exact_duplicate_analysis
     from housekeeper.config import load_config
     from housekeeper.models import ManifestEntry
@@ -167,8 +215,9 @@ def test_dashboard_is_local_query_only_and_escaped(tmp_path):
 
     pytest.importorskip("fastapi")
     pytest.importorskip("httpx")
-    from housekeeper.dashboard.app import create_app
     from fastapi.testclient import TestClient
+
+    from housekeeper.dashboard.app import create_app
 
     db = Database(tmp_path / "db.sqlite")
     db.initialize()
@@ -178,6 +227,7 @@ def test_dashboard_is_local_query_only_and_escaped(tmp_path):
     db.connect().execute(
         "INSERT INTO filesystem_entries(scan_run_id,source_root,absolute_path,relative_path,name,entry_type) VALUES(1,'/x','/x/<script>','<script>','<script>','file')"
     )
+    db.refresh_current_inventory_views()
     db.connect().commit()
     client = TestClient(create_app(db, read_only=True))
     assert client.get("/api/overview").status_code == 200
@@ -208,6 +258,7 @@ def test_dashboard_htmx_decision_form_requires_csrf_and_records(tmp_path):
     pytest.importorskip("fastapi")
     pytest.importorskip("httpx")
     from fastapi.testclient import TestClient
+
     from housekeeper.dashboard.app import create_app
     from housekeeper.review.decisions import create_session
 
@@ -219,6 +270,7 @@ def test_dashboard_htmx_decision_form_requires_csrf_and_records(tmp_path):
     db.connect().execute(
         "INSERT INTO filesystem_entries(scan_run_id,source_root,absolute_path,relative_path,name,entry_type,scan_status) VALUES(1,'/x','/x/a','a','a','file','OK')"
     )
+    db.refresh_current_inventory_views()
     db.connect().commit()
     session_id = create_session(db, "dashboard")
     client = TestClient(create_app(db))

@@ -3,53 +3,58 @@
 Photos and work products are reviewed as collections, not isolated files. Clustering uses time
 gaps (EXIF capture time when available, else file modification time). Precise GPS is never
 stored or displayed by default — only time/sequence signals are used.
+
+Capture time is read from the image artifact recorded at parse time, not from the file: this used
+to open every photograph with PIL on every run, once per snapshot of it.
 """
 
 from __future__ import annotations
 
 import json
-import time
-from pathlib import Path
 
 from ..constants import ClusterType
 
 _IMAGE_SUFFIXES = {".jpg", ".jpeg", ".png", ".gif", ".tiff", ".heic", ".bmp", ".webp"}
 _DOC_SUFFIXES = {".txt", ".md", ".doc", ".docx", ".pdf", ".pptx", ".xlsx"}
 
-
-def _capture_time(path: Path) -> float | None:
-    try:
-        from PIL import Image
-
-        with Image.open(path) as image:
-            exif = getattr(image, "_getexif", lambda: None)() or {}
-        stamp = exif.get(36867) or exif.get(306)  # DateTimeOriginal / DateTime (never GPS)
-        if stamp:
-            return time.mktime(time.strptime(str(stamp), "%Y:%m:%d %H:%M:%S"))
-    except Exception:  # noqa: BLE001 - EXIF is best-effort; fall back to file time
-        return None
-    return None
+#: Capture time from the newest images artifact linked to this entry, if one exists. Entries with
+#: no image analysis fall back to modification time, exactly as an unreadable EXIF block did.
+_CAPTURE_TIME_SQL = """(SELECT json_extract(a.artifact_json,'$.capture_time')
+     FROM entry_content_links l
+     JOIN analysis_artifacts a ON a.content_object_id=l.content_object_id
+     WHERE l.entry_id=e.id AND a.analyser_name='images' AND a.status='COMPLETED'
+     ORDER BY a.id DESC LIMIT 1)"""
 
 
-def _cluster(database, cluster_type: str, suffixes: set[str] | None, gap_seconds: float, use_exif: bool, job_id: int | None = None) -> int:
+def _cluster(database, cluster_type: str, suffixes: set[str] | None, gap_seconds: float, use_exif: bool, job_id: int | None = None, scope=None) -> int:
+    from ..analysers.scope import resolve_scope
     from ..jobs import checkpoint
 
+    # Scoped to the current inventory. Unscoped, every snapshot of the same photograph joins the
+    # same timeline, so a "photo event" is padded with re-scans of one picture — a correctness bug
+    # rather than merely a slow one.
+    entry_sql, params = resolve_scope(database, scope).entry_id_sql()
+    clauses = [f"e.entry_type='file' AND e.id IN ({entry_sql})"]
+    query_params = list(params)
+    if suffixes is not None:
+        clauses.append("lower(e.suffix) IN (" + ",".join("?" for _ in suffixes) + ")")
+        query_params.extend(sorted(suffixes))
+    capture = _CAPTURE_TIME_SQL if use_exif else "NULL"
     rows = database.fetch_all(
-        "SELECT id,absolute_path,modified_at,suffix FROM filesystem_entries WHERE entry_type='file'"
+        f"SELECT e.id,e.modified_at,{capture} AS capture_time FROM filesystem_entries e "
+        "WHERE " + " AND ".join(clauses),
+        tuple(query_params),
     )
     timed: list[tuple[int, float]] = []
     for row in rows:
-        if suffixes is not None and (row["suffix"] or "").lower() not in suffixes:
-            continue
-        timestamp = None
-        if use_exif:
-            timestamp = _capture_time(Path(row["absolute_path"]))
+        timestamp = row["capture_time"]
         if timestamp is None:
             timestamp = row["modified_at"]
         if timestamp is None:
             continue
         timed.append((int(row["id"]), float(timestamp)))
-    timed.sort(key=lambda item: item[1])
+    # Entry id breaks timestamp ties, so cluster membership does not depend on row order.
+    timed.sort(key=lambda item: (item[1], item[0]))
     created = 0
     previous = 0.0
     groups: list[list[int]] = []
@@ -89,7 +94,7 @@ def run_photo_event_analysis(database, config, scope=None, job_id=None) -> dict[
     gap = float(config.section("collections")["photo_event_gap_minutes"]) * 60
     return {
         "photo_events": _cluster(
-            database, ClusterType.PHOTO_EVENT, _IMAGE_SUFFIXES, gap, True, job_id
+            database, ClusterType.PHOTO_EVENT, _IMAGE_SUFFIXES, gap, True, job_id, scope
         )
     }
 
@@ -98,7 +103,7 @@ def run_work_session_analysis(database, config, scope=None, job_id=None) -> dict
     gap = float(config.section("collections")["work_session_gap_hours"]) * 3600
     return {
         "work_sessions": _cluster(
-            database, ClusterType.WORK_SESSION, _DOC_SUFFIXES, gap, False, job_id
+            database, ClusterType.WORK_SESSION, _DOC_SUFFIXES, gap, False, job_id, scope
         )
     }
 
@@ -108,6 +113,6 @@ def run_acquisition_batch_analysis(database, config, scope=None, job_id=None) ->
     gap = float(config.section("collections")["acquisition_batch_gap_minutes"]) * 60
     return {
         "acquisition_batches": _cluster(
-            database, ClusterType.ACQUISITION_BATCH, None, gap, False, job_id
+            database, ClusterType.ACQUISITION_BATCH, None, gap, False, job_id, scope
         )
     }

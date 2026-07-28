@@ -69,8 +69,10 @@ def test_error_state_recorded(config, database, tmp_path, monkeypatch):
 
     real_inspect = scanner.inspect_entry
 
-    def flaky_inspect(path, scan_root):
-        record = real_inspect(path, scan_root)
+    def flaky_inspect(path, scan_root, *args, **kwargs):
+        # Pass through whatever the traversal supplies: this test is about the ERROR state being
+        # recorded, not about inspect_entry's signature.
+        record = real_inspect(path, scan_root, *args, **kwargs)
         if path.name == "broken.txt":
             return FileStatRecord(
                 record.path, record.relative_path, record.name, EntryType.OTHER,

@@ -24,6 +24,12 @@ from pathlib import Path
 
 BASELINE_SCHEMA_VERSION = 1
 
+# Below this, wall clock is scheduler noise rather than signal: a 0.2 s profile routinely varies by
+# more than any relative tolerance worth setting, so comparing it fails runs at random and teaches
+# people to ignore the benchmark. Such profiles are reported as timing-skipped; their counts, which
+# are deterministic, are still compared. `xlarge` exists to be above this floor.
+MINIMUM_TIMED_SECONDS = 1.0
+
 # name -> (file_count, dir_count). Kept modest so recording a baseline and the regression test stay
 # fast; the shapes still exercise traversal, hashing, exact-duplicate grouping, and directory
 # overlap at three scales.
@@ -31,6 +37,10 @@ PROFILES: dict[str, tuple[int, int]] = {
     "small": (12, 3),
     "medium": (60, 6),
     "large": (240, 12),
+    # At 240 files every plan in this codebase looks fine. `xlarge` is the smallest shape that
+    # makes per-entry work visible; keep the largest profile well above the point where a full
+    # table scan is indistinguishable from an index seek.
+    "xlarge": (2_000, 24),
 }
 
 
@@ -57,6 +67,7 @@ def _git_commit() -> str:
             capture_output=True,
             text=True,
             timeout=5,
+            check=False,  # a repo without git, or a detached checkout, is not an error here
         )
         return out.stdout.strip() if out.returncode == 0 else "unknown"
     except (OSError, subprocess.SubprocessError):
@@ -170,12 +181,12 @@ def compare(current: dict, baseline: dict, timing_tolerance: float = 0.5) -> dic
                         "current": current_value,
                     }
                 )
-        if not same_environment:
+        baseline_seconds = base_profile["seconds"]
+        if not same_environment or baseline_seconds < MINIMUM_TIMED_SECONDS:
             timing_skipped.append(name)
             continue
-        baseline_seconds = base_profile["seconds"]
         limit = baseline_seconds * (1 + timing_tolerance)
-        if baseline_seconds > 0 and current_profile["seconds"] > limit:
+        if current_profile["seconds"] > limit:
             timing_regressions.append(
                 {
                     "profile": name,

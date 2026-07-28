@@ -1,53 +1,69 @@
 """Typed analyser registry and content-level, versioned artifact execution."""
 
-from dataclasses import dataclass
 import gzip
 import hashlib
 import json
+import time
+from collections.abc import Callable
+from dataclasses import dataclass
 from pathlib import Path
-from datetime import datetime
-from typing import Any, Callable
+from typing import Any
 
 from ..config import AppConfig, config_fingerprint, performance_profile
-from ..core.worker_pool import bounded_map, run_parser_isolated
-from ..jobs import JobCancelled, JobPaused, check_cancelled, create_job, update_job
+from ..core import counters
+from ..core.worker_pool import bounded_map
 from ..database import Database
-from ..hashing import compute_full_hash, compute_quick_hash
+from ..hashing import compute_identity
+from ..jobs import JobCancelled, JobPaused, check_cancelled, create_job, update_job
 from .archives import inspect_archive
 from .documents import extract_document
-from .images import extract_image_metadata
-from .images import create_thumbnail
+from .images import create_thumbnail, extract_image_metadata
 from .media import extract_basic_media_metadata
+from .parser_pool import ParserPool, worker_count
+from .scope import AnalyserScope, resolve_scope
 
 
 @dataclass(frozen=True)
-class analyserSpec:
+class AnalyserSpec:
     name: str
     version: str
     suffixes: frozenset[str]
     runner: Callable[[Path, AppConfig], dict[str, Any]]
     timeout_seconds: int = 60
+    #: The configuration sections this analyser's result can actually depend on. Only these are
+    #: fingerprinted, so a change elsewhere does not invalidate its artifacts.
+    config_sections: frozenset[str] = frozenset()
 
 
 REGISTRY = (
-    analyserSpec(
+    AnalyserSpec(
         "documents",
         "2",
         frozenset(
             {".txt", ".md", ".csv", ".rst", ".log", ".docx", ".pdf", ".xlsx", ".xlsm", ".pptx"}
         ),
         lambda p, c: extract_document(p, p.suffix, c),
+        config_sections=frozenset({"documents", "content_store"}),
     ),
-    analyserSpec(
-        "archives", "1", frozenset({".zip", ".tar", ".gz", ".tgz", ".bz2", ".xz"}), inspect_archive
-    ),
-    analyserSpec(
-        "images",
+    AnalyserSpec(
+        "archives",
         "1",
+        frozenset({".zip", ".tar", ".gz", ".tgz", ".bz2", ".xz"}),
+        inspect_archive,
+        config_sections=frozenset({"archives"}),
+    ),
+    AnalyserSpec(
+        "images",
+        # v2: the descriptor is a 16-hex 64-bit integer rather than a 64-character bit string, and
+        # the artifact carries capture_time so clustering never re-opens the photograph.
+        # v3: the descriptor is a DCT hash rather than an 8x8 average hash. Same width and encoding,
+        # different measurement — so the version, not the format, is what supersedes v2 artifacts.
+        "3",
         frozenset({".jpg", ".jpeg", ".png", ".gif", ".webp", ".tiff", ".bmp"}),
         extract_image_metadata,
+        config_sections=frozenset({"images", "content_store"}),
     ),
-    analyserSpec(
+    AnalyserSpec(
         "media",
         "1",
         frozenset({".mp3", ".wav", ".flac", ".m4a", ".ogg", ".mp4", ".mov", ".mkv", ".avi"}),
@@ -56,8 +72,129 @@ REGISTRY = (
 )
 
 
-def specs() -> tuple[analyserSpec, ...]:
+#: Identity writes per transaction. Bounded so an interrupted run loses at most this much work.
+IDENTITY_BATCH_SIZE = 500
+#: Artifact writes per transaction — smaller, because each one cost a parser run.
+ARTIFACT_BATCH_SIZE = 50
+
+
+def specs() -> tuple[AnalyserSpec, ...]:
     return REGISTRY
+
+
+def spec_config_fingerprint(config: AppConfig, spec: AnalyserSpec) -> str:
+    """Fingerprint only the configuration ``spec`` can read.
+
+    Artifact reuse was keyed on the *entire* config, so changing ``dashboard.port`` invalidated
+    every artifact in the inventory and forced a full corpus re-parse. A cache that invalidates on
+    changes which cannot affect the result is indistinguishable from no cache. (Existing artifacts
+    carry the old whole-config fingerprint, so the first run after this change re-analyses once.)
+    """
+    payload = {name: config.section(name) for name in sorted(spec.config_sections)}
+    return hashlib.sha256(json.dumps(payload, sort_keys=True, default=str).encode()).hexdigest()
+
+
+def _work_plan(
+    spec: AnalyserSpec,
+    fingerprint: str,
+    changed_only: bool,
+    scope: AnalyserScope,
+    pending_only: bool = True,
+    maximum_size: int | None = None,
+) -> tuple[str, tuple]:
+    """The content objects this analyser still owes an artifact for — one query for the stage.
+
+    Everything that used to be a question asked once per object per spec is a predicate here: the
+    suffix filter, the changed-only filter, the whole of ``scope``, and above all the "is this
+    artifact already current" anti-join, which on an all-cache-hit rerun was one query per object
+    purely to discover there was nothing to do.
+
+    ``pending_only=False`` drops the anti-join, so the same shape counts what was *eligible* and
+    the difference reports how much was skipped.
+
+    **The scope belongs here, not in a Python filter after the fact.** This query used to select
+    non-aggregated entry columns under ``GROUP BY co.id``, so SQLite picked an arbitrary row from
+    whichever snapshot it liked, and the caller then discarded objects whose representative did not
+    match the requested run. After a rescan that silently skipped work the analyser genuinely owed:
+    the content object was still present, still unanalysed, and reachable from a current entry —
+    but the row the planner happened to hand back came from the old snapshot. The membership test
+    is now an ``EXISTS`` over the scope, and the representative is chosen deterministically.
+    """
+    clauses = [
+        "l.link_status='VERIFIED'",
+        "e.entry_type='file'",
+        "e.absolute_path NOT LIKE '%/.housekeeper/%'",
+    ]
+    params: list[object] = []
+    if spec.suffixes:
+        clauses.append("e.suffix IN (" + ",".join("?" for _ in spec.suffixes) + ")")
+        params.extend(sorted(spec.suffixes))
+    if maximum_size is not None:
+        # scanner.max_file_size_for_content_analysis: a ceiling on what a parser is handed, so one
+        # enormous file cannot dominate a stage. Identity (hashing) is unaffected — every file is
+        # still inventoried and still gets a digest.
+        clauses.append("co.size_bytes<=?")
+        params.append(maximum_size)
+    if changed_only:
+        clauses.append(
+            "EXISTS(SELECT 1 FROM scan_entry_changes ch WHERE ch.entry_id=e.id AND ch.change_status<>'UNCHANGED')"
+        )
+    # Every scope facet — run ids, source, subtree, size, mime, classification, uniqueness — as one
+    # EXISTS the planner resolves through the composite indexes, rather than a Python predicate run
+    # against rows already fetched.
+    scope_sql, scope_params = scope.entry_id_sql()
+    clauses.append(f"e.id IN ({scope_sql})")
+    params.extend(scope_params)
+    if pending_only:
+        clauses.append(
+            """NOT EXISTS(SELECT 1 FROM analysis_artifacts a WHERE a.content_object_id=co.id
+               AND a.analyser_name=? AND a.analyser_version=? AND a.configuration_fingerprint=?
+               AND a.status='COMPLETED')"""
+        )
+        params.extend((spec.name, spec.version, fingerprint))
+    # Every in-scope readable path for the object, in one column. A content object can have several,
+    # and a parser error on one is retried through the next, so the stage needs the list — but it
+    # used to fetch it with a query *per pending object*, which is the N+1 the single work plan was
+    # supposed to remove. json_array encodes paths containing newlines correctly; group_concat
+    # would not.
+    return (
+        """SELECT co.id,co.full_hash,co.size_bytes,
+             json_group_array(json_array(e.id,e.absolute_path)) AS representatives_json
+           FROM content_objects co JOIN entry_content_links l ON l.content_object_id=co.id
+           JOIN filesystem_entries e ON e.id=l.entry_id
+           WHERE """
+        + " AND ".join(clauses)
+        + " GROUP BY co.id ORDER BY co.id",
+        tuple(params),
+    )
+
+
+#: Below this the elapsed time is dominated by pool startup rather than by the storage, so the
+#: quotient says nothing about the drive and is not recorded.
+THROUGHPUT_SAMPLE_MINIMUM_BYTES = 32 * 1024 * 1024
+
+
+def _record_identity_throughput(database: Database, hashed_bytes: int, seconds: float) -> None:
+    """Attribute this stage's hashing throughput to the source roots it read from.
+
+    Attributed per source root because that is what the observation is *about* — two drives in one
+    workspace have different speeds, and a single number for the workspace would average an SSD with
+    a network share into a profile that is wrong for both.
+    """
+    if hashed_bytes < THROUGHPUT_SAMPLE_MINIMUM_BYTES or seconds <= 0:
+        return
+    rate = hashed_bytes / seconds
+    for row in database.fetch_all(
+        """SELECT DISTINCT r.source_root_fingerprint AS fingerprint
+           FROM scan_runs r JOIN source_roots s ON s.source_fingerprint=r.source_root_fingerprint
+           WHERE s.latest_complete_scan_run_id=r.id"""
+    ):
+        database.record_hash_throughput(str(row["fingerprint"]), rate)
+
+
+def _count(reader, sql: str, params: tuple) -> int:
+    row = reader.fetch_one(f"SELECT COUNT(*) AS n FROM ({sql})", params)
+    return int(row["n"]) if row else 0
 
 
 def _store_text(database: Database, content_id: int, text: str, config: AppConfig) -> int | None:
@@ -71,6 +208,9 @@ def _store_text(database: Database, content_id: int, text: str, config: AppConfi
         compression = "gzip"
     digest = hashlib.sha256(raw).hexdigest()
     cur = database.connect()
+    # No commit: this runs once per parsed document, and committing here made the artifact batch
+    # size a fiction — a 50-artifact batch became 50 transactions as soon as the documents analyser
+    # produced text. The enclosing loop owns the transaction boundary.
     cur.execute(
         "INSERT OR IGNORE INTO content_text_blobs(content_object_id,text_kind,compression,character_count,text_hash,data) VALUES(?,?,?,?,?,?)",
         (content_id, "normalized", compression, len(text), digest, data),
@@ -79,7 +219,6 @@ def _store_text(database: Database, content_id: int, text: str, config: AppConfi
         "SELECT id FROM content_text_blobs WHERE content_object_id=? AND text_kind=? AND text_hash=?",
         (content_id, "normalized", digest),
     ).fetchone()
-    cur.commit()
     return int(row[0]) if row else None
 
 
@@ -99,20 +238,8 @@ def _run_content_analysis(
     database: Database,
     config: AppConfig,
     analyser_name: str | None = None,
-    under: str | None = None,
+    scope: AnalyserScope | None = None,
     changed_only: bool = False,
-    source_id: int | None = None,
-    extensions: set[str] | None = None,
-    size_min: int | None = None,
-    size_max: int | None = None,
-    older_than: str | None = None,
-    newer_than: str | None = None,
-    classification: str | None = None,
-    content_object_ids: set[int] | None = None,
-    scan_run_id: int | None = None,
-    detected_mime: str | None = None,
-    only_unique: bool = False,
-    only_duplicate_candidates: bool = False,
     job_id: int | None = None,
 ) -> dict[str, int]:
     """analyse each eligible content object once and make parser failures explicit."""
@@ -121,77 +248,46 @@ def _run_content_analysis(
     # Establish content identity before parser selection.  An all-analysis pass therefore
     # covers every regular file, while a narrow analyser only hashes its eligible suffixes.
     suffixes = set().union(*(spec.suffixes for spec in wanted)) if wanted else set()
-    source_path = None
-    if source_id is not None:
-        source = database.fetch_one(
-            "SELECT last_mount_path FROM source_roots WHERE id=?", (source_id,)
-        )
-        if not source:
-            raise ValueError(f"unknown source id {source_id}")
-        source_path = str(source["last_mount_path"])
-    normalized_extensions = {
-        value if value.startswith(".") else f".{value}" for value in (extensions or set())
-    }
-    older_timestamp = datetime.fromisoformat(older_than).timestamp() if older_than else None
-    newer_timestamp = datetime.fromisoformat(newer_than).timestamp() if newer_than else None
+    # One scope object, used as a SQL predicate everywhere below. This stage used to take thirteen
+    # loose filter arguments and apply them twice — once as loose SQL, once as a Python `in_scope`
+    # re-check on rows already fetched — and the two disagreed. With no explicit run the SQL half
+    # saw all history while the Python half compared against the requested run, so a rescan made
+    # the stage skip work it genuinely owed, silently. There is now one representation of scope,
+    # it defaults to the current inventory, and it is resolved by the database.
+    scope = resolve_scope(database, scope)
+    if scope.source_id is not None and not database.fetch_one(
+        "SELECT 1 FROM source_roots WHERE id=?", (scope.source_id,)
+    ):
+        raise ValueError(f"unknown source id {scope.source_id}")
 
-    def in_scope(entry: Any, content_id: int | None = None) -> bool:
-        if source_id is not None and entry["source_root_id"] != source_id:
-            return False
-        if scan_run_id is not None and entry["scan_run_id"] != scan_run_id:
-            return False
-        if detected_mime and entry["detected_mime"] != detected_mime:
-            return False
-        if source_path and not str(entry["absolute_path"]).startswith(source_path):
-            return False
-        if (
-            normalized_extensions
-            and str(entry["suffix"] or "").lower() not in normalized_extensions
-        ):
-            return False
-        if size_min is not None and int(entry["size_bytes"] or 0) < size_min:
-            return False
-        if size_max is not None and int(entry["size_bytes"] or 0) > size_max:
-            return False
-        if older_timestamp is not None and (
-            entry["modified_at"] is None or float(entry["modified_at"]) >= older_timestamp
-        ):
-            return False
-        if newer_timestamp is not None and (
-            entry["modified_at"] is None or float(entry["modified_at"]) <= newer_timestamp
-        ):
-            return False
-        if classification and entry["classification"] != classification:
-            return False
-        return not content_object_ids or content_id in content_object_ids
-
-    candidates = database.iter_rows(
-        "SELECT e.id,e.scan_run_id,e.source_root_id,e.absolute_path,e.suffix,e.size_bytes,e.modified_at,c.classification,s.detected_mime FROM filesystem_entries e LEFT JOIN entry_content_links l ON l.entry_id=e.id LEFT JOIN classifications c ON c.entry_id=e.id LEFT JOIN file_signatures s ON s.entry_id=e.id WHERE e.entry_type='file' AND l.entry_id IS NULL ORDER BY e.id"
+    entry_sql, entry_params = scope.entry_id_sql()
+    candidates = database.reader().iter_rows(
+        f"""SELECT e.id,e.scan_run_id,e.absolute_path,e.suffix FROM filesystem_entries e
+            LEFT JOIN entry_content_links l ON l.entry_id=e.id
+            WHERE e.entry_type='file' AND l.entry_id IS NULL AND e.id IN ({entry_sql})
+            ORDER BY e.id""",
+        entry_params,
     )
     eligible = (
         dict(entry)
         for entry in candidates
-        if (analyser_name in (None, "all") or entry["suffix"] in suffixes) and in_scope(entry)
+        if analyser_name in (None, "all") or entry["suffix"] in suffixes
     )
+
+    hashing = config.section("hashing")
 
     def hash_entry(entry: dict[str, Any]):
         try:
-            target = Path(entry["absolute_path"])
-            quick = compute_quick_hash(
-                target,
-                config.section("hashing")["quick_hash_chunk_bytes"],
-                config.section("hashing")["quick_hash_middle_samples"],
-                config.section("hashing")["algorithm"],
+            # One pass over the file for both digests. Two calls here meant every newly identified
+            # file was read twice, and the quick digest's bytes are a subset of the full digest's.
+            full, quick = compute_identity(
+                Path(entry["absolute_path"]),
+                hashing["algorithm"],
+                hashing["full_hash_block_bytes"],
+                hashing["quick_hash_chunk_bytes"],
+                hashing["quick_hash_middle_samples"],
             )
-            return (
-                entry,
-                quick,
-                compute_full_hash(
-                    target,
-                    config.section("hashing")["algorithm"],
-                    config.section("hashing")["full_hash_block_bytes"],
-                ),
-            )
+            return entry, quick, full
         except OSError:
             return entry, None, None
 
@@ -199,6 +295,11 @@ def _run_content_analysis(
     queue_size = min(
         1_000, max(1, int(config.section("performance")["database_writer_queue_size"]))
     )
+    # Throughput of this stage, recorded per source root so `storage_profile: auto` can prefer a
+    # measurement over a path guess on the next run. Wall clock is only meaningful over enough bytes
+    # to swamp process startup, so it is applied at the end and only if the sample is big enough.
+    identity_started = time.perf_counter()
+    hashed_bytes = 0
     for entry, quick, hashed in bounded_map(
         hash_entry, eligible, int(profile["full_hash_workers"]), queue_size
     ):
@@ -228,100 +329,93 @@ def _run_content_analysis(
                     "OK",
                 ),
             )
-            database.connect().commit()
             counts["hashed"] += 1
+            hashed_bytes += int(hashed.size or 0)
+            # One commit per batch, not per file. The per-spec sweep below reads the work plan on
+            # an independent read-only connection, so identity must be committed before it starts —
+            # and the loop's own progress must survive an interruption.
+            if counts["hashed"] % IDENTITY_BATCH_SIZE == 0:
+                database.connect().commit()
         except OSError:
             counts["errors"] += 1
-    for spec in wanted:
-        rows = database.iter_rows(
-            """SELECT co.id,co.full_hash,co.size_bytes,e.id AS entry_id,e.scan_run_id,e.source_root_id,e.absolute_path,e.suffix,e.modified_at,c.classification,s.detected_mime,
-            (SELECT COUNT(*) FROM entry_content_links links WHERE links.content_object_id=co.id AND links.link_status='VERIFIED') AS occurrence_count
-            FROM content_objects co JOIN entry_content_links l ON l.content_object_id=co.id
-            JOIN filesystem_entries e ON e.id=l.entry_id LEFT JOIN classifications c ON c.entry_id=e.id LEFT JOIN file_signatures s ON s.entry_id=e.id WHERE l.link_status='VERIFIED' AND e.entry_type='file'
-            AND e.absolute_path NOT LIKE ? GROUP BY co.id ORDER BY co.id""",
-            ("%/.housekeeper/%",),
-        )
-        for row in rows:
-            if job_id:
-                check_cancelled(database, job_id)
-            if spec.suffixes and row["suffix"] not in spec.suffixes:
-                continue
-            if not in_scope(row, int(row["id"])):
-                continue
-            if only_unique and row["occurrence_count"] != 1:
-                continue
-            if only_duplicate_candidates and row["occurrence_count"] < 2:
-                continue
-            if under and not str(row["absolute_path"]).startswith(str(Path(under).resolve())):
-                continue
-            if changed_only and not database.fetch_one(
-                "SELECT 1 FROM scan_entry_changes WHERE entry_id=? AND change_status NOT IN ('UNCHANGED') ORDER BY id DESC LIMIT 1",
-                (row["entry_id"],),
-            ):
-                counts["skipped"] += 1
-                continue
-            fingerprint = config_fingerprint(config)
-            if not database.fetch_one(
-                "SELECT 1 FROM entry_content_links WHERE content_object_id=? AND link_status='VERIFIED'",
-                (row["id"],),
-            ):
-                hashed_existing = compute_full_hash(
-                    Path(row["absolute_path"]),
-                    config.section("hashing")["algorithm"],
-                    config.section("hashing")["full_hash_block_bytes"],
-                )
-                if not hashed_existing.stable or not hashed_existing.digest:
-                    counts["errors"] += 1
-                    continue
-                content_id = database.get_or_create_content_object(
-                    config.section("hashing")["algorithm"],
-                    hashed_existing.digest,
-                    hashed_existing.size,
-                )
-                entry_match = database.fetch_one(
-                    "SELECT id FROM filesystem_entries WHERE absolute_path=? ORDER BY id DESC LIMIT 1",
-                    (row["absolute_path"],),
-                )
-                if entry_match:
-                    database.link_entry_content(entry_match["id"], content_id, "")
-                    row = database.fetch_one(  # type: ignore[assignment]
-                        "SELECT co.id,co.full_hash,co.size_bytes,e.id AS entry_id,e.absolute_path,e.suffix FROM content_objects co JOIN entry_content_links l ON l.content_object_id=co.id JOIN filesystem_entries e ON e.id=l.entry_id WHERE co.id=? LIMIT 1",
-                        (content_id,),
+    _record_identity_throughput(database, hashed_bytes, time.perf_counter() - identity_started)
+    database.connect().commit()
+    # One pool for the whole stage. Workers persist across parses, so the 8–11 ms of process
+    # creation that used to precede every single parse is paid once per worker instead.
+    parsers = ParserPool(
+        config,
+        worker_count(config),
+        int(config.section("performance")["parser_memory_limit_mb"]),
+    )
+    artifacts_since_commit = 0
+    try:
+        for spec in wanted:
+            # Hoisted out of the per-row loop below, where it re-hashed the whole configuration once
+            # per content object (~188 s per million objects, for a value that cannot change mid-run).
+            fingerprint = spec_config_fingerprint(config, spec)
+            maximum_size = int(config.section("scanner")["max_file_size_for_content_analysis"])
+            plan_sql, plan_params = _work_plan(
+                spec, fingerprint, changed_only, scope, maximum_size=maximum_size
+            )
+            # Objects whose artifact is already current never reach the loop now, so the skipped total
+            # and the cache-hit counters come from two COUNTs rather than a query per object.
+            reader = database.reader()
+            pending = _count(reader, plan_sql, plan_params)
+            eligible_total = _count(
+                reader,
+                *_work_plan(
+                    spec,
+                    fingerprint,
+                    changed_only,
+                    scope,
+                    pending_only=False,
+                    maximum_size=maximum_size,
+                ),
+            )
+            counts["skipped"] += max(0, eligible_total - pending)
+            counters.count("artifact_cache_hits", max(0, eligible_total - pending))
+            counters.count("artifact_cache_misses", pending)
+            timeout = min(
+                spec.timeout_seconds,
+                int(config.section("performance")["parser_timeout_seconds"]),
+            )
+
+            def eligible_work(plan_sql=plan_sql, plan_params=plan_params):
+                """The work plan, streamed, with each object's representatives already decoded.
+
+                Read it on an independent read-only connection: the loop writes artifacts on the
+                writer connection while this cursor is still streaming. Everything the parser
+                threads touch is plain data — no SQLite connection crosses a thread, and no row is
+                re-filtered here, because the plan already resolved the whole scope in SQL.
+                """
+                for row in database.reader().iter_rows(plan_sql, plan_params):
+                    if job_id:
+                        check_cancelled(database, job_id)
+                    representatives = sorted(
+                        (int(entry_id), str(path))
+                        for entry_id, path in json.loads(row["representatives_json"])
                     )
-                    if not row:
-                        continue
-            if database.is_analysis_current(row["id"], spec.name, spec.version, fingerprint):
-                counts["skipped"] += 1
-                continue
-            try:
-                # A content object can have several readable paths.  Retry a parser error
-                # through another linked entry before recording a content-level failure.
-                representatives = database.iter_rows(
-                    """SELECT e.id,e.absolute_path FROM entry_content_links l JOIN filesystem_entries e ON e.id=l.entry_id
-                       WHERE l.content_object_id=? AND l.link_status='VERIFIED' AND e.entry_type='file' ORDER BY e.id""",
-                    (row["id"],),
-                )
+                    yield row, representatives
+
+            def parse_one(item, spec=spec, timeout=timeout):
+                """One content object, start to finish, on a submitter thread. Touches no database.
+
+                A content object can have several readable paths, and a parser error on one is
+                retried through the next before a content-level failure is recorded — so the unit
+                of concurrency is the object, not the path, and that fallback order is preserved.
+                """
+                row, representatives = item
                 result: dict[str, Any] | None = None
                 representative_id: int | None = None
+                representative_path: str | None = None
                 last_error: str | None = None
-                for representative in representatives:
+                for entry_id, absolute_path in representatives:
                     try:
-                        candidate = run_parser_isolated(
-                            lambda: spec.runner(Path(representative["absolute_path"]), config),
-                            min(
-                                spec.timeout_seconds,
-                                int(config.section("performance")["parser_timeout_seconds"]),
-                            ),
-                            int(config.section("performance")["parser_memory_limit_mb"]),
-                        )
-                    except (
-                        Exception
-                    ) as exc:  # isolated below as an artifact, never a recommendation
+                        candidate = parsers.run(spec.name, absolute_path, timeout)
+                    except Exception as exc:  # noqa: BLE001 - recorded as an artifact, never a recommendation
                         last_error = str(exc)
                         continue
-                    state = candidate.get(
-                        "analysis_status", candidate.get("extraction_status", "OK")
-                    )
+                    state = candidate.get("analysis_status", candidate.get("extraction_status", "OK"))
                     if state == "ERROR":
                         last_error = str(
                             candidate.get("analysis_error")
@@ -329,72 +423,99 @@ def _run_content_analysis(
                             or "parser error"
                         )
                         continue
-                    result, representative_id = candidate, int(representative["id"])
+                    result, representative_id, representative_path = candidate, entry_id, absolute_path
                     break
                 if result is None:
                     result = {
                         "analysis_status": "ERROR",
                         "analysis_error": last_error or "no readable representative",
                     }
-                result["representative_entry_id"] = representative_id
-                if spec.name == "images" and representative_id is not None:
-                    thumbnail = create_thumbnail(
-                        Path(str(row["absolute_path"])), int(row["id"]), config
-                    )
-                    if thumbnail:
-                        result["thumbnail_path"] = thumbnail
-                status = (
-                    "COMPLETED"
-                    if result.get("analysis_status", result.get("extraction_status", "OK"))
-                    not in {"ERROR", "UNSUPPORTED"}
-                    else result.get("analysis_status", result.get("extraction_status"))
-                )
-                text_id = None
-                if spec.name == "documents" and result.get("normalized_text"):
-                    text_id = _store_text(database, row["id"], result["normalized_text"], config)
-                database.connect().execute(
-                    """INSERT OR REPLACE INTO analysis_artifacts(content_object_id,analyser_name,analyser_version,configuration_fingerprint,status,started_at,completed_at,artifact_json,text_blob_id,error_code,error_message)
-                    VALUES(?,?,?,?,?,CURRENT_TIMESTAMP,CURRENT_TIMESTAMP,?,?,?,?)""",
-                    (
-                        row["id"],
-                        spec.name,
-                        spec.version,
-                        fingerprint,
-                        status,
-                        json.dumps(result, sort_keys=True),
-                        text_id,
-                        None if status == "COMPLETED" else status,
-                        result.get("analysis_error") or result.get("extraction_error"),
-                    ),
-                )
-                database.connect().commit()
-                counts["completed" if status == "COMPLETED" else "errors"] += 1
+                    representative_path = representatives[0][1] if representatives else None
+                return row, result, representative_id, representative_path
+
+            # `parser_workers` now sizes the work in flight, not just the pool. A pool of N is
+            # worth N only if N parses are outstanding; submitted one at a time it was worth one.
+            # Every database write stays on this thread, in completion order.
+            for row, result, representative_id, representative_path in bounded_map(
+                parse_one, eligible_work(), parsers.workers, parsers.workers * 4
+            ):
                 if job_id:
-                    update_job(
-                        database,
-                        job_id,
-                        "RUNNING",
-                        processed_count=counts["completed"] + counts["skipped"] + counts["errors"],
-                        success_count=counts["completed"],
-                        skip_count=counts["skipped"],
-                        error_count=counts["errors"],
-                        current_item=str(row["absolute_path"]),
+                    check_cancelled(database, job_id)
+                try:
+                    result["representative_entry_id"] = representative_id
+                    if spec.name == "images" and representative_path is not None:
+                        # The path that actually parsed, not an arbitrary sibling: a thumbnail is
+                        # only meaningful for the copy the metadata came from.
+                        thumbnail = create_thumbnail(
+                            Path(representative_path), int(row["id"]), config
+                        )
+                        if thumbnail:
+                            result["thumbnail_path"] = thumbnail
+                    status = (
+                        "COMPLETED"
+                        if result.get("analysis_status", result.get("extraction_status", "OK"))
+                        not in {"ERROR", "UNSUPPORTED"}
+                        else result.get("analysis_status", result.get("extraction_status"))
                     )
-            except Exception as exc:  # parser errors are protected artifacts, never recommendations
-                database.connect().execute(
-                    "INSERT OR REPLACE INTO analysis_artifacts(content_object_id,analyser_name,analyser_version,configuration_fingerprint,status,completed_at,error_code,error_message) VALUES(?,?,?,?,?,CURRENT_TIMESTAMP,?,?)",
-                    (
-                        row["id"],
-                        spec.name,
-                        spec.version,
-                        fingerprint,
-                        "ERROR",
-                        "analyseR_EXCEPTION",
-                        str(exc),
-                    ),
-                )
-                database.connect().commit()
-                counts["errors"] += 1
+                    text_id = None
+                    if spec.name == "documents" and result.get("normalized_text"):
+                        text_id = _store_text(database, row["id"], result["normalized_text"], config)
+                    database.connect().execute(
+                        """INSERT OR REPLACE INTO analysis_artifacts(content_object_id,analyser_name,analyser_version,configuration_fingerprint,status,started_at,completed_at,artifact_json,text_blob_id,error_code,error_message)
+                        VALUES(?,?,?,?,?,CURRENT_TIMESTAMP,CURRENT_TIMESTAMP,?,?,?,?)""",
+                        (
+                            row["id"],
+                            spec.name,
+                            spec.version,
+                            fingerprint,
+                            status,
+                            json.dumps(result, sort_keys=True),
+                            text_id,
+                            None if status == "COMPLETED" else status,
+                            result.get("analysis_error") or result.get("extraction_error"),
+                        ),
+                    )
+                    counts["completed" if status == "COMPLETED" else "errors"] += 1
+                    # Count every durable outcome, not only successful ones. With an error-only
+                    # corpus `completed` stays zero, and `0 % batch_size == 0` used to commit every
+                    # artifact — exactly the fsync amplification batching exists to prevent.
+                    artifacts_since_commit += 1
+                    if artifacts_since_commit >= ARTIFACT_BATCH_SIZE:
+                        database.connect().commit()
+                        artifacts_since_commit = 0
+                    if job_id:
+                        update_job(
+                            database,
+                            job_id,
+                            processed_count=counts["completed"] + counts["skipped"] + counts["errors"],
+                            success_count=counts["completed"],
+                            skip_count=counts["skipped"],
+                            error_count=counts["errors"],
+                            current_item=representative_path or "",
+                        )
+                except Exception as exc:  # noqa: BLE001 - parser errors are protected artifacts
+                    database.connect().execute(
+                        "INSERT OR REPLACE INTO analysis_artifacts(content_object_id,analyser_name,analyser_version,configuration_fingerprint,status,completed_at,error_code,error_message) VALUES(?,?,?,?,?,CURRENT_TIMESTAMP,?,?)",
+                        (
+                            row["id"],
+                            spec.name,
+                            spec.version,
+                            fingerprint,
+                            "ERROR",
+                            "ANALYSER_EXCEPTION",
+                            str(exc),
+                        ),
+                    )
+                    counts["errors"] += 1
+                    # Exceptional post-processing is still an analysis outcome and follows the
+                    # same transaction policy as COMPLETED/ERROR/UNSUPPORTED parser results.
+                    artifacts_since_commit += 1
+                    if artifacts_since_commit >= ARTIFACT_BATCH_SIZE:
+                        database.connect().commit()
+                        artifacts_since_commit = 0
+        database.connect().commit()
+    finally:
+        parsers.close()
     return counts
 
 
@@ -402,20 +523,8 @@ def run_content_analysis(
     database: Database,
     config: AppConfig,
     analyser_name: str | None = None,
-    under: str | None = None,
+    scope: AnalyserScope | None = None,
     changed_only: bool = False,
-    source_id: int | None = None,
-    extensions: set[str] | None = None,
-    size_min: int | None = None,
-    size_max: int | None = None,
-    older_than: str | None = None,
-    newer_than: str | None = None,
-    classification: str | None = None,
-    content_object_ids: set[int] | None = None,
-    scan_run_id: int | None = None,
-    detected_mime: str | None = None,
-    only_unique: bool = False,
-    only_duplicate_candidates: bool = False,
     job_id: int | None = None,
 ) -> dict[str, int]:
     job_types = {
@@ -429,9 +538,9 @@ def run_content_analysis(
         job_types.get(analyser_name or "", "CONTENT_ANALYSIS"),
         {
             "analyser": analyser_name or "all",
-            "under": under,
+            "under": scope.under if scope else None,
             "changed_only": changed_only,
-            "source_id": source_id,
+            "source_id": scope.source_id if scope else None,
         },
         config_fingerprint(config),
         worker_count=int(performance_profile(config)["full_hash_workers"]),
@@ -440,24 +549,7 @@ def run_content_analysis(
         update_job(database, managed_job_id, "RUNNING")
     try:
         counts = _run_content_analysis(
-            database,
-            config,
-            analyser_name,
-            under,
-            changed_only,
-            source_id,
-            extensions,
-            size_min,
-            size_max,
-            older_than,
-            newer_than,
-            classification,
-            content_object_ids,
-            scan_run_id,
-            detected_mime,
-            only_unique,
-            only_duplicate_candidates,
-            managed_job_id,
+            database, config, analyser_name, scope, changed_only, managed_job_id
         )
     except (JobCancelled, JobPaused):
         raise

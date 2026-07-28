@@ -9,6 +9,7 @@ class Metric:
     value: int
     kind: str = "count"
     href: str | None = None
+    description: str = ""
 
 
 @dataclass(frozen=True)

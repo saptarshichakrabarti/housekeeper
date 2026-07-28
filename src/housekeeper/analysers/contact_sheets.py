@@ -18,11 +18,12 @@ reports unavailable and produces nothing (never an error).
 
 from __future__ import annotations
 
+import hashlib
 import json
 from pathlib import Path
 
-from ..jobs import check_cancelled, update_job
-from .scope import analyserScope, scoped_entry_ids
+from ..jobs import check_cancelled, checkpoint
+from .scope import AnalyserScope, resolve_scope
 
 _BACKGROUND = (245, 245, 245)
 _PADDING = 6
@@ -34,6 +35,32 @@ def contact_sheet_dir(config) -> Path:
 
 def contact_sheet_path(config, group_id: int) -> Path:
     return contact_sheet_dir(config) / f"group_{group_id}.jpg"
+
+
+def _input_key(member_ids: list[int], thumbnails: list[str], columns: int, cell_pixels: int) -> str:
+    """Everything the rendered sheet depends on. Same key ⇒ same bytes, so skip the render."""
+    stamps = [(t, Path(t).stat().st_mtime_ns, Path(t).stat().st_size) for t in thumbnails]
+    payload = json.dumps([member_ids, stamps, columns, cell_pixels], sort_keys=True)
+    return hashlib.sha256(payload.encode()).hexdigest()
+
+
+def _stored_key(database, group_id: int) -> str | None:
+    row = database.fetch_one(
+        "SELECT input_key FROM contact_sheet_renders WHERE group_id=?", (group_id,)
+    )
+    return str(row["input_key"]) if row else None
+
+
+def _record_key(database, group_id: int, key: str) -> None:
+    database.connect().execute(
+        "INSERT INTO contact_sheet_renders(group_id,input_key,rendered_at) VALUES(?,?,CURRENT_TIMESTAMP) "
+        "ON CONFLICT(group_id) DO UPDATE SET input_key=excluded.input_key,rendered_at=CURRENT_TIMESTAMP",
+        (group_id, key),
+    )
+
+
+def _forget_key(database, group_id: int) -> None:
+    database.connect().execute("DELETE FROM contact_sheet_renders WHERE group_id=?", (group_id,))
 
 
 def _pillow_available() -> bool:
@@ -72,7 +99,7 @@ def generate_contact_sheet(
             opened = Image.open(thumbnail)
             opened.load()  # force decode now so a corrupt thumbnail fails here, isolated per file
             usable.append(opened.convert("RGB"))
-        except Exception:  # noqa: BLE001 - a bad thumbnail is skipped, never fatal
+        except Exception:  # noqa: BLE001,S112 - a bad thumbnail is skipped, never fatal
             continue
     if len(usable) < 2:
         for member in usable:
@@ -100,7 +127,7 @@ def generate_contact_sheet(
 
 
 def run_contact_sheet_generation(
-    database, config, scope: analyserScope | None = None, job_id: int | None = None
+    database, config, scope: AnalyserScope | None = None, job_id: int | None = None
 ) -> dict:
     section = config.section("images")
     if not section.get("create_contact_sheets", True):
@@ -115,60 +142,52 @@ def run_contact_sheet_generation(
     cell_pixels = int(section.get("contact_sheet_cell_pixels", 160))
     max_members = int(section.get("contact_sheet_max_members", 36))
 
-    allowed_content: set[int] | None = None
-    if scope:
-        entry_ids = scoped_entry_ids(database, scope)
-        allowed_content = set()
-        if entry_ids:
-            placeholders = ",".join("?" for _ in entry_ids)
-            allowed_content = {
-                int(row["content_object_id"])
-                for row in database.fetch_all(
-                    "SELECT DISTINCT content_object_id FROM entry_content_links "
-                    "WHERE entry_id IN (" + placeholders + ")",
-                    tuple(sorted(entry_ids)),
-                )
-            }
+    content_sql, content_params = resolve_scope(database, scope).content_object_id_sql()
 
     groups = database.fetch_all(
         "SELECT id FROM relationship_groups WHERE group_type='IMAGE_SIMILARITY' ORDER BY id"
     )
     sheets_written = 0
+    sheets_reused = 0
     truncated_groups = 0
     skipped_groups = 0
+    # Reuse keys used to be `group_<id>.key` sidecars beside each sheet. They are rows now, so the
+    # key is cascaded away when its group is replaced — a sidecar outliving its group authorised
+    # reusing a sheet for a different set of members. Old sidecars are removed as they are found.
+    for stale in contact_sheet_dir(config).glob("group_*.key"):
+        stale.unlink(missing_ok=True)
     for index, group in enumerate(groups, start=1):
         if job_id:
             check_cancelled(database, job_id)
         group_id = int(group["id"])
         members = database.fetch_all(
             "SELECT content_object_id FROM relationship_group_members "
-            "WHERE group_id=? ORDER BY content_object_id",
-            (group_id,),
+            f"WHERE group_id=? AND content_object_id IN ({content_sql}) ORDER BY content_object_id",
+            (group_id, *content_params),
         )
         member_ids = [int(row["content_object_id"]) for row in members]
-        if allowed_content is not None:
-            member_ids = [cid for cid in member_ids if cid in allowed_content]
         if len(member_ids) > max_members:
             truncated_groups += 1
             member_ids = member_ids[:max_members]  # deterministic: lowest content ids first
         thumbnails = [path for cid in member_ids if (path := _thumbnail_path(database, cid))]
         output_path = contact_sheet_path(config, group_id)
-        if generate_contact_sheet(thumbnails, output_path, columns, cell_pixels):
+        # The sheet is a pure function of its inputs, so unchanged membership and unchanged
+        # thumbnails mean the render would reproduce the file already on disk.
+        key = _input_key(member_ids, thumbnails, columns, cell_pixels)
+        if output_path.is_file() and _stored_key(database, group_id) == key:
+            sheets_reused += 1
+        elif generate_contact_sheet(thumbnails, output_path, columns, cell_pixels):
+            _record_key(database, group_id, key)
             sheets_written += 1
         else:
+            _forget_key(database, group_id)
             skipped_groups += 1
-        if job_id:
-            update_job(
-                database,
-                job_id,
-                "RUNNING",
-                processed_count=index,
-                checkpoint={"last_group_id": group_id},
-            )
+        checkpoint(database, job_id, processed_count=index, state={"last_group_id": group_id})
     return {
         "status": "ok",
         "groups": len(groups),
         "sheets_written": sheets_written,
+        "sheets_reused": sheets_reused,
         "skipped_groups": skipped_groups,
         "truncated_groups": truncated_groups,
     }

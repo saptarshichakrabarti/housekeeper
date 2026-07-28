@@ -1,6 +1,7 @@
 import argparse
 import time
 from pathlib import Path
+
 from housekeeper.database import Database
 
 parser = argparse.ArgumentParser()

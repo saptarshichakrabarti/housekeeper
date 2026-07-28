@@ -2,9 +2,11 @@ import json
 import os
 import platform
 import signal
-from contextlib import contextmanager
+import time
 from collections.abc import Iterator
+from contextlib import contextmanager
 from typing import Any
+
 from .database import Database
 
 
@@ -100,7 +102,12 @@ def update_job(
         updates.append("started_at=COALESCE(started_at,CURRENT_TIMESTAMP)")
     values.append(job_id)
     database.connect().execute(f"UPDATE jobs SET {','.join(updates)} WHERE id=?", tuple(values))
-    database.connect().commit()
+    # A state transition is control-plane information another process acts on — a dashboard
+    # showing the job, the reaper deciding it is orphaned — so it is committed at once. A pure
+    # progress update is not: it rides the enclosing batch and becomes visible at the next commit,
+    # which is what turned a million-entry stage into a million fsync-bounded transactions.
+    if status is not None:
+        database.connect().commit()
 
 
 def request_cancel(database: Database, job_id: int) -> None:
@@ -156,11 +163,40 @@ def pause_requested(database: Database, job_id: int) -> bool:
     return bool(row and row["status"] in {"PAUSING", "PAUSED"})
 
 
+# Cancellation is a human-scale event: polling faster than this buys nothing and costs a query.
+CANCELLATION_POLL_SECONDS = 0.25
+# One slot, because checks are hot-looped for a single job at a time. If two jobs interleave the
+# slot just flips and both poll every call — slower, never wrong. Keyed by database as well as job
+# id: job ids restart at 1 in every new workspace, and the two are not the same job.
+_last_poll: tuple[object, float] = (None, 0.0)
+
+# How often a progress-only update is made visible to other processes. Progress is telemetry, not
+# state: publishing it costs a transaction, and nobody reads a bar faster than this.
+PROGRESS_COMMIT_SECONDS = 0.25
+_last_progress_commit = 0.0
+
+
 def check_cancelled(database: Database, job_id: int) -> None:
-    if pause_requested(database, job_id):
+    """Honour a pending pause/cancel request. Called per entry, so it must stay nearly free.
+
+    It used to issue up to four statements *per entry* — two SELECTs plus, on the settle path, an
+    UPDATE — which on a million-entry scan is millions of queries asking a question whose answer
+    changes at most once. Now it is one SELECT, and only when at least
+    ``CANCELLATION_POLL_SECONDS`` have passed since the last one for this job.
+    """
+    global _last_poll
+    key = (str(database.path), job_id)
+    last_key, last_time = _last_poll
+    now = time.monotonic()
+    if last_key == key and now - last_time < CANCELLATION_POLL_SECONDS:
+        return
+    _last_poll = (key, now)
+    row = database.fetch_one("SELECT status FROM jobs WHERE id=?", (job_id,))
+    status = row["status"] if row else None
+    if status in {"PAUSING", "PAUSED"}:
         update_job(database, job_id, "PAUSED")
         raise JobPaused(f"job {job_id} paused")
-    if cancellation_requested(database, job_id):
+    if status in {"CANCELLING", "CANCELLED"}:
         update_job(database, job_id, "CANCELLED")
         raise JobCancelled(f"job {job_id} cancelled")
 
@@ -180,18 +216,27 @@ def checkpoint(
     idempotent re-run rather than seek-to-offset, so the recorded ``state`` is progress telemetry,
     not a mandatory resume cursor.
     """
+    global _last_progress_commit
     if job_id is None:
         return
     check_cancelled(database, job_id)
-    if processed_count is not None or current_item is not None or state is not None:
-        update_job(
-            database,
-            job_id,
-            "RUNNING",
-            processed_count=processed_count,
-            current_item=current_item,
-            checkpoint=state,
-        )
+    if processed_count is None and current_item is None and state is None:
+        return
+    # No status: this is progress, not a transition, so the UPDATE does not commit on its own.
+    update_job(
+        database,
+        job_id,
+        processed_count=processed_count,
+        current_item=current_item,
+        checkpoint=state,
+    )
+    # Publish it at a human-visible cadence rather than per row. Some analysers checkpoint once per
+    # candidate pair, which at inventory scale is hundreds of thousands of transactions to move a
+    # progress bar nobody can read that fast.
+    now = time.monotonic()
+    if now - _last_progress_commit >= PROGRESS_COMMIT_SECONDS:
+        _last_progress_commit = now
+        database.connect().commit()
 
 
 @contextmanager
@@ -204,7 +249,15 @@ def tracked_job(
     parent_job_id: int | None = None,
     existing_job_id: int | None = None,
 ) -> Iterator[int]:
-    """Durably track an operation and turn Ctrl-C into a recoverable cancellation request."""
+    """Durably track an operation and turn Ctrl-C into a recoverable cancellation request.
+
+    This is the stage boundary, so it is also the transaction boundary: the write primitives no
+    longer commit per row, and whatever the stage left uncommitted is committed here on success and
+    rolled back on failure. The cached graph projections a relationship-writing stage invalidated
+    are cleared once, here, instead of once per relationship.
+    """
+    from .relationships import invalidate_graph_cache
+
     job_id = existing_job_id or create_job(
         database,
         job_type,
@@ -224,16 +277,25 @@ def tracked_job(
         if signal.getsignal(signal.SIGINT) is not None and threading_main_thread():
             previous_handler = signal.signal(signal.SIGINT, interrupt_handler)
         yield job_id
+        database.connect().commit()
+        invalidate_graph_cache(database)
         check_cancelled(database, job_id)
     except JobPaused:
-        # The checkpoint and partial transactions are already durable; keep the
+        # A pause stops at a checkpoint, so the work up to it is real: commit it and keep the
         # terminal state resumable instead of converting a pause into a failure.
+        database.connect().commit()
         update_job(database, job_id, "PAUSED")
         raise
     except JobCancelled:
+        # Likewise cancellation — it is cooperative and lands on a checkpoint, so the completed
+        # portion stays durable. Resume is idempotent re-run, never seek-to-offset.
+        database.connect().commit()
         update_job(database, job_id, "CANCELLED")
         raise
     except BaseException:
+        # The stage owns the transaction, so a failed stage leaves nothing half-written. The job
+        # row itself is written afterwards, on its own, so the failure is still recorded.
+        database.connect().rollback()
         update_job(database, job_id, "FAILED")
         raise
     else:

@@ -1,5 +1,6 @@
 import argparse
 from pathlib import Path
+
 from housekeeper.database import Database
 from housekeeper.graph.builder import build_projection
 

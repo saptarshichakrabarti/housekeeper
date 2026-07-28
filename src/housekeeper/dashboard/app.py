@@ -1,14 +1,14 @@
 """Local, bounded dashboard.  It can record review decisions but never moves data."""
 
-from html import escape
 import hashlib
 import json
-from pathlib import Path
 import secrets
+from html import escape
+from pathlib import Path
 from typing import Annotated
 from urllib.parse import urlencode
 
-from ..config import AppConfig
+from ..config import DEFAULTS, AppConfig
 from ..core.progress import eta_seconds, format_duration, seconds_since, throughput
 
 
@@ -19,21 +19,33 @@ def create_app(
     config: AppConfig | None = None,
 ):
     try:
-        from fastapi import FastAPI, Form, Header, HTTPException, Path as ApiPath, Query
+        from fastapi import FastAPI, Form, Header, HTTPException, Query
+        from fastapi import Path as ApiPath
         from fastapi.responses import FileResponse, HTMLResponse
         from fastapi.staticfiles import StaticFiles
     except ImportError as exc:
         raise RuntimeError(
             "Install the dashboard extra: pip install 'drive-housekeeper[dashboard]'"
         ) from exc
+    from jinja2 import Environment, FileSystemLoader, select_autoescape
+    from markupsafe import Markup
+
     from ..graph.builder import build_projection
     from ..review.decisions import record_decision
     from .filters import ReviewFilter, filesizeformat, relativetime, thousands
     from .services import DashboardService
-    from jinja2 import Environment, FileSystemLoader, select_autoescape
-    from markupsafe import Markup
 
     csrf_token = secrets.token_urlsafe(24)
+    # dashboard.page_size / maximum_page_size were duplicated as literals in every endpoint's
+    # Query(...) default, so editing them did nothing. Resolved once, here, where the endpoints are
+    # defined. CSRF validation below is unconditional and has no switch.
+    dashboard = config.section("dashboard") if config else DEFAULTS["dashboard"]
+    page_size = int(dashboard["page_size"])
+    maximum_page_size = int(dashboard["maximum_page_size"])
+    graph_settings = config.section("graph") if config else DEFAULTS["graph"]
+    hard_nodes = int(graph_settings["hard_max_nodes"])
+    hard_edges = int(graph_settings["hard_max_edges"])
+
     static_dir = Path(__file__).with_name("static")
     templates = Environment(
         loader=FileSystemLoader(Path(__file__).with_name("templates")),
@@ -70,7 +82,7 @@ def create_app(
             from ..jobs import reconcile_stale_jobs
 
             reconcile_stale_jobs(database)
-        except Exception:  # noqa: BLE001 - reconciliation is best-effort housekeeping
+        except Exception:  # noqa: BLE001,S110 - reconciliation is best-effort housekeeping
             pass
 
     # Reap jobs stranded by a previous process (a killed CLI run, a restarted dashboard) up front,
@@ -199,7 +211,7 @@ def create_app(
         body = "".join(
             "<tr>"
             + "".join(
-                f"<td>{display_cell(h, row[h] if h in row.keys() else None)}</td>"
+                f"<td>{display_cell(h, row[h] if h in row.keys() else None)}</td>"  # noqa: SIM118 - Row keys, not values
                 for h in headings
             )
             + "</tr>"
@@ -334,8 +346,8 @@ def create_app(
     def decision_manifest_records(session_id: int) -> list[dict[str, object]]:
         rows = reader.fetch_all(
             """SELECT e.id,e.absolute_path,e.relative_path,e.size_bytes,c.classification,c.confidence,c.reason_codes_json,c.explanation,s.full_hash,d.decision,d.stale
-               FROM review_decisions d JOIN filesystem_entries e ON d.target_type='ENTRY' AND d.target_id=e.id
-               LEFT JOIN classifications c ON c.entry_id=e.id LEFT JOIN file_signatures s ON s.entry_id=e.id
+               FROM review_decisions d JOIN current_entries e ON d.target_type='ENTRY' AND d.target_id=e.id
+               LEFT JOIN current_classifications c ON c.entry_id=e.id LEFT JOIN file_signatures s ON s.entry_id=e.id
                WHERE d.review_session_id=? AND d.current=1 ORDER BY e.relative_path""",
             (session_id,),
         )
@@ -388,7 +400,7 @@ def create_app(
             params.append(int(stale))
         params.append(limit)
         return reader.fetch_all(
-            f"SELECT e.id,e.name,e.relative_path,e.size_bytes,e.modified_at,c.classification,c.confidence FROM filesystem_entries e LEFT JOIN classifications c ON c.entry_id=e.id WHERE {where} ORDER BY e.id LIMIT ?",
+            f"SELECT e.id,e.name,e.relative_path,e.size_bytes,e.modified_at,c.classification,c.confidence FROM current_entries e LEFT JOIN classifications c ON c.entry_id=e.id WHERE {where} ORDER BY e.id LIMIT ?",
             tuple(params),
         )
 
@@ -432,7 +444,7 @@ def create_app(
 
     @app.get("/review", response_class=HTMLResponse)
     def review(
-        limit: int = Query(100, ge=1, le=500),
+        limit: int = Query(page_size, ge=1, le=maximum_page_size),
         after_id: int = Query(0, ge=0),
         classification: str | None = None,
         extension: str | None = None,
@@ -516,13 +528,13 @@ def create_app(
         classifications = [
             str(row["classification"])
             for row in reader.fetch_all(
-                "SELECT DISTINCT classification FROM classifications WHERE classification IS NOT NULL ORDER BY classification"
+                "SELECT DISTINCT classification FROM current_classifications WHERE classification IS NOT NULL ORDER BY classification"
             )
         ]
         top_level_directories = [
             str(row["top_level"])
             for row in reader.fetch_all(
-                "SELECT DISTINCT CASE WHEN instr(relative_path,'/')=0 THEN relative_path ELSE substr(relative_path,1,instr(relative_path,'/')-1) END top_level FROM filesystem_entries WHERE entry_type='file' ORDER BY top_level LIMIT 500"
+                "SELECT DISTINCT CASE WHEN instr(relative_path,'/')=0 THEN relative_path ELSE substr(relative_path,1,instr(relative_path,'/')-1) END top_level FROM current_entries WHERE entry_type='file' ORDER BY top_level LIMIT 500"
             )
         ]
         return template_page(
@@ -548,7 +560,7 @@ def create_app(
 
     @app.get("/fragments/review", response_class=HTMLResponse)
     def review_fragment(
-        limit: int = Query(100, ge=1, le=500),
+        limit: int = Query(page_size, ge=1, le=maximum_page_size),
         after_id: int = Query(0, ge=0),
         classification: str | None = None,
         extension: str | None = None,
@@ -632,7 +644,7 @@ def create_app(
         body = ""
         for row in rows:
             cells = "".join(
-                f"<td>{display_cell(h, row[h] if h in row.keys() else None)}</td>"
+                f"<td>{display_cell(h, row[h] if h in row.keys() else None)}</td>"  # noqa: SIM118 - Row keys, not values
                 for h in headings
             )
             body += f"<tr>{cells}<td><a href='{href_prefix}/{int(row[id_key])}'>open</a></td></tr>"
@@ -661,7 +673,7 @@ def create_app(
 
     @app.get("/duplicates", response_class=HTMLResponse)
     def duplicates(
-        limit: int = Query(100, ge=1, le=500), sort: str = Query("reclaimable")
+        limit: int = Query(page_size, ge=1, le=maximum_page_size), sort: str = Query("reclaimable")
     ):
         order_by = {
             "reclaimable": "reclaimable_bytes DESC,g.id",
@@ -673,12 +685,12 @@ def create_app(
         rows = reader.fetch_all(
             f"""SELECT g.id,g.full_hash,g.member_count,g.size_bytes,
                        g.size_bytes*(g.member_count-1) reclaimable_bytes,g.canonical_entry_id,
-                       (SELECT rg.id FROM exact_duplicate_members dm
+                       (SELECT rg.id FROM current_exact_duplicate_members dm
                         JOIN entry_content_links ecl ON ecl.entry_id=dm.entry_id
-                        JOIN relationship_group_members rgm ON rgm.content_object_id=ecl.content_object_id
-                        JOIN relationship_groups rg ON rg.id=rgm.group_id AND rg.group_type='IMAGE_SIMILARITY'
+                        JOIN current_relationship_group_members rgm ON rgm.content_object_id=ecl.content_object_id
+                        JOIN current_relationship_groups rg ON rg.id=rgm.group_id AND rg.group_type='IMAGE_SIMILARITY'
                         WHERE dm.group_id=g.id ORDER BY rg.id LIMIT 1) image_group_id
-                FROM exact_duplicate_groups g ORDER BY {order_by[sort]} LIMIT ?""",
+                FROM current_exact_duplicate_groups g ORDER BY {order_by[sort]} LIMIT ?""",
             (limit,),
         )
         groups = []
@@ -700,13 +712,19 @@ def create_app(
 
     @app.get("/fragments/duplicates/{group_id}", response_class=HTMLResponse)
     def duplicate_detail_fragment(group_id: Annotated[int, ApiPath(ge=1)]):
-        group = reader.fetch_one("SELECT * FROM exact_duplicate_groups WHERE id=?", (group_id,))
+        group = reader.fetch_one(
+            "SELECT * FROM current_exact_duplicate_groups WHERE id=?", (group_id,)
+        )
         if not group:
             raise HTTPException(404, "duplicate group not found")
         members = reader.fetch_all(
-            """SELECT e.relative_path,e.modified_at,m.is_canonical,m.readable
-               FROM exact_duplicate_members m JOIN filesystem_entries e ON e.id=m.entry_id
-               WHERE m.group_id=? ORDER BY m.is_canonical DESC,e.relative_path""",
+            """SELECT e.relative_path,e.modified_at,
+                      CASE WHEN m.entry_id=g.canonical_entry_id THEN 1 ELSE 0 END is_canonical,
+                      m.readable
+               FROM current_exact_duplicate_members m
+               JOIN current_exact_duplicate_groups g ON g.id=m.group_id
+               JOIN current_entries e ON e.id=m.entry_id
+               WHERE m.group_id=? ORDER BY is_canonical DESC,e.relative_path""",
             (group_id,),
         )
         return HTMLResponse(
@@ -716,30 +734,30 @@ def create_app(
         )
 
     @app.get("/advanced-duplicates", response_class=HTMLResponse)
-    def advanced_duplicates(limit: int = Query(100, ge=1, le=500)):
+    def advanced_duplicates(limit: int = Query(page_size, ge=1, le=maximum_page_size)):
         return explorer(
             "advanced-duplicates",
             "Advanced duplicate explorer (tiered relationships)",
-            "SELECT relationship_type,evidence_tier,source_id,target_id,round(confidence,3) confidence,explanation FROM content_relationships WHERE status='ACTIVE' ORDER BY evidence_tier,id LIMIT ?",
+            "SELECT relationship_type,evidence_tier,source_id,target_id,round(confidence,3) confidence,explanation FROM current_content_relationships WHERE status='ACTIVE' ORDER BY evidence_tier,id LIMIT ?",
             ["relationship_type", "evidence_tier", "source_id", "target_id", "confidence", "explanation"],
             limit,
         )
 
     @app.get("/chunk-overlap", response_class=HTMLResponse)
-    def chunk_overlap(limit: int = Query(100, ge=1, le=500)):
+    def chunk_overlap(limit: int = Query(page_size, ge=1, le=maximum_page_size)):
         return explorer(
             "chunk-overlap",
             "Partial-content overlap explorer",
-            "SELECT content_object_a_id,content_object_b_id,shared_chunk_bytes,round(overlap_a_in_b,3) overlap_a_in_b,round(overlap_b_in_a,3) overlap_b_in_a,round(weighted_jaccard,3) weighted_jaccard FROM content_overlap_results ORDER BY shared_chunk_bytes DESC LIMIT ?",
+            "SELECT content_object_a_id,content_object_b_id,shared_chunk_bytes,round(overlap_a_in_b,3) overlap_a_in_b,round(overlap_b_in_a,3) overlap_b_in_a,round(weighted_jaccard,3) weighted_jaccard FROM current_content_overlap_results ORDER BY shared_chunk_bytes DESC LIMIT ?",
             ["content_object_a_id", "content_object_b_id", "shared_chunk_bytes", "overlap_a_in_b", "overlap_b_in_a", "weighted_jaccard"],
             limit,
         )
 
     @app.get("/derivations", response_class=HTMLResponse)
-    def derivations(limit: int = Query(100, ge=1, le=500)):
+    def derivations(limit: int = Query(page_size, ge=1, le=maximum_page_size)):
         rows = reader.fetch_all(
             "SELECT relationship_type,evidence_tier,source_id,target_id,round(confidence,3) confidence,explanation"
-            " FROM content_relationships WHERE status='ACTIVE' AND relationship_type LIKE 'LIKELY_%' ORDER BY id LIMIT ?",
+            " FROM current_content_relationships WHERE status='ACTIVE' AND relationship_type LIKE 'LIKELY_%' ORDER BY id LIMIT ?",
             (limit,),
         )
         table = linked_rows_table(
@@ -758,7 +776,7 @@ def create_app(
     def _representative_entry(content_object_id: int) -> dict | None:
         row = reader.fetch_one(
             "SELECT e.name,e.relative_path,e.modified_at FROM entry_content_links l "
-            "JOIN filesystem_entries e ON e.id=l.entry_id WHERE l.content_object_id=? ORDER BY e.id LIMIT 1",
+            "JOIN current_entries e ON e.id=l.entry_id WHERE l.content_object_id=? ORDER BY e.id LIMIT 1",
             (content_object_id,),
         )
         return dict(row) if row else None
@@ -766,7 +784,7 @@ def create_app(
     @app.get("/derivations/{content_object_id}", response_class=HTMLResponse)
     def derivation_timeline(content_object_id: Annotated[int, ApiPath(ge=1)]):
         relationships = reader.fetch_all(
-            "SELECT * FROM content_relationships WHERE status='ACTIVE' AND relationship_type LIKE 'LIKELY_%'"
+            "SELECT * FROM current_content_relationships WHERE status='ACTIVE' AND relationship_type LIKE 'LIKELY_%'"
             " AND source_type='CONTENT_OBJECT' AND (source_id=? OR target_id=?) ORDER BY id LIMIT 200",
             (content_object_id, content_object_id),
         )
@@ -799,37 +817,37 @@ def create_app(
         )
 
     @app.get("/events", response_class=HTMLResponse)
-    def events(limit: int = Query(100, ge=1, le=500)):
+    def events(limit: int = Query(page_size, ge=1, le=maximum_page_size)):
         return explorer(
             "events",
             "Event & collection explorer",
-            "SELECT id,cluster_type,name,round(confidence,3) confidence,summary_json FROM collection_clusters ORDER BY id DESC LIMIT ?",
+            "SELECT id,cluster_type,name,round(confidence,3) confidence,summary_json FROM current_collection_clusters ORDER BY id DESC LIMIT ?",
             ["id", "cluster_type", "name", "confidence", "summary_json"],
             limit,
         )
 
     @app.get("/record-series", response_class=HTMLResponse)
-    def record_series(limit: int = Query(100, ge=1, le=500)):
+    def record_series(limit: int = Query(page_size, ge=1, le=maximum_page_size)):
         return explorer(
             "record-series",
             "Record-series explorer",
-            "SELECT s.name,COUNT(a.id) assigned FROM record_series s LEFT JOIN record_series_assignments a ON a.series_id=s.id AND a.target_type='ENTRY' GROUP BY s.name ORDER BY assigned DESC LIMIT ?",
+            "SELECT s.name,COUNT(a.id) assigned FROM record_series s LEFT JOIN current_record_series_assignments a ON a.series_id=s.id AND a.target_type='ENTRY' GROUP BY s.name ORDER BY assigned DESC LIMIT ?",
             ["name", "assigned"],
             limit,
         )
 
     @app.get("/preservation", response_class=HTMLResponse)
-    def preservation(limit: int = Query(100, ge=1, le=500)):
+    def preservation(limit: int = Query(page_size, ge=1, le=maximum_page_size)):
         return explorer(
             "preservation",
             "Preservation queue (separate from clutter review)",
-            "SELECT target_id,recommended_action,format_risk,encryption_risk,integrity_risk,accessibility_risk FROM preservation_assessments ORDER BY id LIMIT ?",
+            "SELECT target_id,recommended_action,format_risk,encryption_risk,integrity_risk,accessibility_risk FROM current_preservation_assessments ORDER BY id LIMIT ?",
             ["target_id", "recommended_action", "format_risk", "encryption_risk", "integrity_risk", "accessibility_risk"],
             limit,
         )
 
     @app.get("/learning", response_class=HTMLResponse)
-    def learning(limit: int = Query(100, ge=1, le=500)):
+    def learning(limit: int = Query(page_size, ge=1, le=maximum_page_size)):
         return explorer(
             "learning",
             "Active-learning models (suggestions only; cannot approve movement)",
@@ -839,10 +857,10 @@ def create_app(
         )
 
     @app.get("/backups", response_class=HTMLResponse)
-    def backups(limit: int = Query(100, ge=1, le=500)):
+    def backups(limit: int = Query(page_size, ge=1, le=maximum_page_size)):
         rows = reader.fetch_all(
             "SELECT id,source_type,source_id,target_type,target_id,relationship_type,round(confidence,3) confidence"
-            " FROM relationships WHERE relationship_type LIKE '%BACKUP%' OR relationship_type='MOSTLY_CONTAINED_IN'"
+            " FROM current_relationships WHERE relationship_type LIKE '%BACKUP%' OR relationship_type='MOSTLY_CONTAINED_IN'"
             " ORDER BY confidence DESC,id LIMIT ?",
             (limit,),
         )
@@ -862,7 +880,7 @@ def create_app(
     @app.get("/backups/{relationship_id}", response_class=HTMLResponse)
     def backup_compare(relationship_id: Annotated[int, ApiPath(ge=1)]):
         relationship = reader.fetch_one(
-            "SELECT * FROM relationships WHERE id=? AND source_type='DIRECTORY' AND target_type='DIRECTORY'",
+            "SELECT * FROM current_relationships WHERE id=? AND source_type='DIRECTORY' AND target_type='DIRECTORY'",
             (relationship_id,),
         )
         if not relationship:
@@ -883,25 +901,25 @@ def create_app(
         )
 
     @app.get("/documents", response_class=HTMLResponse)
-    def documents(limit: int = Query(100, ge=1, le=500)):
+    def documents(limit: int = Query(page_size, ge=1, le=maximum_page_size)):
         return explorer(
             "documents",
             "Document-version explorer",
-            "SELECT content_object_id,analyser_version,status,completed_at,error_code FROM analysis_artifacts WHERE analyser_name='documents' ORDER BY completed_at DESC LIMIT ?",
+            "SELECT content_object_id,analyser_version,status,completed_at,error_code FROM current_analysis_artifacts WHERE analyser_name='documents' ORDER BY completed_at DESC LIMIT ?",
             ["content_object_id", "analyser_version", "status", "completed_at", "error_code"],
             limit,
         )
 
     @app.get("/images", response_class=HTMLResponse)
-    def images(limit: int = Query(100, ge=1, le=500)):
+    def images(limit: int = Query(page_size, ge=1, le=maximum_page_size)):
         groups = reader.fetch_all(
-            "SELECT g.id,g.group_key,COUNT(m.content_object_id) member_count FROM relationship_groups g"
-            " JOIN relationship_group_members m ON m.group_id=g.id"
+            "SELECT g.id,g.group_key,COUNT(m.content_object_id) member_count FROM current_relationship_groups g"
+            " JOIN current_relationship_group_members m ON m.group_id=g.id"
             " WHERE g.group_type='IMAGE_SIMILARITY' GROUP BY g.id ORDER BY member_count DESC,g.id LIMIT ?",
             (limit,),
         )
         artifacts = reader.fetch_all(
-            "SELECT content_object_id,analyser_version,status,completed_at,error_code FROM analysis_artifacts WHERE analyser_name='images' ORDER BY completed_at DESC LIMIT ?",
+            "SELECT content_object_id,analyser_version,status,completed_at,error_code FROM current_analysis_artifacts WHERE analyser_name='images' ORDER BY completed_at DESC LIMIT ?",
             (limit,),
         )
         groups_table = linked_rows_table(
@@ -930,7 +948,7 @@ def create_app(
     @app.get("/images/{group_id}", response_class=HTMLResponse)
     def image_group_detail(group_id: Annotated[int, ApiPath(ge=1)]):
         group = reader.fetch_one(
-            "SELECT id,group_key,evidence_json,created_at FROM relationship_groups"
+            "SELECT id,group_key,evidence_json,created_at FROM current_relationship_groups"
             " WHERE id=? AND group_type='IMAGE_SIMILARITY'",
             (group_id,),
         )
@@ -938,12 +956,12 @@ def create_app(
             raise HTTPException(404, "image similarity group not found")
         members = reader.fetch_all(
             """SELECT m.content_object_id,
-                      (SELECT e.relative_path FROM entry_content_links l JOIN filesystem_entries e ON e.id=l.entry_id
+                      (SELECT e.relative_path FROM entry_content_links l JOIN current_entries e ON e.id=l.entry_id
                        WHERE l.content_object_id=m.content_object_id ORDER BY e.id LIMIT 1) relative_path,
-                      (SELECT a.artifact_json FROM analysis_artifacts a
+                      (SELECT a.artifact_json FROM current_analysis_artifacts a
                        WHERE a.analyser_name='images' AND a.content_object_id=m.content_object_id
                        AND a.status='COMPLETED' LIMIT 1) artifact_json
-               FROM relationship_group_members m WHERE m.group_id=? ORDER BY m.content_object_id LIMIT 200""",
+               FROM current_relationship_group_members m WHERE m.group_id=? ORDER BY m.content_object_id LIMIT 200""",
             (group_id,),
         )
         detailed = []
@@ -969,17 +987,23 @@ def create_app(
 
     @app.get("/contact-sheets/{group_id}.jpg")
     def contact_sheet_image(group_id: Annotated[int, ApiPath(ge=1)]):
+        if not reader.fetch_one(
+            "SELECT 1 FROM current_relationship_groups "
+            "WHERE id=? AND group_type='IMAGE_SIMILARITY'",
+            (group_id,),
+        ):
+            raise HTTPException(404, "image similarity group not found")
         sheet = _contact_sheet_file(group_id)
         if sheet is None:
             raise HTTPException(404, "contact sheet not rendered")
         return FileResponse(sheet, media_type="image/jpeg")
 
     @app.get("/projects", response_class=HTMLResponse)
-    def projects(limit: int = Query(100, ge=1, le=500)):
+    def projects(limit: int = Query(page_size, ge=1, le=maximum_page_size)):
         return explorer(
             "projects",
             "Project explorer",
-            "SELECT id,name,kind,source_size_bytes,generated_size_bytes,environment_size_bytes,git_status FROM projects ORDER BY source_size_bytes DESC LIMIT ?",
+            "SELECT id,name,kind,source_size_bytes,generated_size_bytes,environment_size_bytes,git_status FROM current_projects ORDER BY source_size_bytes DESC LIMIT ?",
             [
                 "id",
                 "name",
@@ -993,7 +1017,7 @@ def create_app(
         )
 
     @app.get("/jobs", response_class=HTMLResponse)
-    def jobs(limit: int = Query(100, ge=1, le=500)):
+    def jobs(limit: int = Query(page_size, ge=1, le=maximum_page_size)):
         # When the runner is active (gui/app, not the read-only viewer) let users start work right
         # here: reuse the Run page's control panel (`#control-panel` + /fragments/control) above the
         # list. It shares the /control/* endpoints, so starting a job also fires HX-Trigger:
@@ -1024,7 +1048,7 @@ def create_app(
     ACTIVE_JOB_STATES = {"PENDING", "RUNNING", "PAUSING", "CANCELLING"}
 
     @app.get("/fragments/jobs", response_class=HTMLResponse)
-    def jobs_fragment(limit: int = Query(100, ge=1, le=500)):
+    def jobs_fragment(limit: int = Query(page_size, ge=1, le=maximum_page_size)):
         # The jobs fragment is polled by both the Jobs page and the overview, so it is the natural
         # heartbeat for reaping orphans: within one poll interval a dead worker's row turns honest.
         maybe_reconcile()
@@ -1076,8 +1100,9 @@ def create_app(
         return HTMLResponse(table.split("<tbody>", 1)[1].split("</tbody>", 1)[0])
 
     if runner is not None:
-        from .runner import analyse_KINDS, REPORT_KINDS
         from urllib.parse import quote
+
+        from .runner import REPORT_KINDS, analyse_KINDS
 
         @app.get("/fragments/folders", response_class=HTMLResponse)
         def folders_fragment(path: str | None = None):
@@ -1222,7 +1247,7 @@ def create_app(
         )
 
     @app.get("/manifests", response_class=HTMLResponse)
-    def manifests(limit: int = Query(100, ge=1, le=500)):
+    def manifests(limit: int = Query(page_size, ge=1, le=maximum_page_size)):
         return explorer(
             "manifests",
             "Manifest center",
@@ -1232,10 +1257,10 @@ def create_app(
         )
 
     @app.get("/search", response_class=HTMLResponse)
-    def search(q: str = Query(..., min_length=1, max_length=500), limit: int = Query(100, ge=1, le=500)):
+    def search(q: str = Query(..., min_length=1, max_length=500), limit: int = Query(page_size, ge=1, le=maximum_page_size)):
         escaped_prefix = q.replace("\\", "\\\\").replace("%", "\\%").replace("_", "\\_")
         rows = reader.fetch_all(
-            "SELECT id,name,relative_path,size_bytes,modified_at FROM filesystem_entries "
+            "SELECT id,name,relative_path,size_bytes,modified_at FROM current_entries "
             "WHERE relative_path LIKE ? ESCAPE '\\' OR name LIKE ? ESCAPE '\\' "
             "ORDER BY relative_path LIMIT ?",
             (f"{escaped_prefix}%", f"{escaped_prefix}%", limit),
@@ -1255,11 +1280,11 @@ def create_app(
     def api_overview():
         with database.read_connection() as conn:
             return {
-                "entries": conn.execute("SELECT COUNT(*) n FROM filesystem_entries").fetchone()[
+                "entries": conn.execute("SELECT COUNT(*) n FROM current_entries").fetchone()[
                     "n"
                 ],
                 "content_objects": conn.execute(
-                    "SELECT COUNT(*) n FROM content_objects"
+                    "SELECT COUNT(*) n FROM current_content_objects"
                 ).fetchone()["n"],
                 "jobs": conn.execute(
                     "SELECT COUNT(*) n FROM jobs WHERE status IN ('PENDING','RUNNING','PAUSED','CANCELLING')"
@@ -1268,7 +1293,7 @@ def create_app(
 
     @app.get("/api/review")
     def api_review(
-        limit: int = Query(100, ge=1, le=500),
+        limit: int = Query(page_size, ge=1, le=maximum_page_size),
         after_id: int = Query(0, ge=0),
         classification: str | None = None,
         extension: str | None = None,
@@ -1359,28 +1384,36 @@ def create_app(
         }
 
     @app.get("/api/duplicates")
-    def api_duplicates(limit: int = Query(100, ge=1, le=500), after_id: int = Query(0, ge=0)):
+    def api_duplicates(limit: int = Query(page_size, ge=1, le=maximum_page_size), after_id: int = Query(0, ge=0)):
         return [
             dict(row)
             for row in reader.fetch_all(
-                "SELECT id,full_hash,member_count,size_bytes,canonical_entry_id FROM exact_duplicate_groups WHERE id>? ORDER BY id LIMIT ?",
+                "SELECT id,full_hash,member_count,size_bytes,canonical_entry_id FROM current_exact_duplicate_groups WHERE id>? ORDER BY id LIMIT ?",
                 (after_id, limit),
             )
         ]
 
     @app.get("/api/duplicates/{group_id}")
     def duplicate_detail(group_id: Annotated[int, ApiPath(ge=1)]):
-        group = reader.fetch_one("SELECT * FROM exact_duplicate_groups WHERE id=?", (group_id,))
+        group = reader.fetch_one(
+            "SELECT * FROM current_exact_duplicate_groups WHERE id=?", (group_id,)
+        )
         if not group:
             raise HTTPException(404, "duplicate group not found")
         members = reader.fetch_all(
-            "SELECT e.id,e.name,e.relative_path,e.absolute_path,e.modified_at,m.is_canonical,m.readable FROM exact_duplicate_members m JOIN filesystem_entries e ON e.id=m.entry_id WHERE m.group_id=? ORDER BY m.is_canonical DESC,e.relative_path",
+            """SELECT e.id,e.name,e.relative_path,e.absolute_path,e.modified_at,
+                      CASE WHEN m.entry_id=g.canonical_entry_id THEN 1 ELSE 0 END is_canonical,
+                      m.readable
+               FROM current_exact_duplicate_members m
+               JOIN current_exact_duplicate_groups g ON g.id=m.group_id
+               JOIN current_entries e ON e.id=m.entry_id
+               WHERE m.group_id=? ORDER BY is_canonical DESC,e.relative_path""",
             (group_id,),
         )
         return {"group": dict(group), "members": [dict(member) for member in members]}
 
     @app.get("/api/jobs")
-    def api_jobs(limit: int = Query(100, ge=1, le=500)):
+    def api_jobs(limit: int = Query(page_size, ge=1, le=maximum_page_size)):
         return [
             dict(row)
             for row in reader.fetch_all(
@@ -1431,6 +1464,7 @@ def create_app(
     ):
         guard(x_csrf_token)
         from fastapi.responses import Response
+
         from ..review.decisions import export_snapshot, validate_session
 
         errors = validate_session(database, session_id)
@@ -1465,9 +1499,9 @@ def create_app(
         root_type: str | None = None,
         root_id: int | None = Query(None, ge=1),
         depth: int = Query(1, ge=1, le=5),
-        max_nodes: int = Query(500, ge=1, le=5000),
-        max_edges: int = Query(2000, ge=1, le=20000),
-        minimum_confidence: float = Query(0.7, ge=0, le=1),
+        max_nodes: int | None = Query(None, ge=1, le=hard_nodes),
+        max_edges: int | None = Query(None, ge=1, le=hard_edges),
+        minimum_confidence: float | None = Query(None, ge=0, le=1),
         aggregation_level: str = "auto",
         include_types: tuple[str, ...] = Query(()),
         exclude_types: tuple[str, ...] = Query(()),
@@ -1485,6 +1519,7 @@ def create_app(
                 aggregation_level,
                 include_types,
                 exclude_types,
+                config,
             )
         except ValueError as exc:
             raise HTTPException(422, str(exc)) from exc

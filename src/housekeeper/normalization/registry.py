@@ -3,8 +3,8 @@
 from __future__ import annotations
 
 import json
+from collections.abc import Callable
 from pathlib import Path
-from typing import Callable
 
 from .archives import ARCHIVE_CONTENT_PROFILE, normalize_archive_content
 from .audio import AUDIO_PAYLOAD_PROFILE, normalize_audio
@@ -43,22 +43,30 @@ ALL_PROFILES = (
 )
 
 
-def normalizers_for(suffix: str) -> list[tuple[NormalizationProfile, Normalizer]]:
-    s = suffix.lower()
-    result: list[tuple[NormalizationProfile, Normalizer]] = []
-    if s in _IMAGE_SUFFIXES:
-        result.append((IMAGE_PIXEL_PROFILE, normalize_image))
-    if s in _OFFICE_SUFFIXES:
-        result.append((OFFICE_PACKAGE_PROFILE, normalize_office))
-    if s in _ARCHIVE_SUFFIXES:
-        result.append((ARCHIVE_CONTENT_PROFILE, normalize_archive_content))
-    if s in _PDF_SUFFIXES:
-        result.append((PDF_TEXT_PROFILE, normalize_pdf))
-    if s in _AUDIO_SUFFIXES:
-        result.append((AUDIO_PAYLOAD_PROFILE, normalize_audio))
-    if s in _TABULAR_SUFFIXES:
-        result.append((TABULAR_PROFILE, normalize_tabular))
-    return result
+#: Which suffixes each profile claims. Replaces the old suffix -> profiles lookup, which forced the
+#: caller to iterate objects; profile -> suffixes lets it ask "which objects does this profile still
+#: owe an artifact for" as one SQL anti-join per profile instead.
+PROFILE_SUFFIXES: dict[str, frozenset[str]] = {
+    IMAGE_PIXEL_PROFILE.name: frozenset(_IMAGE_SUFFIXES),
+    OFFICE_PACKAGE_PROFILE.name: frozenset(_OFFICE_SUFFIXES),
+    ARCHIVE_CONTENT_PROFILE.name: frozenset(_ARCHIVE_SUFFIXES),
+    PDF_TEXT_PROFILE.name: frozenset(_PDF_SUFFIXES),
+    AUDIO_PAYLOAD_PROFILE.name: frozenset(_AUDIO_SUFFIXES),
+    TABULAR_PROFILE.name: frozenset(_TABULAR_SUFFIXES),
+}
+
+_NORMALIZER_OF = {
+    IMAGE_PIXEL_PROFILE.name: normalize_image,
+    OFFICE_PACKAGE_PROFILE.name: normalize_office,
+    ARCHIVE_CONTENT_PROFILE.name: normalize_archive_content,
+    PDF_TEXT_PROFILE.name: normalize_pdf,
+    AUDIO_PAYLOAD_PROFILE.name: normalize_audio,
+    TABULAR_PROFILE.name: normalize_tabular,
+}
+
+
+def normalizer_for(profile: NormalizationProfile) -> Normalizer:
+    return _NORMALIZER_OF[profile.name]
 
 
 def supported_suffixes() -> set[str]:

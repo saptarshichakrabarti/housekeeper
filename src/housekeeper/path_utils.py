@@ -34,7 +34,31 @@ def is_same_filesystem_object(path_a: Path, path_b: Path) -> bool:
 
 
 def is_hidden_path(path: Path) -> bool:
+    """Hidden iff some component of *this* path starts with a dot.
+
+    Callers must pass the path **relative to the source root**. On an absolute path a single dotted
+    ancestor — ``/Volumes/.Backup``, ``~/.local/share`` — marks an entire drive hidden.
+    """
     return any(part.startswith(".") for part in path.parts if part not in (".", ".."))
+
+
+# The largest code point, so any string starting with ``prefix`` sorts before ``prefix + this``
+# under SQLite's default BINARY collation.
+_ABOVE_ALL_PATHS = "\U0010ffff"
+
+
+def descendant_path_range(prefix_path: str) -> tuple[str, str]:
+    """Half-open ``[low, high)`` bounds selecting everything beneath ``prefix_path``.
+
+    ``relative_path LIKE ? || '/%'`` cannot use an index on the path column, so a descendant sweep
+    degrades to a full table scan per directory — O(directories x entries). The equivalent explicit
+    range does use the index. It is also stricter: SQLite's ``LIKE`` is ASCII case-insensitive by
+    default, so the old predicate matched ``Photos/`` against ``photos/x`` as well.
+    """
+    if not prefix_path:
+        return "", _ABOVE_ALL_PATHS  # the source root itself: every entry is a descendant
+    prefix = prefix_path.rstrip("/") + "/"
+    return prefix, prefix + _ABOVE_ALL_PATHS
 
 
 def sanitize_report_filename(value: str) -> str:

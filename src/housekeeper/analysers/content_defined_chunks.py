@@ -32,17 +32,17 @@ def _representative_path(database, content_object_id: int) -> Path | None:
     return path if path.is_file() and not path.is_symlink() else None
 
 
-def _ensure_hashed_large_files(database, config, minimum_file: int, allowed_entries) -> None:
+def _ensure_hashed_large_files(database, config, minimum_file: int, scope) -> None:
     algorithm = config.section("hashing")["algorithm"]
     block = config.section("hashing")["full_hash_block_bytes"]
+    entry_sql, params = scope.entry_id_sql()
     for row in database.iter_rows(
-        """SELECT e.id,e.absolute_path,e.size_bytes FROM filesystem_entries e
+        f"""SELECT e.id,e.absolute_path,e.size_bytes FROM filesystem_entries e
            LEFT JOIN entry_content_links l ON l.entry_id=e.id
-           WHERE e.entry_type='file' AND l.entry_id IS NULL AND e.size_bytes>=?""",
-        (minimum_file,),
+           WHERE e.entry_type='file' AND l.entry_id IS NULL AND e.size_bytes>=?
+           AND e.id IN ({entry_sql})""",
+        (minimum_file, *params),
     ):
-        if allowed_entries is not None and int(row["id"]) not in allowed_entries:
-            continue
         path = Path(row["absolute_path"])
         if not path.is_file() or path.is_symlink():
             continue
@@ -58,25 +58,43 @@ def _ensure_hashed_large_files(database, config, minimum_file: int, allowed_entr
     database.connect().commit()
 
 
+def _index_bytes(database, profile_id: int) -> int:
+    """Bytes of source content the chunk index currently covers for this profile."""
+    row = database.fetch_one(
+        "SELECT COALESCE(SUM(size_bytes*occurrence_count),0) AS n FROM content_chunks "
+        "WHERE chunking_profile_id=?",
+        (profile_id,),
+    )
+    return int(row["n"]) if row else 0
+
+
 def run_chunk_analysis(database, config, scope=None, job_id=None) -> dict[str, int]:
-    from ..jobs import check_cancelled, update_job
+    from ..jobs import check_cancelled, checkpoint
 
     minimum_file = int(config.section("chunking")["minimum_file_size_bytes"])
     profile = profile_from_config(config)
     profile_id = get_or_create_chunk_profile_id(database, profile)
-    allowed_entries = None
-    if scope is not None:
-        from .scope import scoped_entry_ids
+    from .scope import resolve_scope
 
-        allowed_entries = scoped_entry_ids(database, scope)
-    _ensure_hashed_large_files(database, config, minimum_file, allowed_entries)
-    counts = {"chunked": 0, "chunks": 0, "skipped": 0}
+    scope = resolve_scope(database, scope)
+    _ensure_hashed_large_files(database, config, minimum_file, scope)
+    counts = {"chunked": 0, "chunks": 0, "skipped": 0, "index_full": 0}
+    # chunking.maximum_total_index_bytes was a stated cap on how large the chunk index may grow,
+    # enforced nowhere. Checked here, between objects, so a run stops at the bound instead of
+    # discovering it as a full disk.
+    maximum_index = int(config.section("chunking")["maximum_total_index_bytes"])
+    content_sql, content_params = scope.content_object_id_sql()
     objects = database.fetch_all(
-        "SELECT id FROM content_objects WHERE size_bytes>=? ORDER BY id", (minimum_file,)
+        f"SELECT id FROM content_objects WHERE size_bytes>=? AND id IN ({content_sql}) ORDER BY id",
+        (minimum_file, *content_params),
     )
     for index, obj in enumerate(objects, start=1):
         if job_id:
             check_cancelled(database, job_id)
+        if _index_bytes(database, profile_id) >= maximum_index:
+            counts["index_full"] = 1
+            counts["skipped"] += len(objects) - index + 1
+            break
         path = _representative_path(database, int(obj["id"]))
         if path is None:
             counts["skipped"] += 1
@@ -85,8 +103,7 @@ def run_chunk_analysis(database, config, scope=None, job_id=None) -> dict[str, i
         store_chunks(database, int(obj["id"]), profile_id, profile, records)
         counts["chunked"] += 1
         counts["chunks"] += len(records)
-        if job_id:
-            update_job(database, job_id, "RUNNING", processed_count=index)
+        checkpoint(database, job_id, processed_count=index)
     return counts
 
 

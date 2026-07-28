@@ -81,14 +81,21 @@ def run_record_series_analysis(database, config, scope=None, job_id=None) -> dic
     seed_default_series(database)
     series_ids = _series_ids(database)
     counts: dict[str, int] = {}
+    from ..analysers.scope import resolve_scope
+
+    entry_sql, params = resolve_scope(database, scope).entry_id_sql()
     conn = database.connect()
-    conn.execute("DELETE FROM record_series_assignments WHERE target_type='ENTRY'")
+    conn.execute(
+        f"DELETE FROM record_series_assignments WHERE target_type='ENTRY' AND target_id IN ({entry_sql})",
+        params,
+    )
     batch = []
-    processed = 0
-    for row in database.iter_rows(
-        "SELECT id,name,suffix,relative_path FROM filesystem_entries WHERE entry_type='file'"
-    ):
-        processed += 1
+    rows = database.iter_rows(
+        "SELECT id,name,suffix,relative_path FROM filesystem_entries "
+        f"WHERE entry_type='file' AND id IN ({entry_sql})",
+        params,
+    )
+    for processed, row in enumerate(rows, start=1):
         series, confidence = classify_series(
             row["name"], (row["suffix"] or "").lower(), row["relative_path"]
         )

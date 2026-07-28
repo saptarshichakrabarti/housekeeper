@@ -32,7 +32,6 @@ def _assign(database, group_type, group_id, role, entry_id, content_object_id, s
             json.dumps(components, sort_keys=True),
         ),
     )
-    database.connect().commit()
 
 
 def assign_location_roles(database) -> int:
@@ -124,10 +123,13 @@ def assign_image_metadata_roles(database) -> int:
 
 
 def assign_canonical_roles(database) -> dict[str, int]:
-    return {
+    counts = {
         "location": assign_location_roles(database),
         "image_metadata": assign_image_metadata_roles(database),
     }
+    # One commit for the stage; `_assign` used to commit per role assignment.
+    database.connect().commit()
+    return counts
 
 
 def roles_for_group(database, group_type: str, group_id: int):

@@ -9,10 +9,11 @@ concurrent CLI reader.
 from __future__ import annotations
 
 import threading
+from collections.abc import Callable
 from concurrent.futures import ThreadPoolExecutor
-from datetime import datetime, timezone
+from datetime import UTC, datetime
 from pathlib import Path
-from typing import Any, Callable
+from typing import Any
 
 from ..config import AppConfig, config_fingerprint
 from ..database import Database
@@ -42,7 +43,7 @@ REPORT_KINDS = (
 
 
 def _now_iso() -> str:
-    return datetime.now(timezone.utc).isoformat(timespec="seconds")
+    return datetime.now(UTC).isoformat(timespec="seconds")
 
 
 def _idle_status() -> dict[str, Any]:
@@ -142,16 +143,20 @@ class OperationRunner:
         from ..analysers.exact_duplicates import run_exact_duplicate_analysis
         from ..analysers.projects import run_project_analysis
         from ..analysers.registry import run_content_analysis
-        from ..analysers.scope import analyserScope
+        from ..analysers.scope import AnalyserScope
 
-        # Standalone analyse runs unscoped over all scan history; restrict it to the current
+        # Standalone analyse would otherwise run over all scan history; restrict it to the current
         # inventory so re-scanning the same drive never makes a unique file look duplicated.
-        inventory = analyserScope(current_inventory=True)
+        inventory = AnalyserScope.current(database)
 
         def content_analysis_step(name: str) -> Callable[[int], object]:
             # Named factory (rather than a lambda default-arg trick) so each closure captures its
             # own ``name`` instead of all sharing the loop variable's final value.
-            return lambda job: run_content_analysis(database, self._config, name, job_id=job)
+            # ``inventory`` was built two lines up and handed to every other stage; content
+            # analysis was the one that did not get it, and so ran over all scan history.
+            return lambda job: run_content_analysis(
+                database, self._config, name, inventory, job_id=job
+            )
 
         dispatch: dict[str, tuple[str, Callable[[int], object]]] = {
             "exact-duplicates": (

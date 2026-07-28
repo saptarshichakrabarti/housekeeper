@@ -78,7 +78,7 @@ def _ensure_document_objects(database, config) -> None:
 
 
 def run_document_minhash_analysis(database, config, scope=None, job_id=None) -> dict[str, int]:
-    from ..jobs import check_cancelled, update_job
+    from ..jobs import check_cancelled, checkpoint
 
     section = config.section("document_similarity")
     if not section.get("enabled", True):
@@ -91,28 +91,18 @@ def run_document_minhash_analysis(database, config, scope=None, job_id=None) -> 
     minimum_tokens = int(section.get("minimum_tokens", 20))
     fingerprint = _config_fingerprint(config)
 
-    allowed = None
-    if scope is not None:
-        from .scope import scoped_entry_ids
+    from .scope import resolve_scope
 
-        entry_ids = scoped_entry_ids(database, scope)
-        marks = ",".join("?" for _ in entry_ids) or "NULL"
-        allowed = {
-            int(r["content_object_id"])
-            for r in database.fetch_all(
-                f"SELECT DISTINCT content_object_id FROM entry_content_links WHERE entry_id IN ({marks})",
-                tuple(entry_ids),
-            )
-        } if entry_ids else set()
+    content_sql, content_params = resolve_scope(database, scope).content_object_id_sql()
 
     signatures: dict[int, list[int]] = {}
     shingle_sets: dict[int, set[str]] = {}
     counts = {"signatures": 0, "candidates": 0, "relationships": 0}
-    objects = database.fetch_all("SELECT id FROM content_objects ORDER BY id")
+    objects = database.fetch_all(
+        f"SELECT id FROM content_objects WHERE id IN ({content_sql}) ORDER BY id", content_params
+    )
     for index, obj in enumerate(objects, start=1):
         cid = int(obj["id"])
-        if allowed is not None and cid not in allowed:
-            continue
         if job_id:
             check_cancelled(database, job_id)
         text = _document_text(database, config, cid)
@@ -133,8 +123,7 @@ def run_document_minhash_analysis(database, config, scope=None, job_id=None) -> 
             (cid, "TEXT_MINHASH", SIGNATURE_VERSION, fingerprint, json.dumps(signature), len(shingles)),
         )
         counts["signatures"] += 1
-        if job_id:
-            update_job(database, job_id, "RUNNING", processed_count=index)
+        checkpoint(database, job_id, processed_count=index)
     database.connect().commit()
 
     for a_id, b_id in sorted(candidate_pairs(signatures, num_perm, lsh_threshold)):

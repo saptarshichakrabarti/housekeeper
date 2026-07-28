@@ -1,5 +1,31 @@
 import json
 
+# Cached graph projections are keyed by projection parameters, not by the data, so a relationship
+# write has to invalidate them. Doing that inline meant a relationship-heavy stage issued
+# `DELETE FROM graph_layout_cache` — and a commit — hundreds of thousands of times. Writers now
+# just set this flag; the cache is cleared once, by whoever finishes the stage or reads the graph.
+_graph_cache_stale = False
+
+
+def mark_graph_cache_stale() -> None:
+    global _graph_cache_stale
+    _graph_cache_stale = True
+
+
+def invalidate_graph_cache(database) -> bool:
+    """Clear cached graph projections if any relationship changed since the last clear.
+
+    Called at the end of every tracked stage and before a projection is served, so no reader can
+    see a projection that predates a write, however the writer was invoked.
+    """
+    global _graph_cache_stale
+    if not _graph_cache_stale:
+        return False
+    database.connect().execute("DELETE FROM graph_layout_cache")
+    database.connect().commit()
+    _graph_cache_stale = False
+    return True
+
 
 def replace_relationship_group(
     database,
@@ -30,8 +56,7 @@ def replace_relationship_group(
         "INSERT INTO relationship_group_members(group_id,content_object_id) VALUES(?,?)",
         [(group_id, value) for value in sorted(set(content_object_ids))],
     )
-    conn.execute("DELETE FROM graph_layout_cache")
-    conn.commit()
+    mark_graph_cache_stale()
     return group_id
 
 
@@ -68,8 +93,7 @@ def upsert_relationship(
         "SELECT id FROM relationships WHERE source_type=? AND source_id=? AND target_type=? AND target_id=? AND relationship_type=? AND relationship_version=?",
         (source_type, source_id, target_type, target_id, relationship_type, version),
     ).fetchone()
-    conn.execute("DELETE FROM graph_layout_cache")
-    conn.commit()
+    mark_graph_cache_stale()
     return int(row[0])
 
 
@@ -136,7 +160,6 @@ def upsert_content_relationship(
             configuration_fingerprint,
         ),
     ).fetchone()
-    conn.commit()
     assert row is not None
     return int(row[0])
 
@@ -150,13 +173,21 @@ def invalidate_content_relationships(
            WHERE algorithm=? AND (algorithm_version<>? OR configuration_fingerprint<>?) AND status='ACTIVE'""",
         (algorithm, algorithm_version, configuration_fingerprint),
     )
-    database.connect().commit()
     return cur.rowcount
 
 
 def invalidate_relationships(
-    database, relationship_type: str | None = None, version: str | None = None
+    database,
+    relationship_type: str | None = None,
+    version: str | None = None,
+    except_version: str | None = None,
 ) -> int:
+    """Delete relationships an analyser no longer stands behind.
+
+    ``version`` names a generation to remove; ``except_version`` removes everything *but* one, which
+    is what an analyser whose algorithm changed actually wants — it does not have to remember every
+    superseded version number, and a generation nobody thought to list cannot survive.
+    """
     clauses, params = [], []
     if relationship_type:
         clauses.append("relationship_type=?")
@@ -164,10 +195,12 @@ def invalidate_relationships(
     if version:
         clauses.append("relationship_version=?")
         params.append(version)
+    if except_version:
+        clauses.append("relationship_version<>?")
+        params.append(except_version)
     where = " AND ".join(clauses) or "1=1"
     cur = database.connect().execute(f"DELETE FROM relationships WHERE {where}", tuple(params))
-    database.connect().execute("DELETE FROM graph_layout_cache")
-    database.connect().commit()
+    mark_graph_cache_stale()
     return cur.rowcount
 
 

@@ -2,9 +2,11 @@ import argparse
 from pathlib import Path
 
 from housekeeper.database import Database
-from housekeeper.manifests import (load_manifest,
+from housekeeper.manifests import (
+                                   load_manifest,
                                    validate_manifest_against_database,
-                                   validate_manifest_schema)
+                                   validate_manifest_schema,
+)
 
 p = argparse.ArgumentParser()
 p.add_argument("manifest", type=Path)

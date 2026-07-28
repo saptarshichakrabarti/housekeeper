@@ -59,3 +59,34 @@ def test_storage_breakdown_buckets(config, database, tmp_path):
     assert breakdown["environment"] == len(b"envenv")
     assert breakdown["generated"] == len(b"gen")
     assert breakdown["source"] == len(b"source")
+
+
+def test_project_detection_does_not_query_once_per_directory(config, database, tmp_path):
+    """Marker detection is one query for the stage, not one per directory.
+
+    It used to ask every directory in the inventory for its children's names purely to intersect
+    them with a twenty-name set — 59,399 round trips on the real inventory to find a few hundred
+    projects. The intersection is a join. This asserts the statement count barely moves when the
+    directory count grows tenfold, which is the property a plan assertion cannot pin.
+    """
+    from housekeeper.analysers.projects import run_project_analysis
+    from housekeeper.core import counters
+    from housekeeper.scanner import DriveScanner
+
+    def statements_for(directory_count: int) -> int:
+        root = tmp_path / f"tree{directory_count}"
+        for index in range(directory_count):
+            (root / f"dir{index:04d}").mkdir(parents=True)
+            (root / f"dir{index:04d}" / "notes.txt").write_text("x", encoding="utf-8")
+        (root / "realproject").mkdir()
+        (root / "realproject" / "pyproject.toml").write_text("[project]\n", encoding="utf-8")
+        DriveScanner(database, config).scan(root, incremental=False)
+        with counters.recording() as counted:
+            run_project_analysis(database, config)
+        return int(counted["sql_statements"])
+
+    few = statements_for(20)
+    many = statements_for(200)
+    assert many < few * 3, (
+        f"statement count tracks directory count: {few} for 21 directories, {many} for 201"
+    )

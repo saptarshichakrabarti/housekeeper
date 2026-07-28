@@ -1,5 +1,5 @@
 {
-  "commit": "7bb5bbf",
+  "commit": "44a36bf",
   "environment": {
     "implementation": "CPython",
     "machine": "arm64",
@@ -17,7 +17,7 @@
       "dir_count": 12,
       "file_count": 240,
       "profile": "large",
-      "seconds": 0.1719
+      "seconds": 0.3532
     },
     "medium": {
       "counts": {
@@ -29,7 +29,7 @@
       "dir_count": 6,
       "file_count": 60,
       "profile": "medium",
-      "seconds": 0.0837
+      "seconds": 0.2169
     },
     "small": {
       "counts": {
@@ -41,7 +41,19 @@
       "dir_count": 3,
       "file_count": 12,
       "profile": "small",
-      "seconds": 0.0753
+      "seconds": 0.2409
+    },
+    "xlarge": {
+      "counts": {
+        "content_objects": 1601,
+        "directories": 24,
+        "exact_duplicate_groups": 1,
+        "files": 2000
+      },
+      "dir_count": 24,
+      "file_count": 2000,
+      "profile": "xlarge",
+      "seconds": 2.0479
     }
   },
   "schema_version": 1

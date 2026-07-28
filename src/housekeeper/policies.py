@@ -18,9 +18,10 @@ from __future__ import annotations
 
 import json
 import time
+from collections.abc import Callable
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Any, Callable
+from typing import Any
 
 import yaml
 
@@ -494,7 +495,7 @@ _CLASSIFY_SELECT = """SELECT e.id,e.name,e.suffix,e.relative_path,e.scan_status,
     FROM filesystem_entries e
     LEFT JOIN exact_duplicate_members m ON m.entry_id=e.id
     LEFT JOIN exact_duplicate_groups g ON g.id=m.group_id
-    WHERE e.entry_type='file'"""
+    WHERE e.entry_type='file' AND e.id IN (%s)"""
 
 _CLASSIFY_INSERT = (
     "INSERT OR REPLACE INTO classifications(entry_id,classification,confidence,primary_reason_code,"
@@ -504,23 +505,34 @@ _CLASSIFY_INSERT = (
 
 
 def classify_all_entries(
-    database: Database, config: AppConfig, job_id: int | None = None
+    database: Database, config: AppConfig, job_id: int | None = None, scope=None
 ) -> dict[str, int]:
-    """Classify every file entry deterministically and record full audit evidence.
+    """Classify every file in the current inventory, recording full audit evidence.
 
     Streaming keeps memory bounded on million-entry inventories: rows are read from an
     independent read-only connection while classifications are written in bounded batches on
     the main connection, so no read cursor is invalidated by a concurrent write.
+
+    "Every file" means every file *in scope*. Classifying all of history re-derived a verdict for
+    every snapshot of every file ever scanned — cost that grows with how often you have run the
+    tool rather than with the size of the drive, and a verdict for rows no current-state report
+    should ever show.
     """
+    from .analysers.scope import resolve_scope
+
+    entry_sql, scope_params = resolve_scope(database, scope).entry_id_sql()
     rules, priority, default_policy, protected_config = load_policy_files(config)
     spec_dirs, lock_dirs = _project_marker_dirs(database)
     now = time.time()
     write_conn = database.connect()
-    write_conn.execute("DELETE FROM classifications")
+    write_conn.execute(
+        f"DELETE FROM classifications WHERE entry_id IN ({entry_sql})", scope_params
+    )
     write_conn.commit()
     if job_id:
         total = database.fetch_one(
-            "SELECT COUNT(*) AS n FROM filesystem_entries WHERE entry_type='file'"
+            f"SELECT COUNT(*) AS n FROM filesystem_entries WHERE entry_type='file' AND id IN ({entry_sql})",
+            scope_params,
         )
         update_job(database, job_id, total_estimate=int(total["n"]) if total else 0)
     batch_size = max(1, int(config.section("performance")["batch_size"]))
@@ -528,7 +540,7 @@ def classify_all_entries(
     batch: list[tuple[Any, ...]] = []
     processed = 0
     with database.read_connection() as read_conn:
-        read_cursor = read_conn.execute(_CLASSIFY_SELECT)
+        read_cursor = read_conn.execute(_CLASSIFY_SELECT % entry_sql, scope_params)
         while rows := read_cursor.fetchmany(batch_size):
             for row in rows:
                 facts = _build_facts(row, protected_config, spec_dirs, lock_dirs, now, read_conn)

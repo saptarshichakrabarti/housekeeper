@@ -22,14 +22,15 @@ from ..hashing import compute_full_hash
 from ..normalization.registry import (
     ALL_PROFILES,
     PROFILE_RELATIONSHIP,
+    PROFILE_SUFFIXES,
     get_or_create_profile_id,
-    normalizers_for,
+    normalizer_for,
     supported_suffixes,
 )
 from ..relationships import invalidate_content_relationships, upsert_content_relationship
 
-analyseR_NAME = "normalized_content"
-analyseR_VERSION = "1"
+ANALYSER_NAME = "normalized_content"
+ANALYSER_VERSION = "1"
 
 _SIGNATURE_TYPE = {
     "IMAGE_PIXEL_EQUIVALENCE": "PIXEL_HASH",
@@ -48,22 +49,6 @@ def _representative_entries(database, content_object_id: int):
     )
 
 
-def _allowed_content_objects(database, scope) -> set[int] | None:
-    if scope is None:
-        return None
-    from .scope import scoped_entry_ids
-
-    entry_ids = scoped_entry_ids(database, scope)
-    if not entry_ids:
-        return set()
-    marks = ",".join("?" for _ in entry_ids)
-    return {
-        int(r["content_object_id"])
-        for r in database.fetch_all(
-            f"SELECT DISTINCT content_object_id FROM entry_content_links WHERE entry_id IN ({marks})",
-            tuple(entry_ids),
-        )
-    }
 
 
 def _store_artifact(database, content_object_id, profile_id, profile, artifact) -> None:
@@ -99,7 +84,8 @@ def _store_artifact(database, content_object_id, profile_id, profile, artifact) 
                 artifact.artifact.get("member_count"),
             ),
         )
-    database.connect().commit()
+    # No commit: tracked_job owns the transaction for the whole stage, and committing per
+    # normalized object turned one transaction into one per file in the corpus.
 
 
 def _emit_group(database, profile, content_ids, relationship_type, tier, evidence_key) -> None:
@@ -128,24 +114,41 @@ def _emit_group(database, profile, content_ids, relationship_type, tier, evidenc
         )
 
 
-def _normalize_objects(database, config, allowed, job_id, counts) -> None:
-    from ..jobs import check_cancelled, update_job
+def _pending_objects(database, scope, profile, profile_id):
+    """Content objects this profile still owes an artifact for — one query, not one per object.
 
-    profile_ids = {profile.name: get_or_create_profile_id(database, profile) for profile in ALL_PROFILES}
-    objects = database.fetch_all("SELECT id FROM content_objects ORDER BY id")
-    for index, obj in enumerate(objects, start=1):
-        content_object_id = int(obj["id"])
-        if allowed is not None and content_object_id not in allowed:
-            continue
-        if job_id:
-            check_cancelled(database, job_id)
-        reps = _representative_entries(database, content_object_id)
-        if not reps:
-            continue
-        suffix = (reps[0]["suffix"] or "").lower()
-        for profile, normalizer in normalizers_for(suffix):
+    The schema has always carried ``UNIQUE(content_object_id, normalization_profile_id)``; the
+    stage simply never asked it anything, and re-normalised the whole corpus every run. A profile
+    id changes with its version and configuration fingerprint, so a genuine profile change still
+    re-does the work.
+    """
+    suffixes = sorted(PROFILE_SUFFIXES[profile.name])
+    content_sql, params = scope.content_object_id_sql()
+    return database.reader().iter_rows(
+        f"""SELECT DISTINCT co.id FROM content_objects co
+            JOIN entry_content_links l ON l.content_object_id=co.id
+            JOIN filesystem_entries e ON e.id=l.entry_id AND e.entry_type='file'
+            WHERE co.id IN ({content_sql})
+              AND lower(e.suffix) IN ({",".join("?" for _ in suffixes)})
+              AND NOT EXISTS(SELECT 1 FROM normalized_content_artifacts n
+                             WHERE n.content_object_id=co.id AND n.normalization_profile_id=?)
+            ORDER BY co.id""",
+        (*params, *suffixes, profile_id),
+    )
+
+
+def _normalize_objects(database, config, scope, job_id, counts) -> None:
+    from ..jobs import checkpoint
+
+    processed = 0
+    for profile in ALL_PROFILES:
+        profile_id = get_or_create_profile_id(database, profile)
+        normalizer = normalizer_for(profile)
+        for row in _pending_objects(database, scope, profile, profile_id):
+            content_object_id = int(row["id"])
+            processed += 1
             artifact = None
-            for rep in reps:  # representative-path fallback
+            for rep in _representative_entries(database, content_object_id):  # fallback path
                 path = Path(rep["absolute_path"])
                 if not path.is_file() or path.is_symlink():
                     continue
@@ -155,14 +158,16 @@ def _normalize_objects(database, config, allowed, job_id, counts) -> None:
                     break
             if artifact is None:
                 continue
-            _store_artifact(database, content_object_id, profile_ids[profile.name], profile, artifact)
+            _store_artifact(database, content_object_id, profile_id, profile, artifact)
             key = "normalized" if artifact.status == "OK" else ("errors" if artifact.status == "ERROR" else "unsupported")
             counts[key] += 1
-        if job_id:
-            update_job(database, job_id, "RUNNING", processed_count=index)
+            # checkpoint(), not update_job(..., "RUNNING", ...): any non-null status commits, so
+            # re-asserting a status the job already has published one transaction per object purely
+            # to move a progress bar. checkpoint() polls cancellation and rate-limits the commit.
+            checkpoint(database, job_id, processed_count=processed)
 
 
-def _ensure_content_objects(database, config, allowed_entries: set[int] | None) -> None:
+def _ensure_content_objects(database, config, scope) -> None:
     """Hash supported-suffix files that are not yet linked to a content object.
 
     Makes ``analyse normalized-content`` self-sufficient after a bare scan: identity analysis
@@ -172,13 +177,13 @@ def _ensure_content_objects(database, config, allowed_entries: set[int] | None) 
     suffixes = supported_suffixes()
     algorithm = config.section("hashing")["algorithm"]
     block = config.section("hashing")["full_hash_block_bytes"]
+    entry_sql, params = scope.entry_id_sql()
     for row in database.iter_rows(
-        """SELECT e.id,e.absolute_path,e.suffix FROM filesystem_entries e
+        f"""SELECT e.id,e.absolute_path,e.suffix FROM filesystem_entries e
            LEFT JOIN entry_content_links l ON l.entry_id=e.id
-           WHERE e.entry_type='file' AND l.entry_id IS NULL"""
+           WHERE e.entry_type='file' AND l.entry_id IS NULL AND e.id IN ({entry_sql})""",
+        params,
     ):
-        if allowed_entries is not None and int(row["id"]) not in allowed_entries:
-            continue
         if (row["suffix"] or "").lower() not in suffixes:
             continue
         path = Path(row["absolute_path"])
@@ -197,20 +202,22 @@ def _ensure_content_objects(database, config, allowed_entries: set[int] | None) 
 
 
 def run_normalized_content_analysis(database, config, scope=None, job_id=None) -> dict[str, int]:
-    allowed_entries = None
-    if scope is not None:
-        from .scope import scoped_entry_ids
+    from .scope import resolve_scope
 
-        allowed_entries = scoped_entry_ids(database, scope)
-    _ensure_content_objects(database, config, allowed_entries)
-    allowed = _allowed_content_objects(database, scope)
+    scope = resolve_scope(database, scope)
+    _ensure_content_objects(database, config, scope)
     for profile in ALL_PROFILES:  # supersede any relationships from an older version/config
         invalidate_content_relationships(
             database, profile.algorithm, profile.algorithm_version, profile.fingerprint()
         )
     counts = {"normalized": 0, "errors": 0, "unsupported": 0, "relationships": 0}
-    _normalize_objects(database, config, allowed, job_id, counts)
+    _normalize_objects(database, config, scope, job_id, counts)
 
+    # Group emission is scoped too. It used to read *every* normalized artifact per profile to
+    # re-derive equivalence groups — no file I/O, but O(corpus) per run regardless of how little
+    # changed, and it related content objects reachable only from snapshots nobody asked about. One
+    # `content_object_id IN (scope)` makes the stage proportional to the drive.
+    content_sql, content_params = scope.content_object_id_sql()
     for profile in ALL_PROFILES:
         relationship_type, tier = PROFILE_RELATIONSHIP[profile.name]
         profile_id = get_or_create_profile_id(database, profile)
@@ -218,8 +225,10 @@ def run_normalized_content_analysis(database, config, scope=None, job_id=None) -
         orientation_groups: dict[str, list[int]] = {}
         pixel_hash_of: dict[int, str] = {}
         for row in database.iter_rows(
-            "SELECT content_object_id,normalized_hash,artifact_json FROM normalized_content_artifacts WHERE normalization_profile_id=? AND status='OK' AND normalized_hash IS NOT NULL",
-            (profile_id,),
+            "SELECT content_object_id,normalized_hash,artifact_json FROM normalized_content_artifacts "
+            f"WHERE normalization_profile_id=? AND status='OK' AND normalized_hash IS NOT NULL "
+            f"AND content_object_id IN ({content_sql})",
+            (profile_id, *content_params),
         ):
             cid = int(row["content_object_id"])
             groups.setdefault(row["normalized_hash"], []).append(cid)

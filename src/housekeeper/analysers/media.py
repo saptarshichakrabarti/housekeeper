@@ -1,6 +1,6 @@
-from pathlib import Path
 import json
 import subprocess
+from pathlib import Path
 
 
 def extract_audio_metadata(path: Path, config):

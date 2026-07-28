@@ -6,6 +6,8 @@ import csv
 import json
 from pathlib import Path
 
+from .formatting import display_path, redacts_paths
+
 _FIELDS = [
     "entry_id",
     "relative_path",
@@ -21,18 +23,18 @@ _FIELDS = [
 ]
 
 
-def _recommendation_rows(database):
+def _recommendation_rows(database, redact: bool = False):
     for row in database.iter_rows(
         """SELECT c.entry_id,e.relative_path,e.absolute_path,c.classification,c.confidence,
                   c.primary_reason_code,c.reason_codes_json,e.size_bytes,c.canonical_entry_id,
                   c.requires_manual_approval,c.explanation
-           FROM classifications c JOIN filesystem_entries e ON e.id=c.entry_id
+           FROM current_classifications c JOIN current_entries e ON e.id=c.entry_id
            WHERE c.classification LIKE 'REVIEW_%' ORDER BY e.size_bytes DESC"""
     ):
         yield {
             "entry_id": row["entry_id"],
             "relative_path": row["relative_path"],
-            "absolute_path": row["absolute_path"],
+            "absolute_path": display_path(row["absolute_path"], row["relative_path"], redact),
             "classification": row["classification"],
             "confidence": row["confidence"],
             "primary_reason_code": row["primary_reason_code"],
@@ -44,21 +46,25 @@ def _recommendation_rows(database):
         }
 
 
-def export_csv(database, output_path: Path) -> Path:
+def export_csv(database, output_path: Path, config=None) -> Path:
+    """Recommendations as CSV. ``config`` is optional so a caller can export without one; passing it
+    is what enables `reporting.redact_source_paths`."""
+    redact = redacts_paths(config) if config is not None else False
     output_path.parent.mkdir(parents=True, exist_ok=True)
     with output_path.open("w", newline="", encoding="utf-8") as handle:
         writer = csv.DictWriter(handle, fieldnames=_FIELDS)
         writer.writeheader()
-        for record in _recommendation_rows(database):
+        for record in _recommendation_rows(database, redact):
             item = dict(record)
             item["reason_codes"] = json.dumps(item["reason_codes"])
             writer.writerow(item)
     return output_path
 
 
-def export_jsonl(database, output_path: Path) -> Path:
+def export_jsonl(database, output_path: Path, config=None) -> Path:
+    redact = redacts_paths(config) if config is not None else False
     output_path.parent.mkdir(parents=True, exist_ok=True)
     with output_path.open("w", encoding="utf-8") as handle:
-        for record in _recommendation_rows(database):
+        for record in _recommendation_rows(database, redact):
             handle.write(json.dumps(record, sort_keys=True) + "\n")
     return output_path

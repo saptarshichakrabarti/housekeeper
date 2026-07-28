@@ -6,8 +6,8 @@
   <b>{{ model.reclaimable_bytes | filesizeformat }}</b>
   <span>Logical bytes minus unique bytes — review duplicate copies</span>
 </a>
-<div class="cards">
-{% for metric in model.metrics %}{% if metric.href %}<a class="card metric-card" href="{{ metric.href }}">{% else %}<section class="card">{% endif %}<strong>{{ metric.label }}</strong><b>{% if metric.kind == 'bytes' %}{{ metric.value | filesizeformat }}{% else %}{{ metric.value | thousands }}{% endif %}</b>{% if metric.href %}<span class="card-link-hint">Explore <span aria-hidden="true">→</span></span></a>{% else %}</section>{% endif %}{% endfor %}
+<div class="cards overview-metrics">
+{% for metric in model.metrics %}{% if metric.href %}<a class="card metric-card" href="{{ metric.href }}">{% else %}<section class="card">{% endif %}<strong>{{ metric.label }}</strong><b>{% if metric.kind == 'bytes' %}{{ metric.value | filesizeformat }}{% else %}{{ metric.value | thousands }}{% endif %}</b><span class="card-description">{{ metric.description }}</span>{% if metric.href %}<span class="card-link-hint">Explore <span aria-hidden="true">→</span></span></a>{% else %}</section>{% endif %}{% endfor %}
 </div>
 <section hx-get="/fragments/jobs" hx-trigger="load">Loading job status…</section>
 {% for chart in model.charts %}

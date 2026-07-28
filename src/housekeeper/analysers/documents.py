@@ -1,8 +1,8 @@
 import hashlib
 import re
 import unicodedata
+from collections.abc import Iterable
 from pathlib import Path
-from typing import Iterable
 
 
 def normalize_document_text(text: str, max_chars: int) -> str:

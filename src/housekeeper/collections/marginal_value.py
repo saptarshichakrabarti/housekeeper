@@ -9,16 +9,18 @@ from pathlib import Path
 from ..constants import ClusterType, CollectionValue
 
 
-def _ensure_all_hashed(database, config) -> None:
+def _ensure_all_hashed(database, config, scope) -> None:
     """Hash every unlinked file so uniqueness is measured over content, not just dup candidates."""
     from ..hashing import compute_full_hash
 
     algorithm = config.section("hashing")["algorithm"]
     block = config.section("hashing")["full_hash_block_bytes"]
+    entry_sql, params = scope.entry_id_sql()
     for row in database.iter_rows(
-        """SELECT e.id,e.absolute_path FROM filesystem_entries e
+        f"""SELECT e.id,e.absolute_path FROM filesystem_entries e
            LEFT JOIN entry_content_links l ON l.entry_id=e.id
-           WHERE e.entry_type='file' AND l.entry_id IS NULL"""
+           WHERE e.entry_type='file' AND l.entry_id IS NULL AND e.id IN ({entry_sql})""",
+        params,
     ):
         path = Path(row["absolute_path"])
         if not path.is_file() or path.is_symlink():
@@ -35,16 +37,18 @@ def _ensure_all_hashed(database, config) -> None:
     database.connect().commit()
 
 
-def _collection_membership(database):
+def _collection_membership(database, scope):
     """Return (appears_in, collection_objects, sizes, protected, error) maps keyed by content id."""
     appears_in: dict[int, set[tuple[str, str]]] = defaultdict(set)
     collection_objects: dict[tuple[str, str], set[int]] = defaultdict(set)
+    entry_sql, params = scope.entry_id_sql()
     for row in database.iter_rows(
-        """SELECT DISTINCT l.content_object_id AS cid, e.source_root AS root,
+        f"""SELECT DISTINCT l.content_object_id AS cid, e.source_root AS root,
               CASE WHEN instr(e.relative_path,'/')=0 THEN e.relative_path
                    ELSE substr(e.relative_path,1,instr(e.relative_path,'/')-1) END AS top_level
            FROM entry_content_links l JOIN filesystem_entries e ON e.id=l.entry_id
-           WHERE e.entry_type='file'"""
+           WHERE e.entry_type='file' AND e.id IN ({entry_sql})""",
+        params,
     ):
         key = (str(row["root"]), str(row["top_level"]))
         appears_in[int(row["cid"])].add(key)
@@ -76,10 +80,12 @@ def _classify_value(total_bytes: int, unique_bytes: int, unique_count: int) -> s
 
 
 def run_backup_value_analysis(database, config, scope=None, job_id=None) -> dict[str, int]:
+    from ..analysers.scope import resolve_scope
     from ..jobs import checkpoint
 
-    _ensure_all_hashed(database, config)
-    appears_in, collection_objects, sizes, protected = _collection_membership(database)
+    scope = resolve_scope(database, scope)
+    _ensure_all_hashed(database, config, scope)
+    appears_in, collection_objects, sizes, protected = _collection_membership(database, scope)
     created = 0
     for index, (key, cids) in enumerate(collection_objects.items(), 1):
         checkpoint(database, job_id, processed_count=index)
@@ -115,16 +121,22 @@ def run_backup_value_analysis(database, config, scope=None, job_id=None) -> dict
     return {"collections": created}
 
 
-def simulate_removal(database, collection_id: int) -> dict:
+def simulate_removal(database, collection_id: int, scope=None) -> dict:
     """Non-destructive: report what a collection uniquely contributes and would lose if removed."""
+    from ..analysers.scope import resolve_scope
+
     cluster = database.fetch_one(
         "SELECT scope_json,name FROM collection_clusters WHERE id=?", (collection_id,)
     )
     if not cluster:
         raise ValueError(f"unknown collection {collection_id}")
-    scope = json.loads(cluster["scope_json"])
-    key = (scope.get("source_root", ""), scope.get("top_level", ""))
-    appears_in, collection_objects, sizes, protected = _collection_membership(database)
+    # The cluster's own stored scope (which drive, which top-level directory) — not the analyser
+    # scope, which decides *which snapshot* the membership counts come from.
+    cluster_scope = json.loads(cluster["scope_json"])
+    key = (cluster_scope.get("source_root", ""), cluster_scope.get("top_level", ""))
+    appears_in, collection_objects, sizes, protected = _collection_membership(
+        database, resolve_scope(database, scope)
+    )
     cids = collection_objects.get(key, set())
     unique = [cid for cid in cids if appears_in[cid] == {key}]
     redundant = [cid for cid in cids if len(appears_in[cid]) > 1]

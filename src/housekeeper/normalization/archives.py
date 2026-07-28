@@ -85,7 +85,10 @@ def normalize_archive_content(path: Path, config) -> NormalizedArtifact:
                     if handle is None:
                         continue
                     digest = hashlib.sha256()
-                    for chunk in iter(lambda: handle.read(1 << 20), b""):
+                    # Walrus rather than iter(lambda: handle.read(...)): the lambda closed over the
+                    # loop variable, so it read whichever member the loop had reached rather than
+                    # the one being digested. Correct only because it was consumed immediately.
+                    while chunk := handle.read(1 << 20):
                         digest.update(chunk)
                     entries.append((name, digest.hexdigest()))
                     paths.append((name, member.size))
