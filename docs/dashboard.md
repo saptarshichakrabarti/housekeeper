@@ -23,3 +23,62 @@ Beyond the bounded explorer tables, three GET-only detail views present richer f
   generate it.
 
 All three respect read-only mode (they are read-only by construction) and the standard CSP.
+
+## Space, coverage, and bulk duplicate review
+
+- **Treemap** (`/treemap`): tile area is size on disk, tile fill is the estimated reclaimable share
+  (redundant duplicate copies plus `REVIEW_*` bytes) on a single-hue light→dark ramp, with the same
+  numbers repeated as a table so nothing is colour-only. Drill-down uses the same lazy one-level
+  contract as the graph explorer (`/api/treemap/children`), so a million-entry drive costs the same
+  as a small one. Squarify is ~50 lines in `static/treemap.js` — no charting library is vendored.
+- **Coverage** (`/coverage`): per source, how many of its files have the same content, verified by
+  hash, on at least one *other* source. Three buckets — verified elsewhere, only copy here, and
+  unknown (no verified hash). Unhashed is never counted as covered, and the page never says "safe to
+  delete".
+- **Duplicate wizard** (`/wizard`): bulk review by rule — keep the canonical, keep the newest, keep
+  the copy under a folder. Every rule is previewed first (keeper, proposed approvals, conflicts with
+  the canonical choice, and any stale decisions from an earlier scan), and applying it writes
+  ordinary `review_decisions` rows: `MARK_KEEP` for the keeper, `APPROVE_FOR_REVIEW` for the
+  redundant copies. It adds **no** new mutation capability — movement remains the separate
+  `export-review → validate-manifest → move-to-review` flow. The apply endpoint
+  (`POST /api/review/<session>/bulk?rule=…&fingerprint=…`) re-derives the keeper server-side and never
+  accepts an entry list from the client, and skips a whole group when any member is protected,
+  unhashed, or unreadable. `fingerprint` is required and is the digest of the preview being confirmed
+  (from `GET /api/review/<session>/bulk/preview`): if the groups changed in between — a rescan gives
+  every file a new entry row — nothing is written and the current plan is re-rendered with the reason,
+  so approvals can never land on entries nobody looked at. Pages are capped at 500 groups, and the
+  preview's **Next** button carries the keyset cursor so a later page applies as the page it shows.
+
+## Jobs
+
+The Jobs page filters by type and status (and "pipelines only"), shows each job's duration —
+elapsed while running, with the median of completed jobs of that type as advisory context — and
+expands a pipeline row into its stages. A stopped pipeline (`PAUSED`, `CANCELLED`, `FAILED`,
+`INTERRUPTED`) offers **Resume**, which submits the same operation again. The old row stays terminal
+and the new pipeline records `{"resumes": <old id>}` in its scope. A viewer dashboard (no runner)
+never shows the button.
+
+**Pause and Cancel** are cooperative, and the request travels out-of-band: SQLite has one writer, so
+a stage that is mid-transaction owns the lock and a request written only to the `jobs` row would wait
+out `busy_timeout` and be lost — the click did nothing at all. The request is written to a
+`job-<id>.stop` file beside the database (no lock needed) and the worker, which does own the lock,
+settles the row itself at its next checkpoint; the table reads the same file, so the row shows
+*stopping…* in the meantime. Measured on a 60,000-file scan: the click returns in ≤0.28 s and the run
+stops ~0.3 s after it. What that latency is made of: the poll is throttled to one query per 0.25 s
+per job, the table refreshes every 3 s while a job is active, and a stop only lands on a cooperative
+checkpoint — per committed batch in a scan, per pair/group/object in the analysers. A single
+set-based SQL statement is not interruptible, so the longest of them bounds the worst case.
+
+How much a resume actually skips depends on the operation, and the two mechanisms are different:
+
+- **Quickstart** skips the content-keyed stages (`content-analysis`, `document-versions`,
+  `image-similarity`) that reached `COMPLETED`, matched by input fingerprint. That check rests on each
+  *stage's* own terminal state, not on the pipeline's, which is exactly why an interrupted run does not
+  force the next one to redo the work it already finished. The changed-only narrowing of content
+  analysis is the one thing a resume switches off, because an artifact the interrupted run still owes
+  is invisible in the change record.
+- **The other pipelines** (analyse-all, classify, report) have no stage-level reuse: their stages are
+  either keyed to entry ids (so they must re-derive) or already cheap on a second pass. The saving
+  there is per-unit rather than per-stage — content artifacts, verified hashes and rendered contact
+  sheets are reused whenever identity, analyser version and configuration fingerprint match — so a
+  resumed analyse-all repeats the queries but not the parsing.

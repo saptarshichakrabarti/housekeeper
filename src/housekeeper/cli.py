@@ -21,6 +21,7 @@ from .restore import restore_transaction
 from .review.decisions import create_session, export_snapshot, record_decision, validate_session
 from .review_mover import move_approved_entries
 from .scanner import DriveScanner
+from .schedules import FORMATS, INSTALL_HINTS, INTERVALS, schedule_text
 
 
 def _run_job(database, config, job_type: str, scope: dict, callback):
@@ -51,6 +52,12 @@ def _print_row(row) -> None:
         return
     for key in row.keys():  # noqa: SIM118 - sqlite3.Row: `in row` tests values, not keys
         print(f"{key}: {'' if row[key] is None else row[key]}")
+
+
+def _delta(digest: dict, key: str) -> str:
+    """A signed delta, or "not comparable" — never a number the data does not support."""
+    value = (digest.get("deltas") or {}).get(key)
+    return "not comparable" if value is None else f"{value:+d}"
 
 
 def _emit(value) -> None:
@@ -111,6 +118,11 @@ def build_parser():
     q.add_argument(
         "--no-reports", action="store_true", help="skip static report generation"
     )
+    q.add_argument(
+        "--full",
+        action="store_true",
+        help="re-run every stage instead of reusing stages whose inputs are unchanged",
+    )
     q.add_argument("--json", action="store_true", help="emit the run summary as JSON")
     s = sub.add_parser("scan")
     s.add_argument("source_root")
@@ -122,6 +134,25 @@ def build_parser():
     diff = sub.add_parser("diff")
     diff.add_argument("scan_a", type=int)
     diff.add_argument("scan_b", type=int)
+    ch = sub.add_parser(
+        "changes", help="what changed between the newest scan and the one before it"
+    )
+    ch.add_argument("--json", action="store_true")
+    sched = sub.add_parser(
+        "schedule",
+        help="print a scheduler unit that runs quickstart periodically (nothing is installed)",
+    )
+    sched.add_argument("source_root")
+    sched.add_argument("--interval", choices=list(INTERVALS), default="weekly")
+    # `--weekly` reads better than `--interval weekly` and is what the documentation shows, so both
+    # spellings work; they share one destination, and a later flag wins.
+    every = sched.add_mutually_exclusive_group()
+    for interval in INTERVALS:
+        every.add_argument(
+            f"--{interval}", dest="interval", action="store_const", const=interval,
+            help=f"shorthand for --interval {interval}",
+        )
+    sched.add_argument("--format", dest="output_format", choices=list(FORMATS), default="systemd")
     a = sub.add_parser("analyse")
     a.add_argument(
         "kind",
@@ -179,6 +210,8 @@ def build_parser():
         "kind",
         choices=[
             "summary",
+            "changes",
+            "coverage",
             "inventory",
             "exact-duplicates",
             "directory-overlap",
@@ -206,6 +239,19 @@ def build_parser():
     rr.add_argument("transaction_manifest")
     rr.add_argument("--dry-run", action="store_true")
     rr.add_argument("--yes", action="store_true")
+    cov = sub.add_parser(
+        "coverage",
+        help="which of a source's files are verified present on another source (read-only)",
+    )
+    cov.add_argument("source_id", type=int)
+    cov.add_argument(
+        "--against",
+        type=int,
+        action="append",
+        default=[],
+        help="restrict the comparison to these source ids (default: every other source)",
+    )
+    cov.add_argument("--json", action="store_true")
     sources = sub.add_parser("sources")
     sources_sub = sources.add_subparsers(dest="sources_command", required=True)
     sources_sub.add_parser("list")
@@ -450,6 +496,7 @@ def _dispatch(args, c, d) -> int:
                 Path(args.source_root),
                 generate_reports=not args.no_reports,
                 progress=_note_stage,
+                full=args.full,
             )
         if args.json:
             print(_json.dumps(summary, indent=2, sort_keys=True))
@@ -457,6 +504,16 @@ def _dispatch(args, c, d) -> int:
         totals = summary["totals"]
         print("\nQuickstart complete (read-only — nothing was moved or deleted).")
         print(f"  workspace:         {summary['workspace']}")
+        changed = summary.get("changed_entries")
+        print(
+            f"  mode:              {summary.get('mode', 'full')}"
+            + ("" if changed is None else f" ({changed} changed entries)")
+        )
+        for entry in summary["steps"]:
+            result = entry["result"]
+            skipped = result.get("skipped_stage") if isinstance(result, dict) else None
+            if skipped:
+                print(f"  skipped:           {entry['step']} ({skipped})")
         print(f"  files:             {totals['files']}")
         print(f"  directories:       {totals['directories']}")
         print(f"  content objects:   {totals['content_objects']}")
@@ -465,6 +522,20 @@ def _dispatch(args, c, d) -> int:
         print(f"  protected:         {totals['protected']}")
         if summary.get("reports"):
             print(f"  reports written:   {len(summary['reports'])}")
+        digest = summary.get("changes") or {}
+        print("\nSince the last scan:")
+        if digest.get("unavailable"):
+            print(f"  {digest['unavailable']}")
+        else:
+            counts = ", ".join(
+                f"{status.lower().replace('_', ' ')}: {bucket['count']}"
+                for status, bucket in digest.get("buckets", {}).items()
+            )
+            print(f"  {counts or 'nothing changed'}")
+            print(f"  duplicate groups:  {_delta(digest, 'duplicate_groups')}")
+            print(f"  reviewable bytes:  {_delta(digest, 'reviewable_bytes')} (estimate)")
+            if digest.get("duplicate_note"):
+                print(f"  note:              {digest['duplicate_note']}")
         print("\nNext steps:")
         for step in next_steps(c):
             print(f"  - {step}")
@@ -867,6 +938,36 @@ def _dispatch(args, c, d) -> int:
             )
         )
         return 0
+    if cmd == "changes":
+        import json as _json
+
+        from .reports.contexts import changes_digest
+
+        digest = changes_digest(d, c)
+        if args.json:
+            print(_json.dumps(digest, indent=2, sort_keys=True, default=str))
+            return 0
+        if digest.get("unavailable"):
+            print(digest["unavailable"])
+            return 0
+        for status, bucket in digest["buckets"].items():
+            print(f"{status.lower().replace('_', ' ')}: {bucket['count']} ({bucket['bytes']} bytes)")
+        print(f"duplicate groups: {_delta(digest, 'duplicate_groups')}")
+        print(f"reviewable bytes: {_delta(digest, 'reviewable_bytes')} (estimate)")
+        if digest.get("duplicate_note"):
+            print(digest["duplicate_note"])
+        return 0
+    if cmd == "schedule":
+        # Printed, never installed: a scheduler unit belongs to the operator, and this tool does not
+        # write into ~/.config/systemd or the task store on their behalf.
+        for name, text in schedule_text(
+            c, Path(args.source_root), args.interval, args.output_format
+        ).items():
+            if name:
+                print(f"# ---- {name}")
+            print(text, end="")
+        print(f"\n# {INSTALL_HINTS[args.output_format]}")
+        return 0
     if cmd == "diff":
         _emit(
             d.fetch_all(
@@ -879,6 +980,28 @@ def _dispatch(args, c, d) -> int:
                 "SELECT relative_path,change_status FROM scan_entry_changes WHERE scan_run_id=? ORDER BY relative_path LIMIT 200",
                 (args.scan_b,),
             )
+        )
+        return 0
+    if cmd == "coverage":
+        import json as _json
+
+        from .coverage import coverage
+
+        result = coverage(d, args.source_id, args.against or None)
+        if args.json:
+            print(_json.dumps(result, indent=2, sort_keys=True))
+            return 0
+        print(result["summary"])
+        for name, bucket in result["buckets"].items():
+            print(f"  {name:<8} {bucket['count']:>10,} files  {bucket['bytes']:>16,} bytes")
+        if result["unique_files"]:
+            print("\nLargest files with no verified copy on another source:")
+            for entry in result["unique_files"][:20]:
+                print(f"  {entry['size_bytes']:>16,}  {entry['relative_path']}")
+        print(
+            "\n'verified elsewhere' means the same content was found on another source — not that "
+            "anything is safe to delete. Moving files stays the separate export-review -> "
+            "validate-manifest -> move-to-review flow."
         )
         return 0
     if cmd == "sources":

@@ -86,7 +86,14 @@ DEFAULTS: dict[str, Any] = {
         # Reuse of unchanged signatures and content links is not optional: it is what makes a
         # rescan proportional to what changed. Only the rename heuristic is a real choice.
         "detect_renames": True,
+        # Reuse of whole pipeline stages whose inputs (snapshot content, configuration, code) are
+        # unchanged since a completed run. `quickstart --full` overrides it for one run.
+        "reuse_unchanged_stages": True,
     },
+    # A shell command a *scheduled* run pipes the "what changed" digest into (notify-send, mail, a
+    # curl to a webhook). Empty means no notification. Housekeeper never talks to the network itself
+    # and never runs this command outside a scheduler unit it printed — see schedules.py.
+    "notifications": {"command": ""},
     "content_store": {
         "store_normalized_text": True,
         "compress_text": True,

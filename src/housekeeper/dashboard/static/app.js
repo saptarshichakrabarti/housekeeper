@@ -28,7 +28,7 @@
   const tokens = () => {
     const css = getComputedStyle(document.documentElement);
     const read = (name, fallback) => (css.getPropertyValue(name) || '').trim() || fallback;
-    const dark = ['dark', 'hybrid-dark', 'hybrid-solar', 'brutal-dark'].includes(
+    const dark = ['dark', 'hybrid-dark', 'hybrid-solar'].includes(
       document.documentElement.getAttribute('data-theme'));
     return {
       bg: read('--hk-graph-bg', dark ? '#16161d' : '#fcfcfb'),

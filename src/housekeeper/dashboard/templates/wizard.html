@@ -1,0 +1,25 @@
+<p>Resolve duplicate groups in bulk by rule. A rule picks one <strong>keeper</strong> per group and
+proposes the redundant copies for review. Applying a rule records ordinary review decisions —
+<strong>nothing is moved or deleted</strong>. Moving approved files stays the separate, explicit,
+manifest-verified CLI flow: <code>export-review → validate-manifest → move-to-review</code>
+(dry-run first).</p>
+{% if read_only %}
+<p><em>Dashboard is read-only; a rule can be previewed but not applied.</em></p>
+{% endif %}
+{% if not sessions %}
+<p class="empty-state">No open review session. Create one first:
+<code>housekeeper review new &lt;name&gt;</code>.</p>
+{% else %}
+<form class="jobs-filter" hx-get="/fragments/wizard/preview" hx-target="#wizard-preview" hx-swap="innerHTML">
+  <label>Session <select name="session_id">
+    {% for session in sessions %}<option value="{{ session.id }}">{{ session.name }} ({{ session.status }})</option>{% endfor %}
+  </select></label>
+  <label>Rule <select name="rule">
+    {% for rule in rules %}<option value="{{ rule }}">{{ rule }}</option>{% endfor %}
+  </select></label>
+  <label>Keep under (for <code>keep-under</code>) <input type="text" name="path_prefix" size="30" placeholder="Originals/Photos"></label>
+  <label>Groups <input type="number" name="limit" value="50" min="1" max="500"></label>
+  <button type="submit">Preview</button>
+</form>
+{% endif %}
+<div id="wizard-preview">Choose a rule and preview it.</div>

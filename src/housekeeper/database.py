@@ -927,12 +927,15 @@ class Database:
     # reported itself migrated still is.
     _PURGE_KEEP: ClassVar[tuple[str, ...]] = ("schema_migrations", "migration_progress")
 
-    def purge_runs(self) -> dict[str, int]:
+    def purge_runs(self, keep_job_id: int | None = None) -> dict[str, int]:
         """Delete every recorded run and everything derived from one. Returns rows deleted per table.
 
         Rows rather than the file: the dashboard, its background runner and any CLI process may each
         hold an open connection, and unlinking the database under them leaves them writing to a
         deleted inode.
+
+        ``keep_job_id`` spares one ``jobs`` row: the job that is running this purge. Without it a
+        purge cannot be tracked at all, because it deletes the row recording it mid-flight.
         """
         c = self.connect()
         tables = [
@@ -953,7 +956,12 @@ class Database:
         deleted = {}
         try:
             for table in tables:
-                count = c.execute(f"DELETE FROM {table}").rowcount
+                if table == "jobs" and keep_job_id is not None:
+                    # Row-wise instead of truncate for this one table: jobs is small (a row per
+                    # stage), so keeping the purge's own row costs nothing measurable.
+                    count = c.execute("DELETE FROM jobs WHERE id<>?", (keep_job_id,)).rowcount
+                else:
+                    count = c.execute(f"DELETE FROM {table}").rowcount
                 if count > 0:
                     deleted[table] = count
             c.commit()

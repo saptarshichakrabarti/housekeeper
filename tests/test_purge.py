@@ -28,7 +28,12 @@ def test_purge_empties_runs_and_reports_but_keeps_migration_state(scanned):
     assert result["rows_deleted"]["filesystem_entries"] == entries
     assert c.execute("PRAGMA foreign_keys").fetchone()[0] == 1
     assert not any(reports.iterdir())
-    for table in ("scan_runs", "filesystem_entries", "classifications", "content_objects", "jobs"):
+    for table in ("scan_runs", "filesystem_entries", "classifications", "content_objects"):
         assert c.execute(f"SELECT COUNT(*) FROM {table}").fetchone()[0] == 0, table
+    # Job history goes with the runs, except one marker for the purge itself: without it the next
+    # scan's "what changed" digest would present a purged workspace as a drive full of new files.
+    assert [
+        (row[0], row[1]) for row in c.execute("SELECT job_type,status FROM jobs")
+    ] == [("PURGE", "COMPLETED")]
     assert c.execute("SELECT COUNT(*) FROM current_entries").fetchone()[0] == 0
     assert c.execute("SELECT COUNT(*) FROM schema_migrations").fetchone()[0] == migrations

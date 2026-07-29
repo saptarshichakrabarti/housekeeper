@@ -1,0 +1,43 @@
+{% extends "_base.html.j2" %}
+{% block content %}
+{% if unavailable %}
+<p class="facts">{{ unavailable }}</p>
+{% if identity %}<p>Current scan: #{{ identity.scan_run_id }} of <span class="path">{{ identity.source_root }}</span>, completed {{ identity.completed_at }}.</p>{% endif %}
+{% else %}
+<p class="facts">Scan #{{ identity.scan_run_id }} of <span class="path">{{ identity.source_root }}</span>
+({{ identity.completed_at }}) against scan #{{ previous.scan_run_id }} ({{ previous.completed_at }}).
+{{ unchanged.count }} entries were unchanged.</p>
+<div class="cards">
+  {% for status, bucket in buckets.items() %}
+  <div class="card"><b>{{ bucket.count }}</b>{{ status | lower | replace('_', ' ') }}<br>
+    <small>{{ bucket.bytes | human_size }}</small></div>
+  {% else %}
+  <div class="card"><b>0</b>changes</div>
+  {% endfor %}
+</div>
+<h2>Since the previous scan</h2>
+<table>
+  <tr><th>Measure</th><th class="num">Previous</th><th class="num">Now</th><th class="num">Change</th></tr>
+  <tr><td>Duplicate groups (this snapshot)</td>
+      <td class="num">{% if deltas.duplicate_groups is none %}—{% else %}{{ totals.previous.duplicate_groups }}{% endif %}</td>
+      <td class="num">{{ totals.current.duplicate_groups }}</td>
+      <td class="num">{% if deltas.duplicate_groups is none %}not comparable{% else %}{{ '%+d' % deltas.duplicate_groups }}{% endif %}</td></tr>
+  <tr><td>Estimated reviewable bytes</td>
+      <td class="num">{{ totals.previous.reviewable_bytes | human_size }}</td>
+      <td class="num">{{ totals.current.reviewable_bytes | human_size }}</td>
+      <td class="num">{{ '%+d' % deltas.reviewable_bytes }} B</td></tr>
+</table>
+{% if duplicate_note %}<p class="estimate">{{ duplicate_note }}</p>{% endif %}
+<p class="estimate">Reviewable bytes are an estimate of what review would consider, not guaranteed
+reclaimable space. Nothing here has been moved or deleted.</p>
+{% for status, files in largest.items() %}
+<h2>Largest {{ status | lower | replace('_', ' ') }}</h2>
+<div class="overflow"><table>
+  <tr><th>Path</th><th class="num">Size</th></tr>
+  {% for f in files %}
+  <tr><td class="path">{{ f.absolute_path }}</td><td class="num">{{ f.size_bytes | human_size }}</td></tr>
+  {% endfor %}
+</table></div>
+{% endfor %}
+{% endif %}
+{% endblock %}

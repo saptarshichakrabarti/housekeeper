@@ -1,0 +1,73 @@
+{% if refused %}
+<section class="card card--danger">
+  <strong>Nothing was recorded.</strong> {{ refused }}
+  <br><small>The table below is the current plan — read it, then apply again.</small>
+</section>
+{% endif %}
+{% if applied %}
+<section class="card card--ok">
+  <strong>Applied {{ applied.rule }}</strong> to session {{ applied.session_id }}:
+  {{ applied.kept }} keepers marked, {{ applied.approved }} copies approved for review.
+  {% if applied.skipped %}{{ applied.skipped | length }} groups skipped.{% endif %}
+  {% if applied.next_after_id %}<br>More groups remain — preview again from id {{ applied.next_after_id }}.{% endif %}
+  <br><small>Decisions only. Nothing has been moved or deleted.</small>
+</section>
+{% endif %}
+<section class="card">
+  <strong>{{ plan.counts.actionable_groups }}</strong> of {{ plan.counts.groups }} groups would be
+  acted on · {{ plan.counts.would_approve }} copies proposed for review
+  ({{ plan.counts.would_approve_bytes | filesizeformat }}, estimated) ·
+  {{ plan.counts.conflicts }} disagree with the canonical choice ·
+  {{ plan.counts.skipped_groups }} skipped
+  {%- if plan.counts.stale %} · {{ plan.counts.stale }} members carry a stale decision from an
+  earlier scan and need re-checking{% endif %}.
+</section>
+<div class="table-scroll"><table>
+  <thead><tr><th>Group</th><th>Size</th><th>Keeper</th><th>Proposed for review</th><th>Notes</th></tr></thead>
+  <tbody>
+  {% for group in plan.groups %}
+    <tr>
+      <td>{{ group.group_id }}</td>
+      <td>{{ group.size_bytes | filesizeformat }}</td>
+      <td class="path">{% if group.keeper %}{{ group.keeper.relative_path }}{% else %}—{% endif %}</td>
+      <td class="path">
+        {% for member in group.approve %}{{ member.relative_path }}{% if not loop.last %}<br>{% endif %}{% endfor %}
+        {%- if not group.approve %}—{% endif %}
+      </td>
+      <td>
+        {%- if group.skipped %}skipped: {{ group.skipped }}
+        {%- elif group.conflict %}keeper differs from the canonical choice
+        {%- endif %}
+        {%- if group.stale %} · stale decision on {{ group.stale | length }} member(s){% endif %}
+      </td>
+    </tr>
+  {% else %}
+    <tr><td colspan="5" class="empty-state">No duplicate groups in this range.</td></tr>
+  {% endfor %}
+  </tbody>
+</table></div>
+<div class="controls">
+{% if plan.counts.actionable_groups and not applied %}
+<form hx-post="/fragments/wizard/apply" hx-target="#wizard-preview" hx-swap="innerHTML"
+      hx-confirm="Record decisions for {{ plan.counts.actionable_groups }} groups? This writes review decisions only — no file is moved or deleted.">
+  <input type="hidden" name="session_id" value="{{ plan.session_id }}">
+  <input type="hidden" name="rule" value="{{ plan.rule }}">
+  <input type="hidden" name="path_prefix" value="{{ plan.path_prefix }}">
+  <input type="hidden" name="limit" value="{{ plan.limit }}">
+  <input type="hidden" name="after_id" value="{{ plan.after_id }}">
+  {# Binds this button to the plan above: if the groups change first, the apply is refused. #}
+  <input type="hidden" name="fingerprint" value="{{ plan.fingerprint }}">
+  <button type="submit">Record these decisions</button>
+</form>
+{% endif %}
+{% if plan.next_after_id %}
+<form hx-get="/fragments/wizard/preview" hx-target="#wizard-preview" hx-swap="innerHTML">
+  <input type="hidden" name="session_id" value="{{ plan.session_id }}">
+  <input type="hidden" name="rule" value="{{ plan.rule }}">
+  <input type="hidden" name="path_prefix" value="{{ plan.path_prefix }}">
+  <input type="hidden" name="limit" value="{{ plan.limit }}">
+  <input type="hidden" name="after_id" value="{{ plan.next_after_id }}">
+  <button type="submit">Next {{ plan.limit }} groups →</button>
+</form>
+{% endif %}
+</div>

@@ -201,8 +201,171 @@ def build_errors_context(database, config) -> dict:
     return {"title": "Errors", "scan_errors": scan_errors, "parser_errors": parser_errors}
 
 
+#: Buckets of ``scan_entry_changes.change_status``, in the order a reader cares about them.
+_CHANGE_BUCKETS = ("NEW", "CONTENT_POSSIBLY_CHANGED", "METADATA_CHANGED", "MISSING", "ERROR")
+
+
+def _run_totals(database, scan_run_id: int) -> dict:
+    """The figures a digest compares between runs, for one snapshot.
+
+    Duplicate groups are counted from that snapshot's own **content links**, not from
+    ``exact_duplicate_members``: the analyser replaces a group's membership with the members of the
+    snapshot it last ran over, so counting stored members would report an older run as having none and
+    invent a change nobody made. Verified links, by contrast, are copied forward per entry and stay
+    with the snapshot that recorded them — which makes the two runs genuinely comparable, and uses the
+    same definition of "a duplicate group within this scope" as the analyser itself: one content object
+    reachable from two or more verified files of the run.
+
+    ``identity_available`` is the one honest escape hatch: a snapshot nobody ever hashed has no groups
+    to count, and that is not the same as having none.
+    """
+    groups = database.fetch_one(
+        "SELECT COUNT(*) n FROM (SELECT l.content_object_id FROM entry_content_links l "
+        "JOIN filesystem_entries e ON e.id=l.entry_id "
+        "WHERE e.scan_run_id=? AND e.entry_type='file' AND l.link_status='VERIFIED' "
+        "GROUP BY l.content_object_id HAVING COUNT(*)>1)",
+        (scan_run_id,),
+    )
+    identity = database.fetch_one(
+        "SELECT EXISTS(SELECT 1 FROM entry_content_links l "
+        "JOIN filesystem_entries e ON e.id=l.entry_id "
+        "WHERE e.scan_run_id=? AND l.link_status='VERIFIED') x",
+        (scan_run_id,),
+    )
+    reviewable = database.fetch_one(
+        "SELECT COALESCE(SUM(e.size_bytes),0) b FROM classifications c "
+        "JOIN filesystem_entries e ON e.id=c.entry_id "
+        "WHERE e.scan_run_id=? AND c.classification LIKE 'REVIEW_%'",
+        (scan_run_id,),
+    )
+    return {
+        "duplicate_groups": int(groups["n"]) if groups else 0,
+        "identity_available": bool(identity and identity["x"]),
+        "reviewable_bytes": int(reviewable["b"]) if reviewable else 0,
+    }
+
+
+def changes_digest(database, config=None) -> dict:
+    """What changed between the newest scan and the one before it, for the same source.
+
+    Everything here is already recorded — ``scan_entry_changes`` per scan, classifications and
+    duplicate groups per snapshot. The digest is the view of it nobody had.
+
+    Honest about having nothing to say: a first scan of a source records no comparison at all, and a
+    purge removes the history a comparison would need. Both render as a stated reason rather than a
+    diff full of zeroes or an inventory that looks entirely new.
+    """
+    redact = redacts_paths(config) if config else False
+    current = database.fetch_one(
+        "SELECT id,source_root,source_root_fingerprint,completed_at FROM scan_runs "
+        "WHERE status='COMPLETE' ORDER BY id DESC LIMIT 1"
+    )
+    if not current:
+        return {"title": "Changes", "unavailable": "No completed scan yet."}
+    previous = database.fetch_one(
+        "SELECT id,completed_at FROM scan_runs WHERE status='COMPLETE' AND id<? "
+        "AND source_root_fingerprint=? ORDER BY id DESC LIMIT 1",
+        (current["id"], current["source_root_fingerprint"]),
+    )
+    identity = {
+        "scan_run_id": int(current["id"]),
+        "source_root": display_source(current["source_root"], redact),
+        "completed_at": current["completed_at"],
+    }
+    if not previous:
+        purge = database.fetch_one(
+            "SELECT completed_at FROM jobs WHERE job_type='PURGE' AND status='COMPLETED' "
+            "ORDER BY id DESC LIMIT 1"
+        )
+        reason = (
+            f"History was purged on {purge['completed_at']}, so there is no earlier scan to "
+            "compare against — this is a fresh baseline, not a drive full of new files."
+            if purge
+            else "This is the first scan of this source, so there is no previous scan to compare."
+        )
+        return {"title": "Changes", "identity": identity, "unavailable": reason}
+    buckets = {
+        row["change_status"]: {"count": int(row["n"]), "bytes": int(row["b"])}
+        for row in database.fetch_all(
+            """SELECT ch.change_status,COUNT(*) n,COALESCE(SUM(e.size_bytes),0) b
+               FROM scan_entry_changes ch JOIN filesystem_entries e ON e.id=ch.entry_id
+               WHERE ch.scan_run_id=? GROUP BY ch.change_status""",
+            (int(current["id"]),),
+        )
+    }
+    largest = {
+        status: [
+            {
+                "relative_path": row["relative_path"],
+                "absolute_path": display_path(row["absolute_path"], row["relative_path"], redact),
+                "size_bytes": int(row["size_bytes"] or 0),
+            }
+            for row in database.fetch_all(
+                """SELECT ch.relative_path,e.absolute_path,e.size_bytes
+                   FROM scan_entry_changes ch JOIN filesystem_entries e ON e.id=ch.entry_id
+                   WHERE ch.scan_run_id=? AND ch.change_status=? AND e.entry_type='file'
+                   ORDER BY e.size_bytes DESC LIMIT 10""",
+                (int(current["id"]), status),
+            )
+        ]
+        for status in _CHANGE_BUCKETS
+        if buckets.get(status)
+    }
+    now, before = _run_totals(database, int(current["id"])), _run_totals(database, int(previous["id"]))
+    # A delta only where both sides are still comparable; otherwise ``None`` and a stated reason.
+    comparable = now["identity_available"] and before["identity_available"]
+    deltas: dict[str, int | None] = {
+        "reviewable_bytes": now["reviewable_bytes"] - before["reviewable_bytes"],
+        "duplicate_groups": (
+            now["duplicate_groups"] - before["duplicate_groups"] if comparable else None
+        ),
+    }
+    return {
+        "title": "Changes",
+        "identity": identity,
+        "previous": {"scan_run_id": int(previous["id"]), "completed_at": previous["completed_at"]},
+        "unchanged": buckets.get("UNCHANGED", {"count": 0, "bytes": 0}),
+        "buckets": {status: buckets[status] for status in _CHANGE_BUCKETS if status in buckets},
+        "largest": largest,
+        "totals": {"current": now, "previous": before},
+        "deltas": deltas,
+        "duplicate_note": (
+            None
+            if comparable
+            else (
+                f"Scan #{int(previous['id'])} has no verified content identity recorded, so its "
+                "duplicate groups cannot be counted and the two scans are not comparable."
+            )
+        ),
+    }
+
+
+def build_changes_context(database, config) -> dict:
+    return changes_digest(database, config)
+
+
+def build_coverage_context(database, config) -> dict:
+    """Per-source: how much of it is verified present on another source, and what is not.
+
+    One source (or none) cannot be covered by anything, which the template states rather than
+    rendering a table of zeroes that reads like "nothing is backed up".
+    """
+    from ..coverage import coverage, source_roots
+
+    sources = source_roots(database)
+    return {
+        "title": "Cross-drive coverage",
+        "sources": [
+            {**source, **coverage(database, source["id"], limit=20)} for source in sources
+        ],
+        "comparable": len(sources) > 1,
+    }
+
+
 CONTEXT_BUILDERS = {
     "summary": build_summary_context,
+    "changes": build_changes_context,
+    "coverage": build_coverage_context,
     "inventory": build_inventory_context,
     "exact_duplicates": build_duplicates_context,
     "directory_overlap": build_directory_overlap_context,

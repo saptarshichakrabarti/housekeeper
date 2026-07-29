@@ -12,6 +12,7 @@
   <form hx-post="/control/scan" hx-target="#control-panel" hx-swap="innerHTML">
     <label>Directory <input type="text" name="path" id="control-path" size="60" required hx-preserve="true"{% if busy %} disabled{% endif %}></label>
     <button type="button" id="control-pick-folder" hx-get="/fragments/folders" hx-target="#folder-browser-body" hx-swap="innerHTML"{% if busy %} disabled{% endif %}>Choose folder…</button>
+    <label><input type="checkbox" name="full" value="1"{% if busy %} disabled{% endif %}> Re-run every stage (skip reuse of unchanged stages)</label>
     <div class="controls"><button type="submit"{% if busy %} disabled{% endif %}>Scan</button></div>
   </form>
 </section>

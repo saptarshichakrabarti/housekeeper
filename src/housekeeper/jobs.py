@@ -2,9 +2,11 @@ import json
 import os
 import platform
 import signal
+import sqlite3
 import time
 from collections.abc import Iterator
 from contextlib import contextmanager
+from pathlib import Path
 from typing import Any
 
 from .database import Database
@@ -38,6 +40,62 @@ TERMINAL_STATES = {"CANCELLED", "COMPLETED", "COMPLETED_WITH_ERRORS", "FAILED", 
 # gone, a job left in one of these is orphaned and the reaper settles it — see reconcile_stale_jobs.
 ACTIVE_STATES = {"RUNNING", "PAUSING", "CANCELLING"}
 
+# How long a control request waits for SQLite's single write lock before falling back to the file
+# channel below. Short on purpose: the click must feel immediate, and the file has already recorded
+# the request by then, so losing the race costs nothing.
+CONTROL_BUSY_TIMEOUT_MS = 200
+
+
+def control_path(database: Database, job_id: int) -> Path:
+    return database.path.parent / f"job-{job_id}.stop"
+
+
+def pending_control(database: Database, job_id: int) -> str:
+    """The stop request recorded out-of-band for this job — ``CANCELLING``, ``PAUSING`` or ``""``.
+
+    A stop request is a *write* to the jobs table, and SQLite has exactly one writer: a stage
+    holding its transaction open (a scan batch, a whole analyser) blocks that write past
+    ``busy_timeout``, so the request used to be lost entirely and the button did nothing at all.
+    The request is therefore written to a file first, which needs no lock, and the worker — which
+    already owns the write lock — performs the durable transition itself at its next checkpoint.
+    """
+    try:
+        return control_path(database, job_id).read_text(encoding="utf-8").strip()
+    except OSError:
+        return ""
+
+
+def _request_control(database: Database, job_id: int, status: str) -> None:
+    """Record a stop request out-of-band, then try to publish it to the row as well."""
+    if status == "PAUSING" and pending_control(database, job_id) == "CANCELLING":
+        return  # cancel wins over pause here as it does at the checkpoint
+    control_path(database, job_id).write_text(status, encoding="utf-8")
+    connection = database.connect()
+    connection.execute(f"PRAGMA busy_timeout={CONTROL_BUSY_TIMEOUT_MS}")
+    try:
+        # Guarded in SQL rather than by the status read above: the worker can see the file and
+        # settle the row while this statement is still waiting for the lock, and an unguarded write
+        # would then resurrect the finished job as CANCELLING, with no worker left to settle it.
+        terminal = ",".join("?" for _ in TERMINAL_STATES)
+        changed = connection.execute(
+            f"UPDATE jobs SET status=?,updated_at=CURRENT_TIMESTAMP "
+            f"WHERE id=? AND status NOT IN ({terminal})",
+            (status, job_id, *sorted(TERMINAL_STATES)),
+        ).rowcount
+        connection.commit()
+        if not changed:
+            _clear_control(database, job_id)  # already finished; there is nothing to ask of it
+    except sqlite3.OperationalError:
+        # A worker is mid-transaction. It will see the file and settle the row itself; the UI reads
+        # the same file, so the job still shows as stopping in the meantime.
+        pass
+    finally:
+        connection.execute("PRAGMA busy_timeout=5000")
+
+
+def _clear_control(database: Database, job_id: int) -> None:
+    control_path(database, job_id).unlink(missing_ok=True)
+
 
 def create_job(
     database: Database,
@@ -63,6 +121,9 @@ def create_job(
     )
     database.connect().commit()
     assert cur.lastrowid is not None
+    # `database purge` deletes every job row, so ids start again at 1. Drop any stop request left
+    # over from the job that used to have this id, or the new one would cancel itself immediately.
+    _clear_control(database, cur.lastrowid)
     return cur.lastrowid
 
 
@@ -108,6 +169,8 @@ def update_job(
     # which is what turned a million-entry stage into a million fsync-bounded transactions.
     if status is not None:
         database.connect().commit()
+    if status in TERMINAL_STATES:
+        _clear_control(database, job_id)  # the request has been honoured
 
 
 # Parent chains are shallow (pipeline -> stage today); the bound only guards a corrupt cycle.
@@ -163,7 +226,7 @@ def request_cancel(database: Database, job_id: int) -> None:
     if status == "PAUSED":
         update_job(database, root["id"], "CANCELLED")
         return
-    update_job(database, root["id"], "CANCELLING")
+    _request_control(database, root["id"], "CANCELLING")
 
 
 def request_pause(database: Database, job_id: int) -> None:
@@ -177,7 +240,7 @@ def request_pause(database: Database, job_id: int) -> None:
     root = pipeline_root(database, job_id)
     if not root or root["status"] not in {"PENDING", "RUNNING"}:
         raise ValueError("only pending or running jobs can be paused")
-    update_job(database, root["id"], "PAUSING")
+    _request_control(database, root["id"], "PAUSING")
 
 
 def resume_job(database: Database, job_id: int) -> None:
@@ -197,12 +260,21 @@ WITH RECURSIVE lineage(id, parent_job_id, status, depth) AS (
     FROM jobs j JOIN lineage l ON j.id = l.parent_job_id
     WHERE l.depth < {_MAX_LINEAGE_DEPTH}
 )
-SELECT status FROM lineage
+SELECT id, status FROM lineage
 """
 
 
 def _lineage_statuses(database: Database, job_id: int) -> set[str]:
-    return {str(row["status"]) for row in database.fetch_all(_LINEAGE_STATUS_SQL, (job_id,))}
+    """Every state that applies to this job, its own row and its ancestors' — requests included.
+
+    A request that could not take the write lock lives only in a file (see ``pending_control``), so
+    the file counts as a state here: that is what makes one poll answer both channels.
+    """
+    statuses = set()
+    for row in database.fetch_all(_LINEAGE_STATUS_SQL, (job_id,)):
+        statuses.add(str(row["status"]))
+        statuses.add(pending_control(database, int(row["id"])))
+    return statuses - {""}
 
 
 def cancellation_requested(database: Database, job_id: int) -> bool:
@@ -215,10 +287,13 @@ def pause_requested(database: Database, job_id: int) -> bool:
 
 # Cancellation is a human-scale event: polling faster than this buys nothing and costs a query.
 CANCELLATION_POLL_SECONDS = 0.25
-# One slot, because checks are hot-looped for a single job at a time. If two jobs interleave the
-# slot just flips and both poll every call — slower, never wrong. Keyed by database as well as job
-# id: job ids restart at 1 in every new workspace, and the two are not the same job.
-_last_poll: tuple[object, float] = (None, 0.0)
+# Last poll time per job. Pipelines interleave checks between a stage's per-entry checkpoints and
+# tracked_job's own entry/exit checks, and a single slot would flip on every call, defeating the
+# throttle. Keyed by database as well as job id: job ids restart at 1 in every new workspace, and
+# the two are not the same job.
+# ponytail: plain dict, oldest-first eviction at 8 entries — a pipeline touches ~2 jobs at once.
+_POLL_CACHE_SIZE = 8
+_last_poll: dict[tuple[str, int], float] = {}
 
 # How often a progress-only update is made visible to other processes. Progress is telemetry, not
 # state: publishing it costs a transaction, and nobody reads a bar faster than this.
@@ -238,13 +313,13 @@ def check_cancelled(database: Database, job_id: int) -> None:
     when the *pipeline* is asked to pause or cancel, which is how one button controls a whole
     quickstart/analyse-all run. Cancel wins over pause when both appear in the lineage.
     """
-    global _last_poll
     key = (str(database.path), job_id)
-    last_key, last_time = _last_poll
     now = time.monotonic()
-    if last_key == key and now - last_time < CANCELLATION_POLL_SECONDS:
+    if now - _last_poll.get(key, 0.0) < CANCELLATION_POLL_SECONDS:
         return
-    _last_poll = (key, now)
+    if len(_last_poll) >= _POLL_CACHE_SIZE and key not in _last_poll:
+        del _last_poll[next(iter(_last_poll))]
+    _last_poll[key] = now
     statuses = _lineage_statuses(database, job_id)
     if statuses & {"CANCELLING", "CANCELLED"}:
         update_job(database, job_id, "CANCELLED")

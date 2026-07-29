@@ -7,12 +7,16 @@ that a representative directory-overlap job and a collections job (which had no 
 before this change) both stop at their next checkpoint when paused or cancelled.
 """
 
+import time
+
 import pytest
 
 import housekeeper.jobs as jobs_module
 from housekeeper.analysers.directory_overlap import run_directory_overlap_analysis
 from housekeeper.analysers.exact_duplicates import run_exact_duplicate_analysis
 from housekeeper.collections.events import run_acquisition_batch_analysis
+from housekeeper.core import counters
+from housekeeper.database import Database
 from housekeeper.jobs import (
     JobCancelled,
     JobPaused,
@@ -29,7 +33,7 @@ from housekeeper.scanner import DriveScanner
 def _reset_poll_throttle():
     # check_cancelled polls at most every CANCELLATION_POLL_SECONDS per job; tests that issue a
     # request and immediately checkpoint the same job must not be suppressed by that throttle.
-    jobs_module._last_poll = (None, 0.0)
+    jobs_module._last_poll.clear()
 
 
 def _status(database, job_id):
@@ -198,3 +202,55 @@ def test_reaper_keeps_pipeline_root_alive_while_a_stage_beats(database):
     reaped = jobs_module.reconcile_stale_jobs(database)
     assert reaped == []
     assert _status(database, parent) == "RUNNING"
+
+
+def test_stop_request_reaches_a_worker_holding_the_write_lock(database, config):
+    """Cancel must not need SQLite's single write lock — the running worker is holding it.
+
+    A stage keeps one transaction open (the scanner per batch, most analysers for the whole stage),
+    so the UPDATE behind the button waited out ``busy_timeout`` and then raised: the request was
+    lost and the click did nothing at all. It is now recorded out-of-band and the worker, which owns
+    the lock, settles the row itself.
+    """
+    _reset_poll_throttle()
+    job_id = create_job(database, "SCAN")
+    update_job(database, job_id, "RUNNING")
+    update_job(database, job_id, processed_count=1)  # a progress write: transaction open, no commit
+    assert database.connect().in_transaction
+
+    dashboard = Database(config.database_path)  # a second connection, as the dashboard has
+    started = time.monotonic()
+    request_cancel(dashboard, job_id)
+    assert time.monotonic() - started < 2.0  # not busy_timeout followed by an error
+    assert _status(dashboard, job_id) == "RUNNING"  # the row itself could not be written...
+    assert jobs_module.pending_control(dashboard, job_id) == "CANCELLING"  # ...the request survives
+    dashboard.close()
+
+    with pytest.raises(JobCancelled):
+        checkpoint(database, job_id, processed_count=2)
+    assert _status(database, job_id) == "CANCELLED"
+    assert jobs_module.pending_control(database, job_id) == ""  # honoured, so cleared
+
+
+def test_new_job_does_not_inherit_a_stop_request_from_a_reused_id(database):
+    # `database purge` deletes every job row, so ids start again at 1. A stop request left behind by
+    # a worker that never settled must not cancel the next job to be handed that id.
+    job_id = create_job(database, "SCAN")
+    jobs_module.control_path(database, job_id + 1).write_text("CANCELLING", encoding="utf-8")
+    assert create_job(database, "SCAN") == job_id + 1
+    assert jobs_module.pending_control(database, job_id + 1) == ""
+
+
+def test_poll_throttle_survives_interleaved_jobs(database):
+    # A pipeline interleaves a stage's per-entry checkpoints with the root's own checks. With a
+    # single throttle slot that flip made every call poll; each job now keeps its own timestamp,
+    # so a burst of interleaved checks costs one lineage query per job, not one per call.
+    _reset_poll_throttle()
+    stage, root = create_job(database, "SCAN"), create_job(database, "QUICKSTART")
+    for job_id in (stage, root):
+        update_job(database, job_id, "RUNNING")
+    with counters.recording() as counts:
+        for _ in range(10):
+            jobs_module.check_cancelled(database, stage)
+            jobs_module.check_cancelled(database, root)
+    assert counts["sql_statements"] == 2

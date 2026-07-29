@@ -97,6 +97,22 @@ HOT_PATH_QUERIES = [
            WHERE e.entry_type='file'""",
         forbids=("SCAN m", "SCAN m2", "SCAN l", "SCAN exact_duplicate_members"),
     ),
+    Case(
+        # Cross-drive coverage: one indexed anti-join per source. Visiting every file of the source
+        # is the point; what must not happen is a scan of the content-link table per file.
+        "coverage_membership",
+        """SELECT CASE WHEN l.entry_id IS NULL THEN 'unknown'
+                  WHEN EXISTS(SELECT 1 FROM entry_content_links l2
+                              JOIN current_entries o ON o.id=l2.entry_id
+                              WHERE l2.content_object_id=l.content_object_id
+                                AND o.source_root_id<>e.source_root_id)
+                  THEN 'covered' ELSE 'unique' END state, COUNT(*) n
+           FROM current_entries e
+           LEFT JOIN entry_content_links l ON l.entry_id=e.id AND l.link_status='VERIFIED'
+           WHERE e.source_root_id=? AND e.entry_type='file' GROUP BY state""",
+        (1,),
+        forbids=("SCAN l", "SCAN l2", "SCAN entry_content_links"),
+    ),
 ]
 
 

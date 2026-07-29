@@ -1,0 +1,34 @@
+{% extends "_base.html.j2" %}
+{% block content %}
+<p class="facts">For each source: how many of its files have the same content, verified by hash, on
+at least one <em>other</em> source. "Verified elsewhere" is a statement about where content was
+found — <b>not</b> that anything is safe to delete. Files with no verified hash are counted as
+unknown, never as covered.</p>
+{% if not comparable %}
+<p class="warn">Only one source has been scanned, so there is nothing to compare it against. Scan a
+second drive to see which of its files exist in both places.</p>
+{% endif %}
+{% for source in sources %}
+<h2>{{ source.name }} <small class="path">({{ source.path }})</small></h2>
+<p>{{ source.summary }}</p>
+<div class="cards">
+  <div class="card"><b>{{ source.buckets.covered.count }}</b>verified elsewhere<br>
+    <small>{{ source.buckets.covered.bytes | human_size }}</small></div>
+  <div class="card"><b>{{ source.buckets.unique.count }}</b>only copy here<br>
+    <small>{{ source.buckets.unique.bytes | human_size }}</small></div>
+  <div class="card"><b>{{ source.buckets.unknown.count }}</b>unknown (no hash)<br>
+    <small>{{ source.buckets.unknown.bytes | human_size }}</small></div>
+</div>
+{% if source.unique_files %}
+<h3>Largest files with no verified copy elsewhere</h3>
+<div class="overflow"><table>
+  <tr><th>Path</th><th class="num">Size</th></tr>
+  {% for f in source.unique_files %}
+  <tr><td class="path">{{ f.relative_path }}</td><td class="num">{{ f.size_bytes | human_size }}</td></tr>
+  {% endfor %}
+</table></div>
+{% endif %}
+{% else %}
+<p>No source has a completed scan yet.</p>
+{% endfor %}
+{% endblock %}

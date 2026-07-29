@@ -257,3 +257,42 @@ def test_content_errors_and_exceptions_are_committed_per_batch(
     )["n"] == files // 2
     # Identity has one commit, artifacts ceil(120/50)=3, and the final flush is a small constant.
     assert counted["commits"] <= 8, counted
+
+
+@pytest.fixture(scope="module")
+def quickstart_rerun_counts(tmp_path_factory):
+    """A full quickstart, an unchanged incremental re-run, and an unchanged forced full re-run."""
+    from housekeeper.config import load_config
+    from housekeeper.database import Database
+    from housekeeper.quickstart import run_quickstart
+
+    base = tmp_path_factory.mktemp("quickstart-rerun")
+    corpus = build_flat_corpus(base / "corpus", file_count=400, dir_count=10)
+    config = load_config(workspace_override=base / "workspace")
+    database = Database(config.database_path)
+    database.initialize()
+    runs = {}
+    try:
+        for name, kwargs in (("first", {}), ("incremental", {}), ("forced", {"full": True})):
+            with counters.recording() as counted:
+                run_quickstart(database, config, corpus, generate_reports=False, **kwargs)
+            runs[name] = counted
+    finally:
+        database.close()
+    return runs
+
+
+def test_unchanged_quickstart_rerun_stays_a_small_constant_per_entry(quickstart_rerun_counts):
+    """The whole ~21-stage pipeline, not just the scan, on a tree nobody touched.
+
+    A quickstart re-run has an irreducible O(entries) floor — the new snapshot is still recorded, and
+    every stage keyed to entry ids has to re-derive its rows for it. What must hold is that it stays
+    a small constant per entry, and that reusing the content-keyed stages costs strictly less than
+    forcing them (`--full`) on the very same unchanged snapshot.
+    """
+    runs = quickstart_rerun_counts
+    per_entry = runs["incremental"]["sql_statements"] / runs["incremental"]["entries_enumerated"]
+    assert per_entry < 8.0, f"{per_entry:.2f} statements per entry on an unchanged quickstart re-run"
+    assert runs["incremental"]["sql_statements"] < runs["first"]["sql_statements"] * 0.6
+    assert runs["incremental"]["sql_statements"] < runs["forced"]["sql_statements"]
+    assert runs["incremental"]["source_bytes_read"] == 0

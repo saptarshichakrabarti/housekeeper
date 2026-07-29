@@ -47,7 +47,8 @@ def test_cancelled_job_is_static_and_labelled(client, database):
     job_id = create_job(database, "EXACT_DUPLICATES")
     update_job(database, job_id, "RUNNING", processed_count=25124)
     update_job(database, job_id, "CANCELLED")
-    row_html = client.get("/fragments/jobs").text
+    # The rows only: the fragment's filter form is full of `</select>`, which contains "/s".
+    row_html = client.get("/fragments/jobs").text.split("<tbody>", 1)[1]
     assert "cancelled · 25,124 processed" in row_html
     # No indeterminate (animated) progress element, and no fabricated throughput.
     assert "<progress></progress>" not in row_html
@@ -103,6 +104,30 @@ def test_pause_on_stage_row_pauses_the_whole_run(client, database):
     assert resp.status_code == 200
     root_status = database.fetch_one("SELECT status FROM jobs WHERE id=?", (parent,))["status"]
     assert root_status == "PAUSING"
+
+
+def test_stop_controls_replace_the_row_they_target(client, database):
+    # The endpoint answers with a whole <tr>. htmx's default innerHTML nested that inside the row it
+    # was meant to replace, leaving the row's own status text on screen — the click looked dead.
+    job_id = create_job(database, "SCAN")
+    update_job(database, job_id, "RUNNING")
+    html = client.get("/fragments/jobs").text
+    for action in ("pause", "cancel"):
+        marker = f"/fragments/jobs/{job_id}/control?action={action}'"
+        assert f"{marker} hx-target='closest tr' hx-swap='outerHTML'" in html
+
+
+def test_row_shows_stopping_while_the_request_is_still_out_of_band(client, database):
+    # A cancel that could not take the write lock lives in a file until the worker settles the row.
+    # The table must reflect it, or an accepted request reads as a button that did nothing.
+    from housekeeper.jobs import control_path
+
+    job_id = create_job(database, "SCAN")
+    update_job(database, job_id, "RUNNING", processed_count=3)
+    control_path(database, job_id).write_text("CANCELLING", encoding="utf-8")
+    body = client.get("/fragments/jobs").text.split("<tbody>", 1)[1]
+    assert "stopping…" in body
+    assert f"/fragments/jobs/{job_id}/control?action=pause" not in body  # already stopping
 
 
 def test_stage_rows_are_marked_as_part_of_their_run(client, database):
@@ -181,3 +206,140 @@ def test_read_only_dashboard_does_not_reconcile(config, database):
     ro_client = TestClient(create_app(database, read_only=True))
     ro_client.get("/fragments/jobs")
     assert database.fetch_one("SELECT status FROM jobs WHERE id=?", (job_id,))["status"] == "RUNNING"
+
+
+def _paused_quickstart(database, source_root="/tmp/drive"):
+    import json
+
+    job_id = create_job(database, "QUICKSTART", {"source_root": source_root})
+    update_job(database, job_id, "RUNNING")
+    update_job(database, job_id, "PAUSED")
+    assert json.loads(
+        database.fetch_one("SELECT scope_json FROM jobs WHERE id=?", (job_id,))["scope_json"]
+    )["source_root"] == source_root
+    return job_id
+
+
+def test_paused_pipeline_offers_resume(client, database):
+    job_id = _paused_quickstart(database)
+    html = client.get("/fragments/jobs").text
+    assert f"/fragments/jobs/{job_id}/control?action=resume" in html
+    # Cancel stays: a paused run must always be stoppable for good.
+    assert f"/fragments/jobs/{job_id}/control?action=cancel" in html
+
+
+def test_interrupted_and_failed_pipelines_offer_resume(client, database):
+    for status in ("INTERRUPTED", "FAILED", "CANCELLED"):
+        job_id = create_job(database, "QUICKSTART", {"source_root": "/tmp/drive"})
+        update_job(database, job_id, "RUNNING")
+        update_job(database, job_id, status)
+        assert f"/fragments/jobs/{job_id}/control?action=resume" in client.get("/fragments/jobs").text
+
+
+def test_completed_job_offers_no_resume(client, database):
+    job_id = create_job(database, "QUICKSTART", {"source_root": "/tmp/drive"})
+    update_job(database, job_id, "COMPLETED")
+    assert f"/fragments/jobs/{job_id}/control" not in client.get("/fragments/jobs").text
+    resp = client.post(
+        f"/fragments/jobs/{job_id}/control?action=resume", headers={"X-CSRF-Token": _csrf(client)}
+    )
+    assert resp.status_code == 422
+
+
+def test_stage_row_offers_no_resume_of_its_own(client, database):
+    parent, child = _pipeline(database)
+    update_job(database, parent, "INTERRUPTED")
+    update_job(database, child, "INTERRUPTED")
+    html = client.get("/fragments/jobs").text
+    # The run is resumable; the stage is resumed through it, not on its own.
+    assert f"/fragments/jobs/{parent}/control?action=resume" in html
+    assert f"/fragments/jobs/{child}/control?action=resume" not in html
+
+
+def test_read_only_dashboard_never_offers_resume(config, database):
+    from fastapi.testclient import TestClient
+
+    from housekeeper.dashboard.app import create_app
+
+    _paused_quickstart(database)
+    viewer = TestClient(create_app(database, read_only=True, config=config))
+    assert "action=resume" not in viewer.get("/fragments/jobs").text
+
+
+def test_resume_starts_a_new_pipeline_linked_to_the_old_one(client, database, tmp_path):
+    import json
+
+    source = tmp_path / "drive"
+    (source / "sub").mkdir(parents=True)
+    (source / "sub" / "a.txt").write_text("content", encoding="utf-8")
+    old = _paused_quickstart(database, str(source))
+    resp = client.post(
+        f"/fragments/jobs/{old}/control?action=resume", headers={"X-CSRF-Token": _csrf(client)}
+    )
+    assert resp.status_code == 200
+    _wait_for_new_quickstart(database, old)
+    row = database.fetch_one(
+        "SELECT id,scope_json FROM jobs WHERE job_type='QUICKSTART' AND id<>? ORDER BY id DESC LIMIT 1",
+        (old,),
+    )
+    assert json.loads(row["scope_json"])["resumes"] == old
+    # The old row is left terminal: what happened to it is a fact, not something a resume rewrites.
+    assert database.fetch_one("SELECT status FROM jobs WHERE id=?", (old,))["status"] == "PAUSED"
+
+
+def _wait_for_new_quickstart(database, old_id, timeout=30):
+    import time
+
+    deadline = time.monotonic() + timeout
+    while time.monotonic() < deadline:
+        row = database.fetch_one(
+            "SELECT status FROM jobs WHERE job_type='QUICKSTART' AND id<>? ORDER BY id DESC LIMIT 1",
+            (old_id,),
+        )
+        if row and row["status"] in {"COMPLETED", "COMPLETED_WITH_ERRORS", "FAILED"}:
+            return
+        time.sleep(0.05)
+    raise TimeoutError("the resumed pipeline did not finish in time")
+
+
+def test_jobs_filter_narrows_by_type_and_status(client, database):
+    scan = create_job(database, "SCAN")
+    update_job(database, scan, "COMPLETED")
+    classification = create_job(database, "CLASSIFICATION")
+    update_job(database, classification, "FAILED")
+    only_scan = client.get("/fragments/jobs?job_type=SCAN").text.split("<tbody>", 1)[1]
+    assert "SCAN" in only_scan and "CLASSIFICATION" not in only_scan
+    only_failed = client.get("/fragments/jobs?status=FAILED").text.split("<tbody>", 1)[1]
+    assert "CLASSIFICATION" in only_failed and "SCAN" not in only_failed
+    # The filter survives the poll, so a refresh cannot silently widen the list.
+    assert "job_type=SCAN" in client.get("/fragments/jobs?job_type=SCAN").text
+
+
+def test_pipelines_only_filter_hides_stages(client, database):
+    parent, child = _pipeline(database)
+    rows = client.get("/fragments/jobs?pipelines_only=1").text.split("<tbody>", 1)[1]
+    assert f"<td>{parent}</td>" in rows
+    assert f"<td>{child}</td>" not in rows
+
+
+def test_durations_are_shown_for_finished_and_running_jobs(client, database):
+    finished = create_job(database, "SCAN")
+    database.connect().execute(
+        "UPDATE jobs SET status='COMPLETED',started_at='2024-01-01 00:00:00',"
+        "completed_at='2024-01-01 00:02:30' WHERE id=?",
+        (finished,),
+    )
+    database.connect().commit()
+    assert "02:30" in client.get("/fragments/jobs").text
+    running = create_job(database, "SCAN")
+    update_job(database, running, "RUNNING")
+    assert "elapsed" in client.get("/fragments/jobs").text
+
+
+def test_pipeline_root_expands_to_its_stages(client, database):
+    parent, child = _pipeline(database)
+    assert f"/fragments/jobs/{parent}/stages" in client.get("/fragments/jobs").text
+    stages = client.get(f"/fragments/jobs/{parent}/stages").text
+    assert f"<td>{child}</td>" in stages and "SCAN" in stages
+    # A job with no children says so rather than rendering an empty table.
+    assert "No stages recorded" in client.get(f"/fragments/jobs/{child}/stages").text

@@ -10,6 +10,7 @@ from urllib.parse import urlencode
 
 from ..config import DEFAULTS, AppConfig
 from ..core.progress import eta_seconds, format_duration, seconds_since, throughput
+from ..review.wizard import MAX_GROUPS_PER_REQUEST
 
 
 def create_app(
@@ -101,6 +102,7 @@ def create_app(
                 "items": [
                     ("review", "Review"),
                     ("duplicates", "Duplicates"),
+                    ("wizard", "Dupe wizard"),
                     ("advanced-duplicates", "Advanced dupes"),
                     ("chunk-overlap", "Chunk overlap"),
                 ],
@@ -116,6 +118,8 @@ def create_app(
                     ("backups", "Backups"),
                     ("record-series", "Record series"),
                     ("preservation", "Preservation"),
+                    ("coverage", "Coverage"),
+                    ("treemap", "Treemap"),
                 ],
             },
             {
@@ -163,6 +167,9 @@ def create_app(
     ) -> HTMLResponse:
         body = templates.get_template(template_name).render(**context)
         return page(title, body, scripts=scripts, active_path=active_path)
+
+    def template_fragment(template_name: str, **context) -> HTMLResponse:
+        return HTMLResponse(templates.get_template(template_name).render(**context))
 
     BYTE_COLUMNS = {
         "bytes",
@@ -277,34 +284,100 @@ def create_app(
             )
         return f"{label} · {processed:,} processed"
 
-    def job_controls(job_id: int, status: str) -> str:
+    RESUMABLE_STATES = {"PAUSED", "CANCELLED", "FAILED", "INTERRUPTED"}
+
+    def job_controls(row) -> str:
         """The control buttons a job's *current* status actually supports.
 
         Pause is only meaningful while a worker is running; Cancel stays available right through the
         stopping states (PAUSING/PAUSED) so a user is never left with a job they cannot stop.
-        Transitional CANCELLING and terminal states offer nothing — a live worker settles the first
-        and the reaper settles an orphan, so an extra button would be a lie about what the click
-        does."""
+        Transitional CANCELLING offers nothing — a live worker settles it, and the reaper settles an
+        orphan, so an extra button would be a lie about what the click does.
+
+        Resume appears on a *stopped pipeline root* only, and only where a runner can act on it: a
+        viewer dashboard has nothing to start, a stage is resumed through its run, and a completed
+        run has nothing left to do."""
+        job_id, status = int(row["id"]), row["status"]
+        # outerHTML, not the default innerHTML: the endpoint answers with a whole <tr>, which
+        # innerHTML nested *inside* the row it was supposed to replace — the click then left the
+        # row's own status text untouched, which is exactly what "the button does nothing" looks
+        # like.
         pause = (
             f"<button hx-post='/fragments/jobs/{job_id}/control?action=pause' "
-            f"hx-target='closest tr'>Pause</button> "
+            f"hx-target='closest tr' hx-swap='outerHTML'>Pause</button> "
         )
         cancel = (
             f"<button hx-post='/fragments/jobs/{job_id}/control?action=cancel' "
-            f"hx-target='closest tr'>Cancel</button>"
+            f"hx-target='closest tr' hx-swap='outerHTML'>Cancel</button>"
         )
         if status in {"PENDING", "RUNNING"}:
             return pause + cancel
+        if status == "PAUSED" and _is_resumable(row):
+            return _resume_button(job_id) + " " + cancel
         if status in {"PAUSING", "PAUSED"}:
             return cancel
+        if _is_resumable(row):
+            return _resume_button(job_id)
         return ""
 
-    def jobs_table(rows) -> str:
+    def _is_resumable(row) -> bool:
+        if runner is None or row["status"] not in RESUMABLE_STATES or row["parent_job_id"]:
+            return False
+        from .runner import RESUMABLE
+
+        return str(row["job_type"]) in RESUMABLE
+
+    def _resume_button(job_id: int) -> str:
+        return (
+            f"<button hx-post='/fragments/jobs/{job_id}/control?action=resume' "
+            f"hx-target='closest tr' hx-swap='outerHTML'>Resume</button>"
+        )
+
+    def stage_label(row) -> str:
+        scope = json.loads(row["scope_json"] or "{}")
+        return str(scope.get("quickstart") or scope.get("gui") or "")
+
+    def duration_cell(row, medians: dict[str, float] | None = None) -> str:
+        """How long the job took, or has been going. Never a guess about how long is left.
+
+        ``completed_at - started_at`` is already on every row. For a job still running the same
+        subtraction is elapsed time, labelled as such, plus — where enough completed jobs of the type
+        exist to say so — the median of those as advisory context.
+        """
+        seconds = row["duration_seconds"]
+        if row["started_at"] is None or seconds is None:
+            return ""
+        if row["status"] not in ACTIVE_JOB_STATES:
+            return escape(format_duration(int(seconds)))
+        typical = (medians or {}).get(str(row["job_type"]))
+        advisory = f" · typically ~{escape(format_duration(int(typical)))}" if typical else ""
+        return f"{escape(format_duration(int(seconds)))} elapsed{advisory}"
+
+    def stage_medians() -> dict[str, float]:
+        """Median completed duration per job type, for the advisory note on a running job.
+
+        ponytail: computed from the jobs table on render rather than materialized at pipeline
+        completion — the table is a row per stage, and a median of it is not a query worth caching.
+        """
+        from statistics import median
+
+        rows = reader.fetch_all(
+            "SELECT job_type,CAST((julianday(completed_at)-julianday(started_at))*86400 AS INTEGER) "
+            "seconds FROM jobs WHERE status='COMPLETED' AND started_at IS NOT NULL "
+            "AND completed_at IS NOT NULL"
+        )
+        by_type: dict[str, list[int]] = {}
+        for row in rows:
+            by_type.setdefault(str(row["job_type"]), []).append(int(row["seconds"]))
+        return {name: median(values) for name, values in by_type.items() if any(values)}
+
+    def jobs_table(rows, medians: dict[str, float] | None = None, roots: set[int] | None = None) -> str:
         headings = [
             "id",
             "job_type",
             "status",
             "progress",
+            "duration",
             "success_count",
             "skip_count",
             "error_count",
@@ -318,6 +391,15 @@ def create_app(
             for heading in headings:
                 if heading == "progress":
                     cells += f"<td>{progress_cell(row)}</td>"
+                elif heading == "duration":
+                    cells += f"<td>{duration_cell(row, medians)}</td>"
+                elif heading == "job_type" and not parent and int(row["id"]) in (roots or set()):
+                    # A pipeline root: its stages are one click away, from data already on the rows.
+                    cells += (
+                        f"<td>{display_cell(heading, row[heading])} "
+                        f"<button hx-get='/fragments/jobs/{int(row['id'])}/stages' "
+                        f"hx-target='closest tr' hx-swap='afterend'>stages</button></td>"
+                    )
                 elif heading == "job_type" and parent:
                     # A stage of a pipeline run: mark it so the hierarchy is visible, and make
                     # clear that its controls act on the whole run (job control requests
@@ -328,7 +410,7 @@ def create_app(
                     )
                 else:
                     cells += f"<td>{display_cell(heading, row[heading])}</td>"
-            controls = job_controls(row["id"], row["status"])
+            controls = job_controls(row)
             body += f"<tr>{cells}<td>{controls}</td></tr>"
         running = any(row["status"] in {"PENDING", "RUNNING", "PAUSING", "CANCELLING"} for row in rows)
         completed_count = next(
@@ -679,6 +761,94 @@ def create_app(
             (entry_id,),
         )
         return {**dict(entry), **(dict(summary) if summary else {})}
+
+    @app.get("/wizard", response_class=HTMLResponse)
+    def wizard_page():
+        """Rule-based bulk duplicate review. Records decisions; never moves or deletes anything."""
+        from ..review.wizard import RULES
+
+        return template_page(
+            "Duplicate wizard",
+            "wizard.html",
+            active_path="wizard",
+            rules=RULES,
+            read_only=read_only,
+            sessions=[
+                dict(row)
+                for row in reader.fetch_all(
+                    "SELECT id,name,status FROM review_sessions WHERE status NOT IN "
+                    "('LOCKED','EXPORTED','ARCHIVED') ORDER BY updated_at DESC LIMIT 50"
+                )
+            ],
+        )
+
+    @app.get("/fragments/wizard/preview", response_class=HTMLResponse)
+    def wizard_preview_fragment(
+        session_id: int = Query(..., ge=1),
+        rule: str = Query(...),
+        path_prefix: str = Query("", max_length=1024),
+        after_id: int = Query(0, ge=0),
+        limit: int = Query(50, ge=1, le=MAX_GROUPS_PER_REQUEST),
+    ):
+        from ..review.wizard import preview
+
+        try:
+            plan = preview(reader, rule, path_prefix, after_id, limit, session_id)
+        except ValueError as exc:
+            raise HTTPException(422, str(exc)) from exc
+        return template_fragment(
+            "fragments/wizard_preview.html", plan=plan, applied=None, refused=None
+        )
+
+    @app.post("/fragments/wizard/apply", response_class=HTMLResponse)
+    def wizard_apply_fragment(
+        session_id: Annotated[int, Form()],
+        rule: Annotated[str, Form()],
+        fingerprint: Annotated[str, Form()],
+        path_prefix: Annotated[str, Form()] = "",
+        after_id: Annotated[int, Form()] = 0,
+        limit: Annotated[int, Form()] = 50,
+        x_csrf_token: str | None = Header(default=None),
+    ):
+        guard(x_csrf_token)
+        from ..review.wizard import apply_rule, preview
+
+        try:
+            applied = apply_rule(
+                database,
+                session_id,
+                rule,
+                path_prefix,
+                after_id,
+                limit,
+                expected_fingerprint=fingerprint,
+            )
+            plan = preview(reader, rule, path_prefix, after_id, limit, session_id)
+        except ValueError as exc:
+            # A changed preview is the expected case here, not a server fault: re-render the current
+            # plan with the reason, so the user reads the new one instead of a bare error.
+            plan = preview(reader, rule, path_prefix, after_id, limit, session_id)
+            return template_fragment(
+                "fragments/wizard_preview.html", plan=plan, applied=None, refused=str(exc)
+            )
+        return template_fragment("fragments/wizard_preview.html", plan=plan, applied=applied)
+
+    @app.get("/coverage", response_class=HTMLResponse)
+    def coverage_page(limit: int = Query(20, ge=1, le=maximum_page_size)):
+        """Read-only: is this drive's content present elsewhere? Never "safe to delete"."""
+        from ..coverage import coverage as coverage_of
+        from ..coverage import source_roots
+
+        sources = source_roots(reader)
+        return template_page(
+            "Cross-drive coverage",
+            "coverage.html",
+            active_path="coverage",
+            sources=[
+                {**source, **coverage_of(reader, source["id"], limit=limit)} for source in sources
+            ],
+            comparable=len(sources) > 1,
+        )
 
     @app.get("/duplicates", response_class=HTMLResponse)
     def duplicates(
@@ -1055,26 +1225,147 @@ def create_app(
         )
 
     ACTIVE_JOB_STATES = {"PENDING", "RUNNING", "PAUSING", "CANCELLING"}
+    # One column list for every jobs query, including the duration the table renders: SQLite does the
+    # subtraction, so a running job's "elapsed" and a finished job's total are the same expression.
+    _JOB_COLUMNS = (
+        "id,job_type,status,processed_count,total_estimate,success_count,skip_count,error_count,"
+        "current_item,started_at,completed_at,updated_at,parent_job_id,scope_json,"
+        # Rounded, not truncated: julianday arithmetic is floating point, so a job that took exactly
+        # 150 seconds otherwise renders as 149.
+        "CAST(ROUND((julianday(COALESCE(completed_at,'now'))-julianday(started_at))*86400) AS INTEGER) "
+        "duration_seconds"
+    )
+
+    def _job_row(job_id: int):
+        row = reader.fetch_one(f"SELECT {_JOB_COLUMNS} FROM jobs WHERE id=?", (job_id,))
+        return _with_stop_requests([row])[0] if row else None
+
+    def _with_stop_requests(rows):
+        """Show a stop request the worker has not written to the row yet.
+
+        A pause/cancel that could not take SQLite's write lock lives in a file until the worker
+        settles it (see ``jobs.pending_control``). Without this the row a click returns still reads
+        RUNNING, so a request that *was* accepted looks like a button that did nothing.
+        """
+        from ..jobs import pending_control
+
+        out = []
+        for row in rows:
+            pending = (
+                pending_control(database, int(row["id"]))
+                if row["status"] in {"PENDING", "RUNNING"}
+                else ""
+            )
+            out.append({**row, "status": pending} if pending else row)
+        return out
+
+    def _pipeline_roots(rows) -> set[int]:
+        """Which of these rows have stages, in one query rather than one per row."""
+        ids = [int(row["id"]) for row in rows if not row["parent_job_id"]]
+        if not ids:
+            return set()
+        placeholders = ",".join("?" for _ in ids)
+        return {
+            int(row["parent_job_id"])
+            for row in reader.fetch_all(
+                f"SELECT DISTINCT parent_job_id FROM jobs WHERE parent_job_id IN ({placeholders})",
+                tuple(ids),
+            )
+        }
+
+    def jobs_filter_form(query: dict[str, str | int]) -> str:
+        types = reader.fetch_all("SELECT DISTINCT job_type FROM jobs ORDER BY job_type")
+        from ..jobs import JOB_STATES
+
+        def options(name: str, values, selected) -> str:
+            chosen = "" if selected is None else str(selected)
+            out = f"<option value=''{' selected' if not chosen else ''}>any {name}</option>"
+            for value in values:
+                mark = " selected" if str(value) == chosen else ""
+                out += f"<option value='{escape(str(value))}'{mark}>{escape(str(value))}</option>"
+            return out
+
+        checked = " checked" if query.get("pipelines_only") else ""
+        return (
+            "<form class='jobs-filter' hx-get='/fragments/jobs' hx-target='#jobs-fragment' "
+            "hx-swap='outerHTML'>"
+            f"<input type='hidden' name='limit' value='{int(query['limit'])}'>"
+            "<label>Type <select name='job_type'>"
+            + options("type", [row["job_type"] for row in types], query.get("job_type"))
+            + "</select></label> <label>Status <select name='status'>"
+            + options("status", sorted(JOB_STATES), query.get("status"))
+            + "</select></label> "
+            f"<label><input type='checkbox' name='pipelines_only' value='1'{checked}> "
+            "pipelines only</label> <button type='submit'>Filter</button></form>"
+        )
 
     @app.get("/fragments/jobs", response_class=HTMLResponse)
-    def jobs_fragment(limit: int = Query(page_size, ge=1, le=maximum_page_size)):
+    def jobs_fragment(
+        limit: int = Query(page_size, ge=1, le=maximum_page_size),
+        job_type: str | None = None,
+        status: str | None = None,
+        pipelines_only: bool = False,
+    ):
         # The jobs fragment is polled by both the Jobs page and the overview, so it is the natural
         # heartbeat for reaping orphans: within one poll interval a dead worker's row turns honest.
         maybe_reconcile()
-        rows = reader.fetch_all(
-            "SELECT id,job_type,status,processed_count,total_estimate,success_count,skip_count,error_count,current_item,started_at,updated_at,parent_job_id FROM jobs ORDER BY id DESC LIMIT ?",
-            (limit,),
+        clauses, params = [], []
+        if job_type:
+            clauses.append("job_type=?")
+            params.append(job_type)
+        if status:
+            clauses.append("status=?")
+            params.append(status)
+        if pipelines_only:
+            clauses.append("parent_job_id IS NULL")
+        where = f"WHERE {' AND '.join(clauses)}" if clauses else ""
+        rows = _with_stop_requests(
+            reader.fetch_all(
+                f"SELECT {_JOB_COLUMNS} FROM jobs {where} ORDER BY id DESC LIMIT ?",
+                (*params, limit),
+            )
         )
         # Self-suspending poll: keep the 3s cadence only while a job is actually active. When idle
         # the fragment re-arms on the `job-started` event alone (dispatched by the control endpoints
         # when an operation begins) so an idle dashboard issues no repeating job queries at all.
         active = any(row["status"] in ACTIVE_JOB_STATES for row in rows)
         trigger = "every 3s" if active else "job-started from:body"
+        query: dict[str, str | int] = {"limit": limit}
+        if job_type:
+            query["job_type"] = job_type
+        if status:
+            query["status"] = status
+        if pipelines_only:
+            query["pipelines_only"] = 1
+        # The poll keeps the filter: a refresh that silently widened the list would be a lie.
+        table = jobs_table(rows, stage_medians() if active else None, _pipeline_roots(rows))
         wrapper = (
-            f"<div id='jobs-fragment' hx-get='/fragments/jobs?limit={limit}' "
-            f"hx-trigger='{trigger}' hx-swap='outerHTML'>{jobs_table(rows)}</div>"
+            f"<div id='jobs-fragment' hx-get='/fragments/jobs?{urlencode(query)}' "
+            f"hx-trigger='{trigger}' hx-swap='outerHTML'>"
+            f"{jobs_filter_form(query)}{table}</div>"
         )
         return HTMLResponse(wrapper)
+
+    @app.get("/fragments/jobs/{job_id}/stages", response_class=HTMLResponse)
+    def job_stages_fragment(job_id: Annotated[int, ApiPath(ge=1)]):
+        """The stages of one pipeline run, as an expandable row. No new data — same columns."""
+        rows = reader.fetch_all(
+            f"SELECT {_JOB_COLUMNS} FROM jobs WHERE parent_job_id=? ORDER BY id", (job_id,)
+        )
+        if not rows:
+            return HTMLResponse(
+                "<tr><td colspan='99' class='empty-state'>No stages recorded for this run.</td></tr>"
+            )
+        body = "".join(
+            f"<tr><td>{int(row['id'])}</td><td>{escape(str(row['job_type']))}</td>"
+            f"<td>{escape(stage_label(row) or '—')}</td><td>{escape(str(row['status']))}</td>"
+            f"<td>{duration_cell(row)}</td></tr>"
+            for row in rows
+        )
+        return HTMLResponse(
+            "<tr><td colspan='99'><table><thead><tr><th>id</th><th>job_type</th><th>stage</th>"
+            f"<th>status</th><th>duration</th></tr></thead><tbody>{body}</tbody></table></td></tr>"
+        )
 
     @app.post("/fragments/jobs/{job_id}/control", response_class=HTMLResponse)
     def job_control_fragment(
@@ -1083,10 +1374,25 @@ def create_app(
         x_csrf_token: str | None = Header(default=None),
     ):
         guard(x_csrf_token)
-        if action not in {"pause", "cancel"}:
+        if action not in {"pause", "cancel", "resume"}:
             raise HTTPException(422, "invalid job control")
         from ..jobs import request_cancel, request_pause
 
+        if action == "resume":
+            if runner is None:
+                raise HTTPException(422, "this dashboard cannot start operations")
+            try:
+                accepted = runner.resume(database, job_id)
+            except ValueError as exc:
+                raise HTTPException(422, str(exc)) from exc
+            if accepted == "busy":
+                raise HTTPException(409, "an operation is already running")
+            row = _job_row(job_id)
+            table = jobs_table([row], roots=_pipeline_roots([row]))
+            return HTMLResponse(
+                table.split("<tbody>", 1)[1].split("</tbody>", 1)[0],
+                headers={"HX-Trigger": "job-started"},
+            )
         try:
             if action == "pause":
                 request_pause(database, job_id)
@@ -1099,13 +1405,10 @@ def create_app(
         # If the worker behind this job is already gone, finalize it now so the row the user gets
         # back reflects reality immediately instead of sitting in PAUSING/CANCELLING until a poll.
         maybe_reconcile()
-        row = reader.fetch_one(
-            "SELECT id,job_type,status,processed_count,total_estimate,success_count,skip_count,error_count,current_item,started_at,updated_at,parent_job_id FROM jobs WHERE id=?",
-            (job_id,),
-        )
+        row = _job_row(job_id)
         if not row:
             raise HTTPException(404, "job not found")
-        table = jobs_table([row])
+        table = jobs_table([row], roots=_pipeline_roots([row]))
         return HTMLResponse(table.split("<tbody>", 1)[1].split("</tbody>", 1)[0])
 
     if runner is not None:
@@ -1207,12 +1510,14 @@ def create_app(
 
         @app.post("/control/scan", response_class=HTMLResponse)
         def control_scan(
-            path: Annotated[str, Form()], x_csrf_token: str | None = Header(default=None)
+            path: Annotated[str, Form()],
+            full: Annotated[str | None, Form()] = None,
+            x_csrf_token: str | None = Header(default=None),
         ):
             guard(x_csrf_token)
             if not Path(path).is_dir():
                 raise HTTPException(422, "path must be an existing directory")
-            if runner.submit("quickstart", source=path) == "busy":
+            if runner.submit("quickstart", source=path, full=full is not None) == "busy":
                 raise HTTPException(409, "an operation is already running")
             return control_fragment(job_started=True)
 
@@ -1427,6 +1732,54 @@ def create_app(
             ]
         }
 
+    @app.post("/api/review/{session_id}/bulk")
+    def bulk_rule(
+        session_id: Annotated[int, ApiPath(ge=1)],
+        rule: str = Query(...),
+        fingerprint: str = Query(..., min_length=64, max_length=64),
+        path_prefix: str = Query("", max_length=1024),
+        after_id: int = Query(0, ge=0),
+        limit: int = Query(100, ge=1, le=MAX_GROUPS_PER_REQUEST),
+        x_csrf_token: str | None = Header(default=None),
+    ):
+        """Apply a duplicate-resolution rule to one page of groups.
+
+        The rule and the scope are the input; the entry list is derived here, never accepted from the
+        client. ``fingerprint`` is the preview being confirmed (from the preview endpoint) and is
+        required: without it an apply could land on groups that changed since anyone looked. Writes
+        ordinary review decisions and nothing else.
+        """
+        guard(x_csrf_token)
+        from ..review.wizard import apply_rule
+
+        try:
+            return apply_rule(
+                database,
+                session_id,
+                rule,
+                path_prefix,
+                after_id,
+                limit,
+                expected_fingerprint=fingerprint,
+            )
+        except ValueError as exc:
+            raise HTTPException(422, str(exc)) from exc
+
+    @app.get("/api/review/{session_id}/bulk/preview")
+    def bulk_rule_preview(
+        session_id: Annotated[int, ApiPath(ge=1)],
+        rule: str = Query(...),
+        path_prefix: str = Query("", max_length=1024),
+        after_id: int = Query(0, ge=0),
+        limit: int = Query(100, ge=1, le=MAX_GROUPS_PER_REQUEST),
+    ):
+        from ..review.wizard import preview
+
+        try:
+            return preview(reader, rule, path_prefix, after_id, limit, session_id)
+        except ValueError as exc:
+            raise HTTPException(422, str(exc)) from exc
+
     @app.get("/api/duplicates")
     def api_duplicates(limit: int = Query(page_size, ge=1, le=maximum_page_size), after_id: int = Query(0, ge=0)):
         return [
@@ -1580,6 +1933,29 @@ def create_app(
             return build_explorer(database, node, limit)
         except ValueError as exc:
             raise HTTPException(422, str(exc)) from exc
+
+    @app.get("/api/treemap/children")
+    def treemap_children(
+        node: str | None = Query(None, min_length=1, max_length=64),
+        limit: int = Query(80, ge=1, le=hard_nodes),
+    ):
+        """One level of the treemap: the same lazy contract as the graph, plus size aggregates."""
+        from ..graph.explorer import build_treemap
+
+        try:
+            return build_treemap(reader, node, limit)
+        except ValueError as exc:
+            raise HTTPException(422, str(exc)) from exc
+
+    @app.get("/treemap", response_class=HTMLResponse)
+    def treemap_page():
+        version = (static_dir / "treemap.js").stat().st_mtime_ns
+        return template_page(
+            "Space treemap",
+            "treemap.html",
+            scripts=f"<script defer src='/static/treemap.js?v={version}'></script>",
+            active_path="treemap",
+        )
 
     @app.get("/api/csrf")
     def csrf():

@@ -187,3 +187,171 @@ def test_review_manifests_are_never_redacted(scanned_with_a_large_file, tmp_path
     database.connect().commit()
     manifest = export_review_manifest(database, tmp_path / "review.csv", {"REVIEW_SAFE"})
     assert str(root) in manifest.read_text(encoding="utf-8")
+
+
+def test_unchanged_reports_are_not_rewritten(scanned):
+    """`report all` twice over on an untouched workspace writes nothing at all.
+
+    Guarded by mtime rather than content: identical output written twice is still the work this
+    avoids. Every output counts — the nine HTML reports *and* the CSV/JSONL exports.
+    """
+    database, config, _ = scanned
+    analyse_and_classify(database, config)
+    written = generate_all_reports(database, config)
+    assert {p.suffix for p in written} == {".html", ".csv", ".jsonl"}
+    first = {p: p.stat().st_mtime_ns for p in written}
+    generate_all_reports(database, config)
+    assert {p: p.stat().st_mtime_ns for p in first} == first
+
+
+def test_deleting_an_export_regenerates_only_that_export(scanned):
+    database, config, _ = scanned
+    analyse_and_classify(database, config)
+    paths = generate_all_reports(database, config)
+    before = {p: p.stat().st_mtime_ns for p in paths}
+    target = next(p for p in paths if p.suffix == ".csv")
+    target.unlink()
+    generate_all_reports(database, config)
+    assert target.exists()
+    assert {p: p.stat().st_mtime_ns for p in paths if p != target} == {
+        p: mtime for p, mtime in before.items() if p != target
+    }
+
+
+def test_deleting_a_report_regenerates_only_that_one(scanned):
+    database, config, _ = scanned
+    analyse_and_classify(database, config)
+    paths = [p for p in generate_all_reports(database, config) if p.suffix == ".html"]
+    before = {p: p.stat().st_mtime_ns for p in paths}
+    target = next(p for p in paths if p.name == "summary.html")
+    target.unlink()
+    generate_all_reports(database, config)
+    assert target.exists()
+    assert {p: p.stat().st_mtime_ns for p in paths if p != target} == {
+        p: mtime for p, mtime in before.items() if p != target
+    }
+
+
+def test_new_analysis_regenerates_reports(scanned):
+    """A report is derived from the analysis as well as the snapshot, so `classify` refreshes it.
+
+    Run through a tracked job, as every CLI, dashboard and quickstart path does: the reuse key is
+    the tool's record of completed work.
+    """
+    from housekeeper.jobs import tracked_job
+    from housekeeper.policies import classify_all_entries
+
+    database, config, _ = scanned
+    analyse_and_classify(database, config)
+    before = generate_report("summary", database, config).stat().st_mtime_ns
+    with tracked_job(database, "CLASSIFICATION") as job:  # no rescan, new analysis
+        classify_all_entries(database, config, job_id=job)
+    assert generate_report("summary", database, config).stat().st_mtime_ns != before
+
+
+def _changes(database, config):
+    from housekeeper.reports.contexts import changes_digest
+
+    return changes_digest(database, config)
+
+
+def test_changes_digest_reports_buckets_after_a_rescan(config, database, tmp_path):
+    """New, modified and deleted paths, counted from what the scanner already recorded."""
+    root = tmp_path / "drive"
+    root.mkdir()
+    (root / "keep.txt").write_text("stable", encoding="utf-8")
+    (root / "edit.txt").write_text("before", encoding="utf-8")
+    (root / "gone.txt").write_text("temporary", encoding="utf-8")
+    scanner = DriveScanner(database, config)
+    scanner.scan(root, incremental=True)
+    # A first scan has nothing to compare against, and says so instead of showing an empty diff.
+    first = _changes(database, config)
+    assert "first scan" in first["unavailable"]
+
+    (root / "edit.txt").write_text("after, and longer", encoding="utf-8")
+    (root / "added.txt").write_text("brand new", encoding="utf-8")
+    (root / "gone.txt").unlink()
+    scanner.scan(root, incremental=True)
+
+    digest = _changes(database, config)
+    assert "unavailable" not in digest
+    assert digest["buckets"]["NEW"]["count"] == 1
+    assert digest["buckets"]["CONTENT_POSSIBLY_CHANGED"]["count"] == 1
+    assert digest["buckets"]["MISSING"]["count"] == 1
+    assert digest["unchanged"]["count"] >= 1
+    assert "added.txt" in {f["relative_path"] for f in digest["largest"]["NEW"]}
+    assert digest["previous"]["scan_run_id"] < digest["identity"]["scan_run_id"]
+
+
+def test_changes_digest_after_purge_says_history_was_purged(scanned):
+    """A purged workspace must not report the next scan as a drive full of new files."""
+    from housekeeper.database_maintenance import purge_runs
+
+    database, config, root = scanned
+    DriveScanner(database, config).scan(root, incremental=True)
+    purge_runs(database, config)
+    DriveScanner(database, config).scan(root, incremental=True)
+    digest = _changes(database, config)
+    assert "purged" in digest["unavailable"]
+
+
+def test_changes_report_renders_both_shapes(scanned):
+    database, config, root = scanned
+    analyse_and_classify(database, config)
+    first = generate_report("changes", database, config).read_text(encoding="utf-8")
+    assert "first scan" in first
+    DriveScanner(database, config).scan(root, incremental=True)
+    analyse_and_classify(database, config)
+    second = generate_report("changes", database, config).read_text(encoding="utf-8")
+    assert "unchanged" in second
+    assert "Since the previous scan" in second
+
+
+def test_duplicate_group_delta_survives_the_analyser_rewriting_membership(config, database, tmp_path):
+    """The delta the digest exists to show, on the run where it used to be unavailable.
+
+    The exact-duplicate analyser replaces a group's members with the current snapshot's, so counting
+    stored members would report the previous snapshot as having none. The count comes from that
+    snapshot's own verified content links instead — the analyser's own definition of a duplicate group
+    within a scope — so an unchanged rescan reports a real zero, and a new copy reports a real +1.
+    """
+    from housekeeper.analysers.exact_duplicates import run_exact_duplicate_analysis
+
+    root = tmp_path / "drive"
+    root.mkdir()
+    (root / "a.txt").write_text("same payload", encoding="utf-8")
+    (root / "b.txt").write_text("same payload", encoding="utf-8")
+    scanner = DriveScanner(database, config)
+    scanner.scan(root, incremental=True)
+    run_exact_duplicate_analysis(database, config)
+    scanner.scan(root, incremental=True)
+    run_exact_duplicate_analysis(database, config)
+
+    digest = _changes(database, config)
+    assert digest["totals"]["current"]["duplicate_groups"] == 1
+    assert digest["totals"]["previous"]["duplicate_groups"] == 1
+    assert digest["deltas"]["duplicate_groups"] == 0
+    assert digest["deltas"]["reviewable_bytes"] == 0
+    assert digest["duplicate_note"] is None
+
+    # A second duplicated pair appears: the delta is the change, not an artefact of the rewrite.
+    (root / "c.txt").write_text("another payload", encoding="utf-8")
+    (root / "d.txt").write_text("another payload", encoding="utf-8")
+    scanner.scan(root, incremental=True)
+    run_exact_duplicate_analysis(database, config)
+    assert _changes(database, config)["deltas"]["duplicate_groups"] == 1
+
+
+def test_a_snapshot_that_was_never_hashed_is_not_comparable(config, database, tmp_path):
+    """A delta the data cannot support is still reported as "not comparable", never as a change."""
+    root = tmp_path / "drive"
+    root.mkdir()
+    (root / "a.txt").write_text("same payload", encoding="utf-8")
+    (root / "b.txt").write_text("same payload", encoding="utf-8")
+    scanner = DriveScanner(database, config)
+    scanner.scan(root, incremental=True)  # scan only: no identity established
+    scanner.scan(root, incremental=True)
+    analyse_and_classify(database, config)
+    digest = _changes(database, config)
+    assert digest["deltas"]["duplicate_groups"] is None
+    assert "no verified content identity" in digest["duplicate_note"]

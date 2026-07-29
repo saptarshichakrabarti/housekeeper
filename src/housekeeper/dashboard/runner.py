@@ -8,6 +8,7 @@ concurrent CLI reader.
 
 from __future__ import annotations
 
+import json
 import threading
 from collections.abc import Callable
 from concurrent.futures import ThreadPoolExecutor
@@ -32,6 +33,8 @@ analyse_KINDS = (
 )
 REPORT_KINDS = (
     "summary",
+    "changes",
+    "coverage",
     "inventory",
     "exact-duplicates",
     "directory-overlap",
@@ -40,6 +43,16 @@ REPORT_KINDS = (
     "projects",
     "errors",
 )
+
+
+#: Job types this runner knows how to start again, and the operation that does it. A row's own
+#: ``scope_json`` carries the rest (which source, which kind), so a resume needs nothing else.
+RESUMABLE: dict[str, str] = {
+    "QUICKSTART": "quickstart",
+    "ANALYSE_ALL": "analyse",
+    "CLASSIFICATION": "classify",
+    "REPORT_GENERATION": "report",
+}
 
 
 def _now_iso() -> str:
@@ -66,6 +79,7 @@ class OperationRunner:
         self._executor = ThreadPoolExecutor(max_workers=1)
         self._lock = threading.Lock()
         self._status: dict[str, Any] = _idle_status()
+        self._resumes: int | None = None
 
     def submit(self, operation: str, **kwargs: Any) -> str:
         """Accept and start ``operation`` in the background, or return "busy" if one is running."""
@@ -81,6 +95,44 @@ class OperationRunner:
         self._executor.submit(self._run, operation, kwargs)
         return "accepted"
 
+    def resume(self, database: Database, job_id: int) -> str:
+        """Start the operation an interrupted pipeline was running, again.
+
+        Resume is re-submission, not seek-to-offset: every pipeline is idempotent, so re-running is
+        safe. How much is genuinely skipped depends on the operation. A quickstart skips the
+        content-keyed stages that reached COMPLETED, by fingerprint. For the other pipelines the
+        saving is per-unit rather than per-stage: content artifacts, verified hashes and contact
+        sheets are all reused when identity, version and configuration match, so a resumed
+        analyse-all repeats the queries but not the parsing.
+
+        The old row is left terminal — a finished state is a fact about what happened — and the new
+        pipeline records ``{"resumes": old_id}`` in its scope, which is what links the two.
+        """
+        from ..jobs import pipeline_root
+
+        root = pipeline_root(database, job_id)
+        if not root:
+            raise ValueError("job not found")
+        row = database.fetch_one(
+            "SELECT job_type,status,scope_json FROM jobs WHERE id=?", (root["id"],)
+        )
+        if not row or row["status"] not in {"PAUSED", "CANCELLED", "FAILED", "INTERRUPTED"}:
+            raise ValueError("job is not resumable")
+        operation = RESUMABLE.get(str(row["job_type"]))
+        if operation is None:
+            raise ValueError(f"cannot resume a {row['job_type']} job from the dashboard")
+        scope = json.loads(row["scope_json"] or "{}")
+        kwargs: dict[str, Any] = {"resumes": int(root["id"])}
+        if operation == "quickstart":
+            kwargs["source"] = scope.get("source_root")
+            if not kwargs["source"]:
+                raise ValueError("job records no source to scan")
+        elif operation == "analyse":
+            kwargs["kind"] = "all"
+        elif operation == "report":
+            kwargs["kind"] = "all" if scope.get("gui") == "reports" else scope.get("gui", "all")
+        return self.submit(operation, **kwargs)
+
     def status(self) -> dict[str, Any]:
         with self._lock:
             return dict(self._status)
@@ -93,13 +145,21 @@ class OperationRunner:
 
     def _run(self, operation: str, kwargs: dict[str, Any]) -> None:
         database = Database(self._config.database_path)
+        # Which terminal run this one continues, recorded on every job row it creates. Instance
+        # state is safe: one operation runs at a time (see submit's busy check).
+        self._resumes = kwargs.pop("resumes", None)
         try:
             database.initialize()
             if operation == "quickstart":
                 from ..quickstart import run_quickstart
 
                 run_quickstart(
-                    database, self._config, Path(kwargs["source"]), progress=self._on_progress
+                    database,
+                    self._config,
+                    Path(kwargs["source"]),
+                    progress=self._on_progress,
+                    full=bool(kwargs.get("full")),
+                    resumes=self._resumes,
                 )
             elif operation == "analyse":
                 self._run_analyse(database, kwargs["kind"])
@@ -110,7 +170,14 @@ class OperationRunner:
             elif operation == "purge":
                 from ..database_maintenance import purge_runs
 
-                purge_runs(database, self._config)
+                # Tracked like every other operation, so a purge shows up in Jobs history and the
+                # reaper covers it. It keeps its own job row alive as it deletes the rest.
+                self._tracked(
+                    database,
+                    "PURGE",
+                    "purge",
+                    lambda job: purge_runs(database, self._config, keep_job_id=job),
+                )
             else:
                 raise ValueError(f"unknown operation: {operation}")
             # analyse/classify change the counts and charts the overview shows, so refresh the
@@ -142,10 +209,13 @@ class OperationRunner:
         callback: Callable[[int], object],
         parent_job_id: int | None = None,
     ) -> object:
+        scope: dict[str, Any] = {"gui": label}
+        if self._resumes is not None and parent_job_id is None:
+            scope["resumes"] = self._resumes
         with tracked_job(
             database,
             job_type,
-            {"gui": label},
+            scope,
             config_fingerprint(self._config),
             parent_job_id=parent_job_id,
         ) as job_id:
@@ -196,8 +266,11 @@ class OperationRunner:
         if kind == "all":
             # One pipeline job spanning every kind, so a single pause/cancel stops the whole
             # sequence instead of only the analyser that happened to be running when clicked.
+            scope: dict[str, Any] = {"gui": "analyse-all"}
+            if self._resumes is not None:
+                scope["resumes"] = self._resumes
             with tracked_job(
-                database, "ANALYSE_ALL", {"gui": "analyse-all"}, config_fingerprint(self._config)
+                database, "ANALYSE_ALL", scope, config_fingerprint(self._config)
             ) as pipeline_job:
                 for name in analyse_KINDS:
                     job_type, callback = dispatch[name]

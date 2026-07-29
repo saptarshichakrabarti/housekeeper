@@ -26,12 +26,15 @@ def vacuum(database: Database) -> None:
     database.vacuum()
 
 
-def purge_runs(database: Database, config: AppConfig) -> dict[str, object]:
+def purge_runs(
+    database: Database, config: AppConfig, keep_job_id: int | None = None
+) -> dict[str, object]:
     """Delete every recorded run, everything derived from one, and the reports they generated.
 
     The source drive is never touched: only the workspace's own database rows and report files go.
+    ``keep_job_id`` spares the job row tracking this purge — see ``Database.purge_runs``.
     """
-    deleted = database.purge_runs()
+    deleted = database.purge_runs(keep_job_id)
     reports = normalize_absolute_path(config.workspace / config.data["workspace"]["reports_dir"])
     workspace = normalize_absolute_path(config.workspace)
     # A misconfigured reports_dir would otherwise aim a recursive delete anywhere on the filesystem.
@@ -42,4 +45,12 @@ def purge_runs(database: Database, config: AppConfig) -> dict[str, object]:
         for path in sorted(reports.rglob("*"), reverse=True):  # children sort after their parent
             path.rmdir() if path.is_dir() else path.unlink()
             removed += 1
+    if keep_job_id is None:
+        # Nobody else is recording this purge (the dashboard runner wraps it in a tracked job and
+        # passes keep_job_id). Leave the marker afterwards, so the next scan's "what changed" digest
+        # can say the history was purged instead of reporting a drive full of new files.
+        from .jobs import create_job, update_job
+
+        job = create_job(database, "PURGE", {"rows_deleted": sum(deleted.values())})
+        update_job(database, job, "COMPLETED")
     return {"rows_deleted": deleted, "report_paths_removed": removed}

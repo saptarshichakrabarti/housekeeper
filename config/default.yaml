@@ -20,7 +20,7 @@ reporting:
   # source-relative path. Review manifests are never redacted: they are revalidated by absolute path
   # and hash before a move. See docs/threat_model.md.
   redact_source_paths: false
-incremental: {detect_renames: true}
+incremental: {detect_renames: true, reuse_unchanged_stages: true}
 content_store: {store_normalized_text: true, compress_text: true, store_image_thumbnails: true, thumbnail_max_dimension: 512}
 dashboard: {enabled: true, host: 127.0.0.1, port: 8765, open_browser: true, read_only: false, page_size: 100, maximum_page_size: 500, allow_non_loopback: false}
 graph: {enabled: true, default_max_nodes: 500, hard_max_nodes: 5000, default_max_edges: 2000, hard_max_edges: 20000, minimum_edge_confidence: 0.70}

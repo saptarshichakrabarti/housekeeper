@@ -21,7 +21,15 @@ from pathlib import Path
 
 from .analysers.scope import AnalyserScope
 from .config import config_fingerprint
-from .jobs import tracked_job, update_job
+from .jobs import create_job, tracked_job, update_job
+from .reuse import input_fingerprint, snapshot_token
+
+# Stages whose output is keyed to *content objects*, so an earlier run's output still describes the
+# current snapshot. Everything else is re-derived every run: a rescan writes new
+# ``filesystem_entries`` rows, and anything keyed to an entry id (classifications, duplicate
+# members, projects, canonical roles, directory overlap) would leave the ``current_*`` views empty
+# if it were skipped. Content identity is global and copied forward by the scanner, so these stand.
+REUSABLE_STAGES = frozenset({"content-analysis", "document-versions", "image-similarity"})
 
 
 def _step(
@@ -31,16 +39,92 @@ def _step(
     label: str,
     callback: Callable[[int | None], object],
     parent_job_id: int | None = None,
+    fingerprint: str | None = None,
 ):
     """Run one pipeline step inside a durable tracked job and normalise its outcome."""
+    scope: dict = {"quickstart": label}
+    if fingerprint:
+        # In the scope rather than a column of its own: scope_json is written once per job and never
+        # rewritten, and the jobs table is a row per stage — a scan of it costs nothing.
+        scope["input_fingerprint"] = fingerprint
     with tracked_job(
         database,
         job_type,
-        {"quickstart": label},
+        scope,
         config_fingerprint(config),
         parent_job_id=parent_job_id,
     ) as job:
         return callback(job)
+
+
+def _changed_entry_count(database, scan_run_id: int | None) -> int | None:
+    """Entries this scan saw as changed, or ``None`` when it had no baseline to compare against.
+
+    A first scan of a source records no change rows at all, which must never read as "nothing
+    changed" — hence ``None`` rather than 0.
+    """
+    if scan_run_id is None:
+        return None
+    row = database.fetch_one(
+        "SELECT COUNT(*) total, COALESCE(SUM(change_status<>'UNCHANGED'),0) changed "
+        "FROM scan_entry_changes WHERE scan_run_id=?",
+        (scan_run_id,),
+    )
+    if not row or not int(row["total"]):
+        return None
+    return int(row["changed"])
+
+
+def _previous_pipeline_completed(database, source_root: Path, pipeline_job: int) -> bool:
+    """Did the last quickstart of this source finish cleanly?
+
+    Gates only the changed-only narrowing of content analysis, which assumes the previous run did the
+    work its change record implies. After an interrupted, cancelled or failed run some of that work is
+    still owed and is invisible in the change record. Stage reuse has its own, stronger evidence — a
+    COMPLETED stage job — and is not gated on this, which is what lets a resume continue.
+    """
+    row = database.fetch_one(
+        "SELECT status FROM jobs WHERE job_type='QUICKSTART' AND id<>? "
+        "AND json_extract(scope_json,'$.source_root')=? ORDER BY id DESC LIMIT 1",
+        (pipeline_job, str(source_root)),
+    )
+    return bool(row and row["status"] == "COMPLETED")
+
+
+def _reusable_job(database, job_type: str, fingerprint: str) -> int | None:
+    row = database.fetch_one(
+        "SELECT id FROM jobs WHERE status='COMPLETED' AND job_type=? "
+        "AND json_extract(scope_json,'$.input_fingerprint')=? ORDER BY id DESC LIMIT 1",
+        (job_type, fingerprint),
+    )
+    return int(row["id"]) if row else None
+
+
+def _record_skipped_stage(
+    database,
+    config,
+    job_type: str,
+    label: str,
+    fingerprint: str,
+    reused_job_id: int,
+    pipeline_job: int,
+) -> dict:
+    """A stage that was considered and not run still gets a job row.
+
+    Skipped work is reported as skipped: the Jobs page shows the stage was weighed and reused,
+    rather than silently missing from the run.
+    """
+    job = create_job(
+        database,
+        job_type,
+        {"quickstart": label, "input_fingerprint": fingerprint, "reused_job_id": reused_job_id},
+        config_fingerprint(config),
+        parent_job_id=pipeline_job,
+    )
+    update_job(
+        database, job, "COMPLETED", skip_count=1, current_item=f"reused job {reused_job_id}"
+    )
+    return {"skipped_stage": f"reused job {reused_job_id}"}
 
 
 def run_quickstart(
@@ -49,12 +133,17 @@ def run_quickstart(
     source_root: Path,
     generate_reports: bool = True,
     progress: Callable[[str, int, int], None] = lambda message, stage, stage_total: None,
+    full: bool = False,
+    resumes: int | None = None,
 ) -> dict:
     """Execute the full safe pipeline against ``source_root`` and return a summary.
 
     The whole run is one durable ``QUICKSTART`` job with a child job per stage. Pause/cancel on
     any of those rows stops the entire run (control requests escalate to the pipeline root, and
     every stage polls its lineage), rather than only the stage that happened to be running.
+
+    A re-run is incremental unless ``full``: stages whose inputs are unchanged since a completed run
+    are reused rather than recomputed, and content analysis narrows to changed entries.
     """
     # Fail fast on a source that cannot be scanned, instead of reporting a hollow "complete" with
     # all-zero totals.
@@ -62,11 +151,15 @@ def run_quickstart(
         raise FileNotFoundError(f"source path does not exist: {source_root}")
     if not source_root.is_dir():
         raise NotADirectoryError(f"source must be a directory, not a file: {source_root}")
+    scope: dict = {"source_root": str(source_root)}
+    if resumes is not None:
+        # Which terminal run this one continues. The old row stays terminal; the link lives here.
+        scope["resumes"] = resumes
     with tracked_job(
-        database, "QUICKSTART", {"source_root": str(source_root)}, config_fingerprint(config)
+        database, "QUICKSTART", scope, config_fingerprint(config)
     ) as pipeline_job:
         return _run_pipeline(
-            database, config, source_root, generate_reports, progress, pipeline_job
+            database, config, source_root, generate_reports, progress, pipeline_job, full, resumes
         )
 
 
@@ -77,6 +170,8 @@ def _run_pipeline(
     generate_reports: bool,
     progress: Callable[[str, int, int], None],
     pipeline_job: int,
+    full: bool = False,
+    resumes: int | None = None,
 ) -> dict:
     from .analysers.archive_equivalence import run_archive_directory_analysis
     from .analysers.backup_lineage import run_backup_lineage_analysis
@@ -152,9 +247,34 @@ def _run_pipeline(
     def record(label: str, result: object) -> None:
         steps.append({"step": label, "result": result})
 
+    # Set after the scan, once there is a snapshot to fingerprint against.
+    mode: dict = {"incremental": False, "changed_only": False, "token": ""}
+
     def step(job_type: str, label: str, callback: Callable[[int | None], object]) -> object:
         # Every stage job is a child of the pipeline job, so one pause/cancel controls the run.
-        return _step(database, config, job_type, label, callback, parent_job_id=pipeline_job)
+        # Recorded whenever the stage is reusable *in principle*, including on a full run: the
+        # fingerprint describes the inputs this job worked from, and a later run is what decides
+        # whether to trust it. Only the lookup is gated on the mode.
+        fingerprint = (
+            input_fingerprint(label, mode["token"], config_fingerprint(config))
+            if mode["token"] and label in REUSABLE_STAGES
+            else None
+        )
+        if fingerprint and mode["incremental"]:
+            reused = _reusable_job(database, job_type, fingerprint)
+            if reused is not None:
+                return _record_skipped_stage(
+                    database, config, job_type, label, fingerprint, reused, pipeline_job
+                )
+        return _step(
+            database,
+            config,
+            job_type,
+            label,
+            callback,
+            parent_job_id=pipeline_job,
+            fingerprint=fingerprint,
+        )
 
     begin_stage(f"scanning {source_root} (read-only; nothing is ever moved)")
     # The scanner creates and completes its own durable SCAN job, so it is not wrapped in
@@ -171,6 +291,36 @@ def _run_pipeline(
         if scan_run_id is not None
         else AnalyserScope.current(database)
     )
+    # Two separate decisions, because they rest on different evidence.
+    #
+    # *Stage reuse* only ever fires on a fingerprint hit, and a fingerprint is only recorded on a
+    # stage job that reached COMPLETED. An interrupted run therefore cannot cause a stage to be
+    # skipped — the stages it did finish are exactly the ones worth skipping. This is what makes
+    # Resume continue a run rather than redo it, so it deliberately does *not* require the previous
+    # pipeline to have completed.
+    #
+    # *Changed-only narrowing* of content analysis has no such per-unit evidence: an artifact the
+    # previous run still owed is invisible in the change record, and narrowing to changed entries
+    # would skip it forever. That one does require a cleanly completed previous pipeline.
+    #
+    # ponytail: no "changed is small relative to inventory" threshold — a knob nobody could set
+    # meaningfully. Narrowing is right whatever the ratio.
+    changed_entries = _changed_entry_count(database, scan_run_id)
+    reuse_enabled = (
+        not full
+        and changed_entries is not None
+        and bool(config.section("incremental")["reuse_unchanged_stages"])
+    )
+    mode["incremental"] = reuse_enabled
+    mode["changed_only"] = reuse_enabled and _previous_pipeline_completed(
+        database, source_root, pipeline_job
+    )
+    if scan_run_id is not None:
+        mode["token"] = snapshot_token(database, scan_run_id)
+    summary["mode"] = "incremental" if mode["incremental"] else "full"
+    summary["changed_entries"] = changed_entries
+    summary["changed_only"] = mode["changed_only"]
+    summary["resumes"] = resumes
     begin_stage("exact-duplicates")
     record(
         "exact-duplicates",
@@ -186,7 +336,9 @@ def _run_pipeline(
         step(
             "CONTENT_ANALYSIS",
             "content-analysis",
-            lambda job: run_content_analysis(database, config, None, scope, job_id=job),
+            lambda job: run_content_analysis(
+                database, config, None, scope, changed_only=mode["changed_only"], job_id=job
+            ),
         ),
     )
     # Each factory binds ``runner`` as a fresh parameter (avoiding late-binding over the loop) and
@@ -247,7 +399,10 @@ def _run_pipeline(
         report_paths = step(
             "REPORT_GENERATION",
             "reports",
-            lambda job: [p.as_posix() for p in generate_all_reports(database, config, job_id=job)],
+            lambda job: [
+                p.as_posix()
+                for p in generate_all_reports(database, config, job_id=job, reuse=not full)
+            ],
         )
         record("reports", report_paths)
         summary["reports"] = report_paths
@@ -299,6 +454,11 @@ def _run_pipeline(
         ),
     }
     summary["workspace"] = str(config.workspace)
+    # The three lines a re-run is actually about. Same context the `changes` report renders, so the
+    # CLI epilogue and the report can never disagree — including on having nothing to compare.
+    from .reports.contexts import changes_digest
+
+    summary["changes"] = changes_digest(database, config)
     # Roll stage errors up onto the pipeline row so its terminal state is honest: the enclosing
     # tracked_job reads error_count and settles COMPLETED_WITH_ERRORS when any stage had errors.
     stage_errors = database.fetch_one(

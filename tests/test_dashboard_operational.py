@@ -54,6 +54,10 @@ def test_submit_purge_clears_a_scanned_workspace(config, fixture_root):
     db.initialize()
     try:
         assert db.fetch_one("SELECT COUNT(*) n FROM filesystem_entries")["n"] == 0
+        # The purge is a tracked job like everything else, and the one job row that survives it is
+        # its own: history is gone, but the fact that it was purged is not.
+        jobs = db.fetch_all("SELECT job_type,status FROM jobs")
+        assert [(row["job_type"], row["status"]) for row in jobs] == [("PURGE", "COMPLETED")]
     finally:
         db.close()
 

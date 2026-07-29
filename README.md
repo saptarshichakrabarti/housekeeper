@@ -26,7 +26,25 @@ housekeeper dashboard
 ```
 
 `quickstart` runs every step inside a durable, pausable job and is safe to re-run — each run reports
-the current snapshot of the drive. It deliberately stops short of any movement: staging approved
+the current snapshot of the drive. A re-run is **incremental**: stages whose inputs (snapshot
+content, configuration, code) are unchanged since a completed *stage* are reused instead of
+recomputed, and the summary names every stage it skipped and why. Because the check is per stage, a
+re-run after an interrupted one continues where it stopped instead of starting over. `report all` on an
+untouched workspace likewise writes nothing. `--full` forces every stage and every report to run
+again; `incremental.reuse_unchanged_stages: false` makes that the default.
+
+Three read-only questions the tool can answer directly:
+
+```bash
+housekeeper changes                      # what changed since the previous scan (also: report changes)
+housekeeper coverage 2 --against 1       # is drive 2's content verified present on drive 1?
+housekeeper schedule /mnt/drive --weekly # print a systemd timer (or --format cron|windows) — installs nothing
+```
+
+`coverage` reports "verified present elsewhere", never "safe to delete", and counts files with no
+verified hash as *unknown* rather than covered. `schedule` prints scheduler text for you to install;
+housekeeper never runs resident and never talks to the network — set `notifications.command` to have
+the scheduled run pipe its digest into `notify-send`, `mail`, or a webhook of your choosing. It deliberately stops short of any movement: staging approved
 files into a review folder remains the separate, explicit, manifest-verified flow shown below.
 Run `make help` to see all targets (`install-dev`, `check`, `test`, `lint`, `typecheck`,
 `benchmark`, `clean`).

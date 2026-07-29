@@ -1,0 +1,21 @@
+<p>Where the bytes are. Each tile's <strong>area</strong> is size on disk; its <strong>fill</strong>
+is how much of that is estimated reclaimable — redundant duplicate copies and files the classifier
+put in a REVIEW_* bucket, counted once each even when a file is both. Click a folder to go deeper. Estimated bytes are an estimate, not
+guaranteed reclaimable space, and nothing on this page moves or deletes anything.</p>
+<nav class="treemap-crumbs" id="treemap-crumbs" aria-label="Treemap location"></nav>
+<div class="treemap-legend">
+  <span>reclaimable share</span>
+  <span class="treemap-legend__ramp" aria-hidden="true">
+    <i style="background:var(--hk-tree-0)"></i><i style="background:var(--hk-tree-1)"></i>
+    <i style="background:var(--hk-tree-2)"></i><i style="background:var(--hk-tree-3)"></i>
+    <i style="background:var(--hk-tree-4)"></i>
+  </span>
+  <span>none → most</span>
+</div>
+<div id="treemap" class="treemap" role="img" aria-label="Treemap of folder sizes">Loading…</div>
+<p id="treemap-note" class="treemap-note"></p>
+<h2>The same numbers as a table</h2>
+<div class="table-scroll"><table id="treemap-table">
+  <thead><tr><th>Name</th><th>Size</th><th>Duplicate bytes</th><th>Reviewable bytes</th><th>Reclaimable (union)</th></tr></thead>
+  <tbody></tbody>
+</table></div>

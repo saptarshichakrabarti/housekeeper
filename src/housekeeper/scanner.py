@@ -425,6 +425,11 @@ class DriveScanner:
             current_item=current,
             checkpoint={"scan_run_id": run_id, "processed": processed},
         )
+        # A batch that is committed is a safe place to stop, so it is also where a pause/cancel is
+        # honoured. The traversal loop above only polls per *directory*, which on a drive with one
+        # flat folder of 200k photos is no stop point at all — Cancel then did nothing until the
+        # whole tree had been walked.
+        check_cancelled(self.db, job_id)
 
     def _checkpoint_counts(self, run_id: int, counts: dict) -> None:
         self.db.connect().execute(

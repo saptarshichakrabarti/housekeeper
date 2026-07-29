@@ -51,6 +51,45 @@ lose the work is to weaken one when it becomes inconvenient.
 | `tests/test_configuration_honesty.py` | a knob added without being wired |
 | `tests/test_acceleration.py` | a native backend that disagrees with Python, or a client that forks per request |
 | `benchmarks/baseline.json` | a change that alters entity counts |
+| `tests/test_stage_reuse.py` | stage reuse that skips work the current snapshot still needs, or fails to skip after an unchanged rescan |
+
+## Stage reuse on a re-run
+
+A quickstart re-run reuses a completed stage whose *input fingerprint* matches:
+`sha256(stage label, snapshot token, configuration fingerprint, code digest)` — recorded in the
+stage's job scope and looked up before the stage runs (`src/housekeeper/reuse.py`).
+
+* The **snapshot token** names the content of a snapshot, not the run that recorded it: the newest run
+  of that source which recorded a change. Two scans of an unchanged tree therefore agree, and a chain
+  of unchanged rescans keeps agreeing — a run id would change every time and reuse would never fire.
+* The **code digest** is a hash of the package's `*.py` and `*.j2` files rather than a version
+  constant per analyser. A constant has to be remembered on every semantic change; the digest cannot
+  be forgotten and also covers shared helpers. The cost is that any source edit re-runs every stage
+  once, which is the safe direction.
+
+**Only content-object-keyed stages are reusable** (`quickstart.REUSABLE_STAGES`: content-analysis,
+document-versions, image-similarity). A rescan writes a whole new set of `filesystem_entries` rows, so
+anything keyed to an entry id — classifications, duplicate members, projects, canonical roles,
+directory overlap — must be re-derived for the new snapshot or the `current_*` views come back empty.
+That is a correctness boundary, not a tuning choice: extending the set means proving the stage's
+output is not keyed to entry ids.
+
+The reuse check rests on each *stage job* reaching `COMPLETED`, not on the pipeline's own state. That
+is what makes **Resume** continue rather than redo: an interrupted run's finished stages are exactly
+the ones worth skipping, and a cancelled stage has no fingerprint to match. The one thing an
+interrupted predecessor does switch off is the changed-only narrowing of content analysis — an
+artifact the previous run still owed is invisible in the change record, so narrowing to changed
+entries would skip it forever. The summary reports both decisions (`mode`, `changed_only`).
+
+Reports use the same fingerprint plus the analysis that has been recorded since, so `report all` on an
+untouched workspace writes nothing at all — the nine HTML reports carry their marker in the file
+itself, and the CSV/JSONL exports carry it in a `.fingerprint` sidecar (CSV has no comment syntax, and
+a JSONL stream must stay parseable). Delete any output and only that one regenerates. `--full` forces
+every stage and every report.
+
+Parallel structural stages are still **not built**: SQLite WAL allows one writer, and the decision
+gate is a measurement — a full quickstart still spending >50% of wall-clock in structural stages
+*after* incremental re-runs land.
 
 ## Decisions taken and not revisited
 

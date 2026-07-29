@@ -1,0 +1,39 @@
+<p>For each scanned source: how many of its files have the same content, verified by hash, on at
+least one <strong>other</strong> source. This says where content was found — it does
+<strong>not</strong> say anything is safe to delete, and files with no verified hash are counted as
+unknown rather than covered. Moving files stays the separate, manifest-verified CLI flow.</p>
+{% if not comparable %}
+<p class="empty-state">Only one source has been scanned, so there is nothing to compare it against.
+Scan a second drive to see which of its files exist in both places.</p>
+{% endif %}
+{% for source in sources %}
+<section class="card">
+  <h2>{{ source.name }}</h2>
+  <p class="path">{{ source.path }}</p>
+  <p>{{ source.summary }}</p>
+  <div class="table-scroll"><table>
+    <thead><tr><th>Bucket</th><th>Files</th><th>Bytes</th></tr></thead>
+    <tbody>
+      <tr><td>Verified elsewhere</td><td>{{ source.buckets.covered.count | thousands }}</td>
+          <td>{{ source.buckets.covered.bytes | filesizeformat }}</td></tr>
+      <tr><td>Only copy here</td><td>{{ source.buckets.unique.count | thousands }}</td>
+          <td>{{ source.buckets.unique.bytes | filesizeformat }}</td></tr>
+      <tr><td>Unknown (no verified hash)</td><td>{{ source.buckets.unknown.count | thousands }}</td>
+          <td>{{ source.buckets.unknown.bytes | filesizeformat }}</td></tr>
+    </tbody>
+  </table></div>
+  {% if source.unique_files %}
+  <h3>Largest files with no verified copy elsewhere</h3>
+  <div class="table-scroll"><table>
+    <thead><tr><th>Path</th><th>Size</th></tr></thead>
+    <tbody>
+      {% for f in source.unique_files %}
+      <tr><td class="path">{{ f.relative_path }}</td><td>{{ f.size_bytes | filesizeformat }}</td></tr>
+      {% endfor %}
+    </tbody>
+  </table></div>
+  {% endif %}
+</section>
+{% else %}
+<p class="empty-state">No source has a completed scan yet.</p>
+{% endfor %}
