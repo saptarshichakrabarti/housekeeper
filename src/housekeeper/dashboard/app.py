@@ -371,6 +371,9 @@ def create_app(
             by_type.setdefault(str(row["job_type"]), []).append(int(row["seconds"]))
         return {name: median(values) for name, values in by_type.items() if any(values)}
 
+    def _stages_row_id(job_id: int) -> str:
+        return f"job-stages-{job_id}"
+
     def jobs_table(rows, medians: dict[str, float] | None = None, roots: set[int] | None = None) -> str:
         headings = [
             "id",
@@ -387,18 +390,23 @@ def create_app(
         body = ""
         for row in rows:
             parent = row["parent_job_id"]
+            expandable = not parent and int(row["id"]) in (roots or set())
             cells = ""
             for heading in headings:
                 if heading == "progress":
                     cells += f"<td>{progress_cell(row)}</td>"
                 elif heading == "duration":
                     cells += f"<td>{duration_cell(row, medians)}</td>"
-                elif heading == "job_type" and not parent and int(row["id"]) in (roots or set()):
+                elif heading == "job_type" and expandable:
                     # A pipeline root: its stages are one click away, from data already on the rows.
+                    # The click replaces this row's own empty stages row (below) rather than
+                    # inserting a new one, so clicking twice refreshes the table instead of
+                    # stacking a second copy of it.
                     cells += (
                         f"<td>{display_cell(heading, row[heading])} "
                         f"<button hx-get='/fragments/jobs/{int(row['id'])}/stages' "
-                        f"hx-target='closest tr' hx-swap='afterend'>stages</button></td>"
+                        f"hx-target='#{_stages_row_id(int(row['id']))}' "
+                        f"hx-swap='outerHTML'>stages</button></td>"
                     )
                 elif heading == "job_type" and parent:
                     # A stage of a pipeline run: mark it so the hierarchy is visible, and make
@@ -412,6 +420,8 @@ def create_app(
                     cells += f"<td>{display_cell(heading, row[heading])}</td>"
             controls = job_controls(row)
             body += f"<tr>{cells}<td>{controls}</td></tr>"
+            if expandable:
+                body += f"<tr id='{_stages_row_id(int(row['id']))}' class='stages-row' hidden></tr>"
         running = any(row["status"] in {"PENDING", "RUNNING", "PAUSING", "CANCELLING"} for row in rows)
         completed_count = next(
             (
@@ -1347,14 +1357,26 @@ def create_app(
         return HTMLResponse(wrapper)
 
     @app.get("/fragments/jobs/{job_id}/stages", response_class=HTMLResponse)
-    def job_stages_fragment(job_id: Annotated[int, ApiPath(ge=1)]):
-        """The stages of one pipeline run, as an expandable row. No new data — same columns."""
+    def job_stages_fragment(job_id: Annotated[int, ApiPath(ge=1)], expanded: bool = True):
+        """The stages of one pipeline run, as the run's own expandable row. Same columns, no new data.
+
+        Always the row identified by ``_stages_row_id``, so every click — expand, refresh, or the
+        collapse below — replaces the previous state of it in place.
+        """
+        row_id = _stages_row_id(job_id)
+        if not expanded:
+            return HTMLResponse(f"<tr id='{row_id}' class='stages-row' hidden></tr>")
+        hide = (
+            f"<button hx-get='/fragments/jobs/{job_id}/stages?expanded=0' "
+            f"hx-target='#{row_id}' hx-swap='outerHTML'>hide stages</button>"
+        )
         rows = reader.fetch_all(
             f"SELECT {_JOB_COLUMNS} FROM jobs WHERE parent_job_id=? ORDER BY id", (job_id,)
         )
         if not rows:
             return HTMLResponse(
-                "<tr><td colspan='99' class='empty-state'>No stages recorded for this run.</td></tr>"
+                f"<tr id='{row_id}' class='stages-row'><td colspan='99'><span class='empty-state'>No stages recorded "
+                f"for this run.</span> {hide}</td></tr>"
             )
         body = "".join(
             f"<tr><td>{int(row['id'])}</td><td>{escape(str(row['job_type']))}</td>"
@@ -1363,7 +1385,8 @@ def create_app(
             for row in rows
         )
         return HTMLResponse(
-            "<tr><td colspan='99'><table><thead><tr><th>id</th><th>job_type</th><th>stage</th>"
+            f"<tr id='{row_id}' class='stages-row'><td colspan='99'>{hide}"
+            "<table><thead><tr><th>id</th><th>job_type</th><th>stage</th>"
             f"<th>status</th><th>duration</th></tr></thead><tbody>{body}</tbody></table></td></tr>"
         )
 

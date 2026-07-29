@@ -343,3 +343,19 @@ def test_pipeline_root_expands_to_its_stages(client, database):
     assert f"<td>{child}</td>" in stages and "SCAN" in stages
     # A job with no children says so rather than rendering an empty table.
     assert "No stages recorded" in client.get(f"/fragments/jobs/{child}/stages").text
+
+
+def test_stages_expand_in_place_and_collapse(client, database):
+    # The button used to insert a row after the pipeline's own (hx-swap=afterend), so every click
+    # appended another copy of the same table. It now replaces one row identified by the run.
+    parent, _child = _pipeline(database)
+    table = client.get("/fragments/jobs").text
+    assert f"hx-target='#job-stages-{parent}' hx-swap='outerHTML'" in table
+    assert f"<tr id='job-stages-{parent}' class='stages-row' hidden></tr>" in table  # the row the click replaces
+
+    stages = client.get(f"/fragments/jobs/{parent}/stages").text
+    assert stages.startswith(f"<tr id='job-stages-{parent}' class='stages-row'>")  # same row, so it cannot stack
+    assert f"/fragments/jobs/{parent}/stages?expanded=0" in stages  # and it can be collapsed again
+    assert client.get(f"/fragments/jobs/{parent}/stages?expanded=0").text == (
+        f"<tr id='job-stages-{parent}' class='stages-row' hidden></tr>"
+    )

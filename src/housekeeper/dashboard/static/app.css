@@ -354,7 +354,9 @@ th {
   z-index: 1;
 }
 :root[data-theme="brutal"] td { border-bottom-color: #111; }
-tbody tr:nth-child(even) { background: var(--hk-surface-alt); }
+/* Stripe the data rows only: every pipeline row is followed by its own stages row (empty until
+   expanded), which would otherwise flip the parity of everything below it. */
+tbody tr:nth-child(even of :not(.stages-row)) { background: var(--hk-surface-alt); }
 tbody tr:hover { background: var(--hk-accent-bg); }
 :root[data-theme="brutal"] tbody tr:hover { background: #fff2b8; }
 
@@ -408,6 +410,9 @@ kbd { background: var(--hk-surface); border: 1px solid var(--hk-border-strong); 
 .duplicate-thumbnail { width: 96px; height: 64px; }
 .number { white-space: nowrap; font-family: var(--hk-font-num); font-variant-numeric: tabular-nums; }
 .sort-control { margin: .75rem 0; }
+/* The jobs filter is an inline row of controls directly above the table; without this its labels
+   sit flush against the first header row. */
+.jobs-filter { display: flex; flex-wrap: wrap; align-items: center; gap: .6rem; margin: 0 0 1rem; }
 .sr-only { position: absolute !important; width: 1px; height: 1px; padding: 0; margin: -1px; overflow: hidden; clip: rect(0, 0, 0, 0); white-space: nowrap; border: 0; }
 
 .toast { position: fixed; right: 1rem; bottom: 1rem; z-index: 20; max-width: 28rem; padding: .8rem 1rem; color: var(--hk-ok); background: var(--hk-ok-bg); border: var(--hk-border-w) solid var(--hk-ok); border-radius: var(--hk-radius); box-shadow: var(--hk-shadow-card); opacity: 0; transform: translateY(.5rem); transition: opacity .2s ease, transform .2s ease; }

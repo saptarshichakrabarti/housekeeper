@@ -53,7 +53,9 @@ All three respect read-only mode (they are read-only by construction) and the st
 
 The Jobs page filters by type and status (and "pipelines only"), shows each job's duration —
 elapsed while running, with the median of completed jobs of that type as advisory context — and
-expands a pipeline row into its stages. A stopped pipeline (`PAUSED`, `CANCELLED`, `FAILED`,
+expands a pipeline row into its stages. Each pipeline owns one `job-stages-<id>` row, empty until
+expanded: **stages** replaces that row and **hide stages** empties it again, so clicking twice
+refreshes the table rather than stacking a second copy of it. A stopped pipeline (`PAUSED`, `CANCELLED`, `FAILED`,
 `INTERRUPTED`) offers **Resume**, which submits the same operation again. The old row stays terminal
 and the new pipeline records `{"resumes": <old id>}` in its scope. A viewer dashboard (no runner)
 never shows the button.
