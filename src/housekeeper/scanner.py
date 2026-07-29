@@ -172,6 +172,7 @@ class DriveScanner:
         incremental: bool = True,
         force_rehash: bool = False,
         job_id: int | None = None,
+        parent_job_id: int | None = None,
     ):
         root = normalize_absolute_path(source_root)
         root_fp = build_source_root_fingerprint(root)
@@ -253,6 +254,7 @@ class DriveScanner:
             # Traversal is a single walk: one worker, recorded honestly. `scan_workers` was a knob
             # that only ever changed this number in the job row.
             worker_count=1,
+            parent_job_id=parent_job_id,
         )
         update_job(self.db, job_id, "RUNNING")
         counts = {"files": 0, "dirs": 0, "symlinks": 0, "errors": 0, "bytes": 0}

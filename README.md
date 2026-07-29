@@ -66,6 +66,7 @@ housekeeper analyse all --changed-only
 housekeeper jobs list
 housekeeper database migrate --dry-run
 housekeeper database backup workspace/backups/inventory.sqlite
+housekeeper database purge --yes   # start over: drops every run, all derived analysis, all reports
 housekeeper graph build universe
 housekeeper benchmark scan /tmp/synthetic-fixture
 ```

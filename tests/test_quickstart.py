@@ -105,6 +105,32 @@ def test_quickstart_records_durable_jobs(tmp_path):
     assert any(job["job_type"] == "SCAN" for job in jobs)
 
 
+def test_quickstart_is_one_pipeline_job_with_stage_children(tmp_path):
+    # The whole run is a single QUICKSTART job; every stage (including the scan) is its child, so
+    # pause/cancel against any of the rows controls the entire run rather than one stage.
+    root = _drive(tmp_path)
+    database, config = _fresh(tmp_path)
+    run_quickstart(database, config, root, generate_reports=False)
+    parent = database.fetch_one(
+        "SELECT id,status,processed_count,total_estimate FROM jobs WHERE job_type='QUICKSTART'"
+    )
+    assert parent is not None
+    assert parent["status"] in {"COMPLETED", "COMPLETED_WITH_ERRORS"}
+    # The pipeline row reports stage progress, ending fully processed.
+    assert parent["total_estimate"] and parent["processed_count"] == parent["total_estimate"]
+    children = database.fetch_all(
+        "SELECT job_type FROM jobs WHERE parent_job_id=?", (parent["id"],)
+    )
+    child_types = {row["job_type"] for row in children}
+    assert "SCAN" in child_types
+    assert "EXACT_DUPLICATES" in child_types
+    # No stage job floats outside the pipeline.
+    strays = database.fetch_all(
+        "SELECT id,job_type FROM jobs WHERE parent_job_id IS NULL AND id<>?", (parent["id"],)
+    )
+    assert [dict(row) for row in strays] == []
+
+
 def test_next_steps_are_advisory_and_mention_safety(tmp_path):
     _, config = _fresh(tmp_path)
     steps = next_steps(config)

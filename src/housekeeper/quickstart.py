@@ -21,12 +21,25 @@ from pathlib import Path
 
 from .analysers.scope import AnalyserScope
 from .config import config_fingerprint
-from .jobs import tracked_job
+from .jobs import tracked_job, update_job
 
 
-def _step(database, config, job_type: str, label: str, callback: Callable[[int | None], object]):
+def _step(
+    database,
+    config,
+    job_type: str,
+    label: str,
+    callback: Callable[[int | None], object],
+    parent_job_id: int | None = None,
+):
     """Run one pipeline step inside a durable tracked job and normalise its outcome."""
-    with tracked_job(database, job_type, {"quickstart": label}, config_fingerprint(config)) as job:
+    with tracked_job(
+        database,
+        job_type,
+        {"quickstart": label},
+        config_fingerprint(config),
+        parent_job_id=parent_job_id,
+    ) as job:
         return callback(job)
 
 
@@ -37,7 +50,34 @@ def run_quickstart(
     generate_reports: bool = True,
     progress: Callable[[str, int, int], None] = lambda message, stage, stage_total: None,
 ) -> dict:
-    """Execute the full safe pipeline against ``source_root`` and return a summary."""
+    """Execute the full safe pipeline against ``source_root`` and return a summary.
+
+    The whole run is one durable ``QUICKSTART`` job with a child job per stage. Pause/cancel on
+    any of those rows stops the entire run (control requests escalate to the pipeline root, and
+    every stage polls its lineage), rather than only the stage that happened to be running.
+    """
+    # Fail fast on a source that cannot be scanned, instead of reporting a hollow "complete" with
+    # all-zero totals.
+    if not source_root.exists():
+        raise FileNotFoundError(f"source path does not exist: {source_root}")
+    if not source_root.is_dir():
+        raise NotADirectoryError(f"source must be a directory, not a file: {source_root}")
+    with tracked_job(
+        database, "QUICKSTART", {"source_root": str(source_root)}, config_fingerprint(config)
+    ) as pipeline_job:
+        return _run_pipeline(
+            database, config, source_root, generate_reports, progress, pipeline_job
+        )
+
+
+def _run_pipeline(
+    database,
+    config,
+    source_root: Path,
+    generate_reports: bool,
+    progress: Callable[[str, int, int], None],
+    pipeline_job: int,
+) -> dict:
     from .analysers.archive_equivalence import run_archive_directory_analysis
     from .analysers.backup_lineage import run_backup_lineage_analysis
     from .analysers.contact_sheets import run_contact_sheet_generation
@@ -59,13 +99,6 @@ def run_quickstart(
     from .policies import classify_all_entries
     from .reporting import generate_all_reports
     from .scanner import DriveScanner
-
-    # Fail fast on a source that cannot be scanned, instead of reporting a hollow "complete" with
-    # all-zero totals.
-    if not source_root.exists():
-        raise FileNotFoundError(f"source path does not exist: {source_root}")
-    if not source_root.is_dir():
-        raise NotADirectoryError(f"source must be a directory, not a file: {source_root}")
 
     # Named (rather than left as inline loop literals) so the stage count below is derived from
     # their length instead of a hand-maintained magic number.
@@ -105,15 +138,29 @@ def run_quickstart(
         nonlocal stage
         stage += 1
         progress(f"[quickstart] {label}", stage, stage_total)
+        # Mirror the same progress onto the pipeline job row: the Jobs table then shows one
+        # QUICKSTART row advancing stage-by-stage, and each stage boundary refreshes the root's
+        # heartbeat. Committed by the stage's own first status transition moments later.
+        update_job(
+            database,
+            pipeline_job,
+            processed_count=stage - 1,
+            total_estimate=stage_total,
+            current_item=label,
+        )
 
     def record(label: str, result: object) -> None:
         steps.append({"step": label, "result": result})
 
+    def step(job_type: str, label: str, callback: Callable[[int | None], object]) -> object:
+        # Every stage job is a child of the pipeline job, so one pause/cancel controls the run.
+        return _step(database, config, job_type, label, callback, parent_job_id=pipeline_job)
+
     begin_stage(f"scanning {source_root} (read-only; nothing is ever moved)")
     # The scanner creates and completes its own durable SCAN job, so it is not wrapped in
-    # ``tracked_job`` (which would double-manage the lifecycle).
+    # ``tracked_job`` (which would double-manage the lifecycle); it parents that job itself.
     scanner = DriveScanner(database, config)
-    record("scan", scanner.scan(source_root))
+    record("scan", scanner.scan(source_root, parent_job_id=pipeline_job))
     # Scope every analysis to the run just produced. The tool keeps scan history, so an unscoped
     # exact-duplicate pass would group a file with its own prior-scan snapshot and then classify the
     # current copy as a removable duplicate — marking unique, single-copy files REVIEW_SAFE on a
@@ -127,9 +174,7 @@ def run_quickstart(
     begin_stage("exact-duplicates")
     record(
         "exact-duplicates",
-        _step(
-            database,
-            config,
+        step(
             "EXACT_DUPLICATES",
             "exact-duplicates",
             lambda job: run_exact_duplicate_analysis(database, config, job_id=job, scope=scope),
@@ -138,9 +183,7 @@ def run_quickstart(
     begin_stage("content-analysis")
     record(
         "content-analysis",
-        _step(
-            database,
-            config,
+        step(
             "CONTENT_ANALYSIS",
             "content-analysis",
             lambda job: run_content_analysis(database, config, None, scope, job_id=job),
@@ -159,13 +202,11 @@ def run_quickstart(
     # Structural analysers over the fresh inventory (scope, then job_id, positionally).
     for label, job_type, runner in STRUCTURAL_ANALYSERS:
         begin_stage(label)
-        record(label, _step(database, config, job_type, label, scope_positional(runner)))
+        record(label, step(job_type, label, scope_positional(runner)))
     begin_stage("canonical-roles")
     record(
         "canonical-roles",
-        _step(
-            database,
-            config,
+        step(
             "CLASSIFICATION",
             "canonical-roles",
             lambda job: assign_canonical_roles(database),
@@ -173,13 +214,11 @@ def run_quickstart(
     )
     for label, job_type, runner in POST_CANONICAL_ANALYSERS:
         begin_stage(label)
-        record(label, _step(database, config, job_type, label, job_keyword(runner)))
+        record(label, step(job_type, label, job_keyword(runner)))
     begin_stage("classify")
     record(
         "classify",
-        _step(
-            database,
-            config,
+        step(
             "CLASSIFICATION",
             "classify",
             lambda job: classify_all_entries(database, config, job_id=job, scope=scope),
@@ -188,9 +227,7 @@ def run_quickstart(
     begin_stage("review-priority")
     record(
         "review-priority",
-        _step(
-            database,
-            config,
+        step(
             "CLASSIFICATION",
             "review-priority",
             lambda job: run_review_priority_analysis(database, config, scope, job_id=job),
@@ -199,9 +236,7 @@ def run_quickstart(
     begin_stage("lifecycle")
     record(
         "lifecycle",
-        _step(
-            database,
-            config,
+        step(
             "CLASSIFICATION",
             "lifecycle",
             lambda job: run_lifecycle_analysis(database, config, scope, job_id=job),
@@ -209,9 +244,7 @@ def run_quickstart(
     )
     if generate_reports:
         begin_stage("reports")
-        report_paths = _step(
-            database,
-            config,
+        report_paths = step(
             "REPORT_GENERATION",
             "reports",
             lambda job: [p.as_posix() for p in generate_all_reports(database, config, job_id=job)],
@@ -266,6 +299,18 @@ def run_quickstart(
         ),
     }
     summary["workspace"] = str(config.workspace)
+    # Roll stage errors up onto the pipeline row so its terminal state is honest: the enclosing
+    # tracked_job reads error_count and settles COMPLETED_WITH_ERRORS when any stage had errors.
+    stage_errors = database.fetch_one(
+        "SELECT COALESCE(SUM(error_count),0) n FROM jobs WHERE parent_job_id=?", (pipeline_job,)
+    )
+    update_job(
+        database,
+        pipeline_job,
+        processed_count=stage,
+        error_count=int(stage_errors["n"]) if stage_errors else 0,
+        current_item="complete",
+    )
     return summary
 
 

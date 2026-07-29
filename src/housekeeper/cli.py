@@ -253,6 +253,11 @@ def build_parser():
         help="most recent complete scans to keep per source root (default 3)",
     )
     dbp_prune.add_argument("--yes", action="store_true", help="actually delete the listed snapshots")
+    dbpurge = db_sub.add_parser(
+        "purge",
+        help="delete every recorded run, all derived analysis and all generated reports (--yes)",
+    )
+    dbpurge.add_argument("--yes", action="store_true", help="confirm; nothing happens without it")
     review = sub.add_parser("review")
     review_sub = review.add_subparsers(dest="review_command", required=True)
     rc = review_sub.add_parser("create")
@@ -996,6 +1001,16 @@ def _dispatch(args, c, d) -> int:
                         lambda _job: d.prune_snapshots(args.keep_per_source),
                     )
                 )
+        elif args.database_command == "purge":
+            # Not wrapped in _run_job: the purge deletes the ``jobs`` table the job row lives in.
+            if not args.yes:
+                raise SystemExit(
+                    "purge deletes every recorded run, all derived analysis and all generated "
+                    "reports (the source drive is untouched); rerun with --yes"
+                )
+            from .database_maintenance import purge_runs
+
+            _emit(purge_runs(d, c))
         elif args.database_command == "vacuum":
             if not args.yes:
                 raise SystemExit(

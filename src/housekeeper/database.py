@@ -923,6 +923,47 @@ class Database:
         c.commit()
         return plan
 
+    # Migration bookkeeping survives a purge: the schema itself is untouched, so a database that
+    # reported itself migrated still is.
+    _PURGE_KEEP: ClassVar[tuple[str, ...]] = ("schema_migrations", "migration_progress")
+
+    def purge_runs(self) -> dict[str, int]:
+        """Delete every recorded run and everything derived from one. Returns rows deleted per table.
+
+        Rows rather than the file: the dashboard, its background runner and any CLI process may each
+        hold an open connection, and unlinking the database under them leaves them writing to a
+        deleted inode.
+        """
+        c = self.connect()
+        tables = [
+            str(row[0])
+            for row in c.execute(
+                "SELECT name FROM sqlite_master WHERE type='table' AND name NOT LIKE 'sqlite_%'"
+            )
+            if str(row[0]) not in self._PURGE_KEEP
+        ]
+        # One unordered DELETE per table with foreign keys *off*, rather than a dependency-ordered
+        # cascade: the entire graph is going, so ordering carries no information — and an unqualified
+        # DELETE on a table with no live foreign keys takes SQLite's truncate path instead of walking
+        # every row to check constraints. On a large inventory that is the difference between holding
+        # the single WAL write lock for minutes (past every other connection's busy_timeout, which is
+        # how a concurrent dashboard refresh got "database is locked") and holding it for moments.
+        c.commit()  # PRAGMA foreign_keys is a silent no-op inside a transaction
+        c.execute("PRAGMA foreign_keys=OFF")
+        deleted = {}
+        try:
+            for table in tables:
+                count = c.execute(f"DELETE FROM {table}").rowcount
+                if count > 0:
+                    deleted[table] = count
+            c.commit()
+        finally:
+            c.rollback()  # no-op after a successful commit; drops the partial purge otherwise
+            c.execute("PRAGMA foreign_keys=ON")
+        self.refresh_current_inventory_views()
+        c.commit()
+        return deleted
+
     def backup(self, output: Path) -> Path:
         """Create a consistent SQLite backup without modifying the source database."""
         output = Path(output)

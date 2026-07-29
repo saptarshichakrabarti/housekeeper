@@ -559,3 +559,43 @@ aside#detail-drawer {
 .folder-list li { padding: .15rem 0; }
 .folder-list a { text-decoration: none; color: var(--hk-link); }
 .folder-list a:hover { text-decoration: underline; }
+
+/* ---- graph explorer (Obsidian-style) ----------------------------------- */
+/* Node/edge colors as theme tokens so every dashboard theme skins the canvas.
+   The three categorical hues (violet container / orange duplicate / aqua entity)
+   are palette-validated for all-pairs CVD separation on both surfaces; files use
+   a neutral fold color. Identity is never color-alone: nodes carry direct labels
+   and the legend chips below name each hue. */
+:root {
+  --hk-graph-bg: #fcfcfb;
+  --hk-graph-ink: #1c1c22;
+  --hk-graph-muted: #6d6d76;
+  --hk-graph-edge: #d4d4dc;
+  --hk-graph-container: #4a3aa7;
+  --hk-graph-file: #9a9aa6;
+  --hk-graph-dup: #eb6834;
+  --hk-graph-entity: #1baf7a;
+}
+:root[data-theme="dark"],
+:root[data-theme="hybrid-dark"],
+:root[data-theme="hybrid-solar"],
+:root[data-theme="brutal-dark"] {
+  --hk-graph-bg: #16161d;
+  --hk-graph-ink: #e8e8f0;
+  --hk-graph-muted: #8f8f9d;
+  --hk-graph-edge: #3d3d4d;
+  --hk-graph-container: #9085e9;
+  --hk-graph-file: #6c6c7a;
+  --hk-graph-dup: #d95926;
+  --hk-graph-entity: #199e70;
+}
+#cy { background: var(--hk-graph-bg); }
+.graph-forces { align-items: center; font-size: .85rem; color: var(--hk-text-muted); }
+.graph-forces input[type="range"] { width: 140px; vertical-align: middle; }
+.graph-legend { display: inline-flex; align-items: center; gap: .35rem; margin-right: 1rem; }
+.graph-legend__chip {
+  display: inline-block; width: .7rem; height: .7rem; border-radius: 50%;
+}
+.graph-legend__chip--folder { background: var(--hk-graph-container); }
+.graph-legend__chip--file { background: var(--hk-graph-file); }
+.graph-legend__chip--dup { background: var(--hk-graph-dup); }

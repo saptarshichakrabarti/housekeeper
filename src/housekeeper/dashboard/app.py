@@ -313,12 +313,21 @@ def create_app(
         header = "".join(f"<th>{escape(heading)}</th>" for heading in [*headings, "controls"])
         body = ""
         for row in rows:
-            cells = "".join(
-                f"<td>{progress_cell(row)}</td>"
-                if heading == "progress"
-                else f"<td>{display_cell(heading, row[heading])}</td>"
-                for heading in headings
-            )
+            parent = row["parent_job_id"]
+            cells = ""
+            for heading in headings:
+                if heading == "progress":
+                    cells += f"<td>{progress_cell(row)}</td>"
+                elif heading == "job_type" and parent:
+                    # A stage of a pipeline run: mark it so the hierarchy is visible, and make
+                    # clear that its controls act on the whole run (job control requests
+                    # escalate to the pipeline root).
+                    cells += (
+                        f"<td title='stage of job #{int(parent)}; controls act on the whole run'>"
+                        f"↳ {display_cell(heading, row[heading])}</td>"
+                    )
+                else:
+                    cells += f"<td>{display_cell(heading, row[heading])}</td>"
             controls = job_controls(row["id"], row["status"])
             body += f"<tr>{cells}<td>{controls}</td></tr>"
         running = any(row["status"] in {"PENDING", "RUNNING", "PAUSING", "CANCELLING"} for row in rows)
@@ -1053,7 +1062,7 @@ def create_app(
         # heartbeat for reaping orphans: within one poll interval a dead worker's row turns honest.
         maybe_reconcile()
         rows = reader.fetch_all(
-            "SELECT id,job_type,status,processed_count,total_estimate,success_count,skip_count,error_count,current_item,started_at,updated_at FROM jobs ORDER BY id DESC LIMIT ?",
+            "SELECT id,job_type,status,processed_count,total_estimate,success_count,skip_count,error_count,current_item,started_at,updated_at,parent_job_id FROM jobs ORDER BY id DESC LIMIT ?",
             (limit,),
         )
         # Self-suspending poll: keep the 3s cadence only while a job is actually active. When idle
@@ -1091,7 +1100,7 @@ def create_app(
         # back reflects reality immediately instead of sitting in PAUSING/CANCELLING until a poll.
         maybe_reconcile()
         row = reader.fetch_one(
-            "SELECT id,job_type,status,processed_count,total_estimate,success_count,skip_count,error_count,current_item,started_at,updated_at FROM jobs WHERE id=?",
+            "SELECT id,job_type,status,processed_count,total_estimate,success_count,skip_count,error_count,current_item,started_at,updated_at,parent_job_id FROM jobs WHERE id=?",
             (job_id,),
         )
         if not row:
@@ -1236,9 +1245,44 @@ def create_app(
                 raise HTTPException(409, "an operation is already running")
             return control_fragment(job_started=True)
 
+        @app.post("/control/purge", response_class=HTMLResponse)
+        def control_purge(x_csrf_token: str | None = Header(default=None)):
+            guard(x_csrf_token)
+            if runner.submit("purge") == "busy":
+                raise HTTPException(409, "an operation is already running")
+            return control_fragment(job_started=True)
+
     @app.get("/graph", response_class=HTMLResponse)
     def graph_page():
-        body = "<p>Bounded Cytoscape.js projection. Click a node to inspect it; double-click to progressively expand its local neighborhood. Structured explorers remain authoritative.</p><div class='graph-controls'><label>Projection <select id='graph-projection'><option>universe</option><option>duplicate</option><option>content</option><option>backup-lineage</option><option>project</option><option>document-family</option><option>image-cluster</option></select></label><label>Layout <select id='graph-layout'><option>concentric</option><option>breadthfirst</option><option>grid</option><option>cose</option></select></label><label>Confidence <input id='graph-confidence' type='number' min='0' max='1' step='.05' value='.7'></label><input id='graph-search' placeholder='Search nodes'><button id='graph-load'>Load</button><button id='graph-export'>Export PNG</button><span id='graph-status'></span></div><div id='cy' role='application' aria-label='Storage relationship graph'></div><pre id='graph-detail'></pre>"
+        body = (
+            "<p>Everything starts collapsed: click a source root or folder to reveal what it"
+            " contains, click it again to fold it away. Hover a node to light up its"
+            " neighborhood. Structured explorers remain authoritative.</p>"
+            "<div class='graph-controls'>"
+            "<label>View <select id='graph-projection'>"
+            "<option value='explore' selected>explore (folders)</option>"
+            "<option>universe</option><option>duplicate</option><option>content</option>"
+            "<option>backup-lineage</option><option>project</option>"
+            "<option>document-family</option><option>image-cluster</option></select></label>"
+            "<label class='graph-projection-only'>Confidence "
+            "<input id='graph-confidence' type='number' min='0' max='1' step='.05' value='.7'></label>"
+            "<input id='graph-search' placeholder='Filter nodes'>"
+            "<button id='graph-load'>Reload</button>"
+            "<button id='graph-collapse-all'>Collapse all</button>"
+            "<button id='graph-export'>Export PNG</button>"
+            "<span id='graph-status' role='status'></span></div>"
+            "<div class='graph-controls graph-forces'>"
+            "<span class='graph-legend'>"
+            "<span class='graph-legend__chip graph-legend__chip--folder'></span> folder "
+            "<span class='graph-legend__chip graph-legend__chip--file'></span> file "
+            "<span class='graph-legend__chip graph-legend__chip--dup'></span> duplicate copy"
+            "</span>"
+            "<label>Link distance <input id='graph-force-distance' type='range' min='30' max='220' value='80'></label>"
+            "<label>Repel force <input id='graph-force-repel' type='range' min='1000' max='20000' value='4500'></label>"
+            "</div>"
+            "<div id='cy' role='application' aria-label='Storage relationship graph'></div>"
+            "<pre id='graph-detail'></pre>"
+        )
         return page(
             "Graph",
             body,
@@ -1521,6 +1565,19 @@ def create_app(
                 exclude_types,
                 config,
             )
+        except ValueError as exc:
+            raise HTTPException(422, str(exc)) from exc
+
+    @app.get("/api/graph/children")
+    def graph_children(
+        node: str | None = Query(None, min_length=1, max_length=64),
+        limit: int = Query(150, ge=1, le=hard_nodes),
+    ):
+        """One level of the lazy folder explorer: roots when ``node`` is absent, else children."""
+        from ..graph.explorer import build_explorer
+
+        try:
+            return build_explorer(database, node, limit)
         except ValueError as exc:
             raise HTTPException(422, str(exc)) from exc
 

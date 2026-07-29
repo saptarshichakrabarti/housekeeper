@@ -35,4 +35,12 @@
     <div class="controls"><button type="submit"{% if busy %} disabled{% endif %}>Report</button></div>
   </form>
 </section>
+<section class="card card--danger">
+  <h3>Purge</h3>
+  <p>Deletes every recorded scan run, everything derived from one, and the generated report files. The source drive is not touched.</p>
+  <form hx-post="/control/purge" hx-target="#control-panel" hx-swap="innerHTML"
+        hx-confirm="Delete every recorded run, all derived analysis and all generated reports? This cannot be undone.">
+    <div class="controls"><button type="submit"{% if busy %} disabled{% endif %}>Purge all runs</button></div>
+  </form>
+</section>
 {% endif %}

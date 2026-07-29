@@ -43,6 +43,21 @@ def test_submit_runs_quickstart_against_a_temp_workspace(config, fixture_root):
         db.close()
 
 
+def test_submit_purge_clears_a_scanned_workspace(config, fixture_root):
+    runner = OperationRunner(config)
+    assert runner.submit("quickstart", source=str(fixture_root)) == "accepted"
+    _wait_idle(runner)
+    assert runner.submit("purge") == "accepted"
+    _wait_idle(runner)
+    assert runner.status()["state"] == "idle"
+    db = Database(config.database_path)
+    db.initialize()
+    try:
+        assert db.fetch_one("SELECT COUNT(*) n FROM filesystem_entries")["n"] == 0
+    finally:
+        db.close()
+
+
 def test_submit_rejects_a_concurrent_operation(config, monkeypatch):
     started = threading.Event()
     release = threading.Event()

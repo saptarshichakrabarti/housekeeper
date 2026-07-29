@@ -6,6 +6,14 @@ import pytest
 
 from housekeeper.jobs import create_job, request_pause, update_job
 
+
+def _pipeline(database):
+    parent = create_job(database, "QUICKSTART")
+    update_job(database, parent, "RUNNING")
+    child = create_job(database, "SCAN", parent_job_id=parent)
+    update_job(database, child, "RUNNING")
+    return parent, child
+
 pytest.importorskip("fastapi")
 pytest.importorskip("httpx")
 
@@ -71,6 +79,37 @@ def test_control_cancel_on_paused_job_finalizes(client, database):
     assert resp.status_code == 200
     assert "cancelled" in resp.text
     assert database.fetch_one("SELECT status FROM jobs WHERE id=?", (job_id,))["status"] == "CANCELLED"
+
+
+def test_cancel_on_stage_row_cancels_the_whole_run(client, database):
+    # The Jobs table shows one row per stage of a pipeline run. Cancelling the row that happens
+    # to be running must stop the RUN: the request escalates to the pipeline root job.
+    parent, child = _pipeline(database)
+    resp = client.post(
+        f"/fragments/jobs/{child}/control?action=cancel",
+        headers={"X-CSRF-Token": _csrf(client)},
+    )
+    assert resp.status_code == 200
+    root_status = database.fetch_one("SELECT status FROM jobs WHERE id=?", (parent,))["status"]
+    assert root_status == "CANCELLING"
+
+
+def test_pause_on_stage_row_pauses_the_whole_run(client, database):
+    parent, child = _pipeline(database)
+    resp = client.post(
+        f"/fragments/jobs/{child}/control?action=pause",
+        headers={"X-CSRF-Token": _csrf(client)},
+    )
+    assert resp.status_code == 200
+    root_status = database.fetch_one("SELECT status FROM jobs WHERE id=?", (parent,))["status"]
+    assert root_status == "PAUSING"
+
+
+def test_stage_rows_are_marked_as_part_of_their_run(client, database):
+    parent, _child = _pipeline(database)
+    html = client.get("/fragments/jobs").text
+    assert f"stage of job #{parent}" in html
+    assert "↳" in html
 
 
 def test_control_pause_on_finished_job_is_harmless(client, database):

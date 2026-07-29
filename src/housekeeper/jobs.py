@@ -110,8 +110,40 @@ def update_job(
         database.connect().commit()
 
 
+# Parent chains are shallow (pipeline -> stage today); the bound only guards a corrupt cycle.
+_MAX_LINEAGE_DEPTH = 16
+
+
+def pipeline_root(database: Database, job_id: int) -> dict[str, Any] | None:
+    """The topmost job of the pipeline ``job_id`` belongs to (itself, if standalone).
+
+    A multi-stage run (quickstart, analyse-all) is one pipeline job with a child job per stage.
+    The child rows are what a user sees progressing, but pause/cancel is a decision about the
+    *run*, so control requests resolve to the root before they are applied.
+    """
+    current = job_id
+    row = None
+    for _ in range(_MAX_LINEAGE_DEPTH):
+        row = database.fetch_one(
+            "SELECT id,status,parent_job_id FROM jobs WHERE id=?", (current,)
+        )
+        if not row:
+            return None
+        parent = row["parent_job_id"]
+        if parent is None or int(parent) == int(row["id"]):
+            break
+        current = int(parent)
+    return {"id": int(row["id"]), "status": row["status"]} if row else None
+
+
 def request_cancel(database: Database, job_id: int) -> None:
     """Ask a worker to stop and leave the job in a durable, cancelled state.
+
+    A request against any stage of a multi-stage pipeline escalates to the pipeline's root job:
+    cancelling "the thing that is running" means the whole run, not the current stage — otherwise
+    the pipeline simply continues with its next stage (or the click races a stage boundary and
+    lands on an already-finished job, doing nothing at all). Workers poll their whole lineage, so
+    the running stage observes the root's ``CANCELLING`` at its next checkpoint.
 
     Cancellation, like pause, is expressed through the status column so a restarted worker sees
     the same request. The transition is validated so a stray click on an already-finished job is a
@@ -122,28 +154,30 @@ def request_cancel(database: Database, job_id: int) -> None:
       ``CANCELLED`` directly instead of waiting at ``CANCELLING`` for a worker that never runs;
     * an active job is asked to cancel and settles at its next cooperative checkpoint.
     """
-    row = database.fetch_one("SELECT status FROM jobs WHERE id=?", (job_id,))
-    if not row:
+    root = pipeline_root(database, job_id)
+    if not root:
         raise ValueError("job not found")
-    status = row["status"]
+    status = root["status"]
     if status in TERMINAL_STATES:
         return
     if status == "PAUSED":
-        update_job(database, job_id, "CANCELLED")
+        update_job(database, root["id"], "CANCELLED")
         return
-    update_job(database, job_id, "CANCELLING")
+    update_job(database, root["id"], "CANCELLING")
 
 
 def request_pause(database: Database, job_id: int) -> None:
     """Ask a worker to stop at its next durable checkpoint.
 
-    A pause is deliberately not an in-memory primitive: the status is the control
+    Like cancellation, a pause against a pipeline stage escalates to the pipeline's root job so
+    the whole run parks, instead of only the stage that happened to be running when the user
+    clicked. A pause is deliberately not an in-memory primitive: the status is the control
     plane, so a worker that is restarted will observe the same request.
     """
-    row = database.fetch_one("SELECT status FROM jobs WHERE id=?", (job_id,))
-    if not row or row["status"] not in {"PENDING", "RUNNING"}:
+    root = pipeline_root(database, job_id)
+    if not root or root["status"] not in {"PENDING", "RUNNING"}:
         raise ValueError("only pending or running jobs can be paused")
-    update_job(database, job_id, "PAUSING")
+    update_job(database, root["id"], "PAUSING")
 
 
 def resume_job(database: Database, job_id: int) -> None:
@@ -153,14 +187,30 @@ def resume_job(database: Database, job_id: int) -> None:
     update_job(database, job_id, "PENDING")
 
 
+# One query for the statuses of a job and every ancestor pipeline it belongs to. Bounded so a
+# corrupt parent cycle degrades to a truncated (but still correct) answer instead of a hang.
+_LINEAGE_STATUS_SQL = f"""
+WITH RECURSIVE lineage(id, parent_job_id, status, depth) AS (
+    SELECT id, parent_job_id, status, 0 FROM jobs WHERE id=?
+    UNION ALL
+    SELECT j.id, j.parent_job_id, j.status, l.depth + 1
+    FROM jobs j JOIN lineage l ON j.id = l.parent_job_id
+    WHERE l.depth < {_MAX_LINEAGE_DEPTH}
+)
+SELECT status FROM lineage
+"""
+
+
+def _lineage_statuses(database: Database, job_id: int) -> set[str]:
+    return {str(row["status"]) for row in database.fetch_all(_LINEAGE_STATUS_SQL, (job_id,))}
+
+
 def cancellation_requested(database: Database, job_id: int) -> bool:
-    row = database.fetch_one("SELECT status FROM jobs WHERE id=?", (job_id,))
-    return bool(row and row["status"] in {"CANCELLING", "CANCELLED"})
+    return bool(_lineage_statuses(database, job_id) & {"CANCELLING", "CANCELLED"})
 
 
 def pause_requested(database: Database, job_id: int) -> bool:
-    row = database.fetch_one("SELECT status FROM jobs WHERE id=?", (job_id,))
-    return bool(row and row["status"] in {"PAUSING", "PAUSED"})
+    return bool(_lineage_statuses(database, job_id) & {"PAUSING", "PAUSED"})
 
 
 # Cancellation is a human-scale event: polling faster than this buys nothing and costs a query.
@@ -183,6 +233,10 @@ def check_cancelled(database: Database, job_id: int) -> None:
     UPDATE — which on a million-entry scan is millions of queries asking a question whose answer
     changes at most once. Now it is one SELECT, and only when at least
     ``CANCELLATION_POLL_SECONDS`` have passed since the last one for this job.
+
+    The poll covers the job's whole lineage, not just its own row: a stage of a pipeline stops
+    when the *pipeline* is asked to pause or cancel, which is how one button controls a whole
+    quickstart/analyse-all run. Cancel wins over pause when both appear in the lineage.
     """
     global _last_poll
     key = (str(database.path), job_id)
@@ -191,14 +245,13 @@ def check_cancelled(database: Database, job_id: int) -> None:
     if last_key == key and now - last_time < CANCELLATION_POLL_SECONDS:
         return
     _last_poll = (key, now)
-    row = database.fetch_one("SELECT status FROM jobs WHERE id=?", (job_id,))
-    status = row["status"] if row else None
-    if status in {"PAUSING", "PAUSED"}:
-        update_job(database, job_id, "PAUSED")
-        raise JobPaused(f"job {job_id} paused")
-    if status in {"CANCELLING", "CANCELLED"}:
+    statuses = _lineage_statuses(database, job_id)
+    if statuses & {"CANCELLING", "CANCELLED"}:
         update_job(database, job_id, "CANCELLED")
         raise JobCancelled(f"job {job_id} cancelled")
+    if statuses & {"PAUSING", "PAUSED"}:
+        update_job(database, job_id, "PAUSED")
+        raise JobPaused(f"job {job_id} paused")
 
 
 def checkpoint(
@@ -276,6 +329,10 @@ def tracked_job(
     try:
         if signal.getsignal(signal.SIGINT) is not None and threading_main_thread():
             previous_handler = signal.signal(signal.SIGINT, interrupt_handler)
+        # A stage that starts inside a pipeline that was just paused/cancelled must not run at
+        # all: honour the inherited request before doing any work. Without this, a control click
+        # that lands on a stage boundary would be a no-op and the run would simply move on.
+        check_cancelled(database, job_id)
         yield job_id
         database.connect().commit()
         invalidate_graph_cache(database)
@@ -368,7 +425,13 @@ def reconcile_stale_jobs(
         alive = _worker_process_alive(row["process_id"], row["host"], this_host)
         if alive is True:
             continue  # a live worker owns this job; leave it alone
-        stale_heartbeat = seconds_since(row["updated_at"]) > heartbeat_timeout_seconds
+        # A pipeline root's own row is only touched at stage boundaries, so its heartbeat is the
+        # freshest of itself and its stage jobs — a busy stage keeps the whole pipeline alive.
+        child = database.fetch_one(
+            "SELECT MAX(updated_at) latest FROM jobs WHERE parent_job_id=?", (row["id"],)
+        )
+        heartbeats = [row["updated_at"]] + ([child["latest"]] if child and child["latest"] else [])
+        stale_heartbeat = min(seconds_since(value) for value in heartbeats) > heartbeat_timeout_seconds
         if alive is None and not stale_heartbeat:
             # Undecidable pid and a recent heartbeat — assume a healthy remote/near worker.
             continue

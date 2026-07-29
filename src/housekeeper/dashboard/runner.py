@@ -107,6 +107,10 @@ class OperationRunner:
                 self._run_classify(database)
             elif operation == "report":
                 self._run_report(database, kwargs["kind"])
+            elif operation == "purge":
+                from ..database_maintenance import purge_runs
+
+                purge_runs(database, self._config)
             else:
                 raise ValueError(f"unknown operation: {operation}")
             # analyse/classify change the counts and charts the overview shows, so refresh the
@@ -131,10 +135,19 @@ class OperationRunner:
             database.close()
 
     def _tracked(
-        self, database: Database, job_type: str, label: str, callback: Callable[[int], object]
+        self,
+        database: Database,
+        job_type: str,
+        label: str,
+        callback: Callable[[int], object],
+        parent_job_id: int | None = None,
     ) -> object:
         with tracked_job(
-            database, job_type, {"gui": label}, config_fingerprint(self._config)
+            database,
+            job_type,
+            {"gui": label},
+            config_fingerprint(self._config),
+            parent_job_id=parent_job_id,
         ) as job_id:
             return callback(job_id)
 
@@ -180,9 +193,18 @@ class OperationRunner:
             dispatch[name] = ("CONTENT_ANALYSIS", content_analysis_step(name))
         if kind != "all" and kind not in dispatch:
             raise ValueError(f"unknown analyse kind: {kind}")
-        for name in analyse_KINDS if kind == "all" else [kind]:
-            job_type, callback = dispatch[name]
-            self._tracked(database, job_type, name, callback)
+        if kind == "all":
+            # One pipeline job spanning every kind, so a single pause/cancel stops the whole
+            # sequence instead of only the analyser that happened to be running when clicked.
+            with tracked_job(
+                database, "ANALYSE_ALL", {"gui": "analyse-all"}, config_fingerprint(self._config)
+            ) as pipeline_job:
+                for name in analyse_KINDS:
+                    job_type, callback = dispatch[name]
+                    self._tracked(database, job_type, name, callback, parent_job_id=pipeline_job)
+        else:
+            job_type, callback = dispatch[kind]
+            self._tracked(database, job_type, kind, callback)
 
     def _run_classify(self, database: Database) -> None:
         from ..policies import classify_all_entries
