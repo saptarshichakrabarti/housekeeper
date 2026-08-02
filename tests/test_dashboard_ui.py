@@ -91,7 +91,8 @@ def test_overview_has_grouped_navigation_hero_links_and_bars(dashboard_client) -
 
 
 def test_review_renders_filter_bar_chips_and_human_values(dashboard_client) -> None:
-    body = dashboard_client.get("/review?extension=.pdf&minimum_size=1000").text
+    # show_all: the sample row is an unclassified pdf; the default actionable queue would hide it.
+    body = dashboard_client.get("/review?extension=.pdf&minimum_size=1000&show_all=true").text
     assert 'class="filter-bar"' in body
     assert 'name="top_level_directory"' in body
     assert 'name="duplicate_only"' in body
@@ -100,6 +101,60 @@ def test_review_renders_filter_bar_chips_and_human_values(dashboard_client) -> N
     assert 'title="12,400 bytes"' in body
     assert 'href="/review" aria-current="page"' in body
     assert "Keyboard shortcuts" in body
+
+
+def _review_client(database):
+    from fastapi.testclient import TestClient
+
+    from housekeeper.dashboard.app import create_app
+
+    conn = database.connect()
+    conn.execute(
+        "INSERT INTO scan_runs(id,source_root,source_root_fingerprint,status) "
+        "VALUES(1,'/drive','drive','COMPLETE')"
+    )
+    conn.execute(
+        "INSERT INTO filesystem_entries(id,scan_run_id,source_root,absolute_path,relative_path,name,entry_type,size_bytes) VALUES"
+        "(10,1,'/drive','/drive/undecided.bin','undecided.bin','undecided.bin','file',1000),"
+        "(11,1,'/drive','/drive/decided.bin','decided.bin','decided.bin','file',1000),"
+        "(12,1,'/drive','/drive/kept.bin','kept.bin','kept.bin','file',1000)"
+    )
+    conn.execute(
+        "INSERT INTO classifications(entry_id,classification,confidence) VALUES"
+        "(10,'REVIEW_DUPLICATE',0.9),(11,'REVIEW_DUPLICATE',0.9),(12,'KEEP',0.9)"
+    )
+    conn.execute("INSERT INTO review_sessions(id,name,status) VALUES(1,'S','OPEN')")
+    conn.execute(
+        "INSERT INTO review_decisions(review_session_id,target_type,target_id,decision,current) "
+        "VALUES(1,'ENTRY',11,'MARK_KEEP',1)"
+    )
+    database.refresh_current_inventory_views()
+    conn.commit()
+    return TestClient(create_app(database))
+
+
+def test_review_defaults_to_the_actionable_queue(database) -> None:
+    pytest.importorskip("fastapi")
+    pytest.importorskip("httpx")
+    client = _review_client(database)
+    default = client.get("/review").text
+    # Assert on the row's entry link, not the bare name (names also appear in filter dropdowns).
+    assert "/fragments/entry/10" in default  # the undecided review candidate is queued
+    assert "/fragments/entry/11" not in default  # already has a decision
+    assert "/fragments/entry/12" not in default  # KEEP, not a review candidate
+    assert "Items that need review" in default
+    assert "Show all files" in default
+
+
+def test_review_show_all_reveals_the_full_inventory(database) -> None:
+    pytest.importorskip("fastapi")
+    pytest.importorskip("httpx")
+    client = _review_client(database)
+    body = client.get("/review?show_all=true").text
+    assert "undecided.bin" in body and "decided.bin" in body and "kept.bin" in body
+    assert "All files" in body
+    # The "all files" scope stays sticky across pagination.
+    assert "show_all=true" in body or "Next page" not in body
 
 
 def test_duplicates_lead_with_reclaimable_space_and_copyable_hash(dashboard_client) -> None:

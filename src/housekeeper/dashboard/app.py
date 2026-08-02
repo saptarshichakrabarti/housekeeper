@@ -561,7 +561,14 @@ def create_app(
         top_level_directory: str | None = None,
         modified_after: float | None = None,
         modified_before: float | None = None,
+        show_all: bool = False,
     ):
+        # Actionable-by-default: an unfiltered visit lands on the items that still need a decision —
+        # review candidates with none recorded — not the whole drive. An explicit classification,
+        # decision, protected or stale filter means the user asked for a specific slice, so honour
+        # it; `show_all=true` opts out of the default entirely.
+        narrowed = any(v is not None for v in (classification, decision, protected, stale))
+        actionable = not show_all and not narrowed
         filters = ReviewFilter(
             classification=classification,
             suffix=extension,
@@ -577,6 +584,7 @@ def create_app(
             top_level_directory=top_level_directory,
             minimum_age_timestamp=modified_after,
             maximum_age_timestamp=modified_before,
+            actionable=actionable,
         )
         rows = service.review_rows(filters, limit, after_id)
         filter_values: dict[str, object] = {
@@ -598,6 +606,9 @@ def create_app(
         active_params = {
             key: value for key, value in filter_values.items() if value is not None and value != ""
         }
+        # Toggle between the actionable default and the whole inventory, preserving any other filters.
+        show_all_url = "/review?" + urlencode({**active_params, "show_all": "true"})
+        actionable_url = "/review" + (f"?{urlencode(active_params)}" if active_params else "")
         chip_labels = {
             "classification": "Classification",
             "extension": "Extension",
@@ -626,6 +637,8 @@ def create_app(
             )
         next_id = rows[-1].entry_id if rows else None
         next_params = {"limit": limit, **active_params, "after_id": next_id}
+        if show_all:  # keep "all files" sticky across pages; the default needs no marker
+            next_params["show_all"] = "true"
         classifications = [
             str(row["classification"])
             for row in reader.fetch_all(
@@ -645,6 +658,10 @@ def create_app(
             next_id=next_id,
             next_url=f"/review?{urlencode(next_params)}" if next_id else "",
             filters=filter_values,
+            actionable=actionable,
+            narrowed=narrowed,
+            show_all_url=show_all_url,
+            actionable_url=actionable_url,
             chips=chips,
             classifications=classifications,
             top_level_directories=top_level_directories,

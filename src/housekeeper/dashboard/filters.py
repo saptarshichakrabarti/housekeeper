@@ -121,10 +121,19 @@ class ReviewFilter:
     stale: bool | None = None
     protected: bool | None = None
     top_level_directory: str | None = None
+    # Restrict to the work that still needs doing: review candidates with no decision recorded yet.
+    # The review page sets this by default so an unfiltered visit lands on the queue, not the drive.
+    actionable: bool = False
 
     def where_clause(self) -> tuple[str, tuple[object, ...]]:
         clauses = ["e.entry_type='file'"]
         params: list[object] = []
+        if self.actionable:
+            clauses.append("c.classification LIKE 'REVIEW_%'")
+            clauses.append(
+                "NOT EXISTS(SELECT 1 FROM review_decisions d WHERE d.target_type='ENTRY' "
+                "AND d.target_id=e.id AND d.current=1)"
+            )
         if self.classification:
             clauses.append("c.classification=?")
             params.append(self.classification)

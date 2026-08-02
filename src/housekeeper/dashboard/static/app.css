@@ -402,6 +402,8 @@ input, select {
 }
 
 .empty-state { color: var(--hk-text-muted); padding: 1.25rem; text-align: center; }
+.review-scope { display: flex; flex-wrap: wrap; gap: .5rem; align-items: baseline; color: var(--hk-text-muted); margin: .6rem 0; }
+.review-scope strong { color: var(--hk-text); }
 .filter-bar { background: var(--hk-surface); border: var(--hk-border-w) solid var(--hk-border); border-radius: var(--hk-radius); padding: .8rem; margin: 1rem 0 .6rem; }
 .filter-bar h2 { font-size: 1rem; margin: 0 0 .65rem; }
 .filter-grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(160px, 1fr)); gap: .65rem; align-items: end; }

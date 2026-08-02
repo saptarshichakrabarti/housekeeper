@@ -1,5 +1,15 @@
 <p>Cursor-paginated review queue. Decisions are recorded to a review session; this page never moves files.</p>
 
+<p class="review-scope">
+{% if actionable %}
+  <strong>Items that need review</strong> — candidates with no decision yet.
+  <a href="{{ show_all_url }}">Show all files</a>
+{% else %}
+  <strong>{% if narrowed %}Filtered view{% else %}All files{% endif %}</strong> — the full inventory, including kept and decided items.
+  <a href="{{ actionable_url }}">Only items that need review</a>
+{% endif %}
+</p>
+
 <form class="filter-bar" action="/review" method="get" hx-get="/review" hx-target="main" hx-select="main" hx-swap="outerHTML" hx-push-url="true">
   <h2>Filter review</h2>
   <div class="filter-grid">
