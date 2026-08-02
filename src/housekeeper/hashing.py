@@ -1,8 +1,51 @@
 import hashlib
+import os
 from pathlib import Path
+from typing import BinaryIO
 
 from .core import counters
 from .models import HashResult
+
+#: These are optimisations, not requirements — a platform without them still hashes correctly.
+_HAS_FADVISE = hasattr(os, "posix_fadvise")
+_O_NOATIME = getattr(os, "O_NOATIME", 0)
+
+
+def _open_for_hash(path: Path, sequential: bool = True) -> BinaryIO:
+    """Open a file for hashing with reduced page-cache impact.
+
+    ``O_NOATIME`` avoids an access-time write per file on an otherwise read-only scan; it is
+    owner-only, so a file we do not own falls back to a plain open. ``posix_fadvise`` tells the
+    kernel the access pattern — sequential for a full read, random for the sampled quick hash — so
+    reading a terabyte through the cache once does not evict everything else the machine needs.
+    """
+    try:
+        fd = os.open(path, os.O_RDONLY | _O_NOATIME)
+    except PermissionError:
+        fd = os.open(path, os.O_RDONLY)  # O_NOATIME requires ownership of the file
+    if _HAS_FADVISE:
+        try:
+            os.posix_fadvise(
+                fd, 0, 0, os.POSIX_FADV_SEQUENTIAL if sequential else os.POSIX_FADV_RANDOM
+            )
+        except OSError:
+            pass
+    return os.fdopen(fd, "rb")
+
+
+def _drop_from_cache(handle: BinaryIO) -> None:
+    """Evict this file's pages after hashing it — for data nothing else is about to re-read.
+
+    Used only for content that will not be parsed (too large, or a suffix no analyser opens): a
+    long streaming scan of such files would otherwise fill the page cache with bytes read exactly
+    once, at the expense of the database pages and directory metadata the run genuinely reuses.
+    """
+    if not _HAS_FADVISE:
+        return
+    try:
+        os.posix_fadvise(handle.fileno(), 0, 0, os.POSIX_FADV_DONTNEED)
+    except OSError:
+        pass
 
 
 def _quick_offsets(size: int, chunk_size: int, samples: int) -> list[int]:
@@ -23,7 +66,12 @@ def _samples_whole_file(size: int, chunk_size: int, samples: int) -> bool:
 
 
 def _hash(
-    path: Path, algorithm: str, block_size: int, quick: bool = False, samples: int = 2
+    path: Path,
+    algorithm: str,
+    block_size: int,
+    quick: bool = False,
+    samples: int = 2,
+    drop_cache: bool = False,
 ) -> HashResult:
     try:
         before = path.stat()
@@ -36,17 +84,21 @@ def _hash(
             quick = False
         if quick and size:
             offsets = _quick_offsets(size, block_size, samples)
-            with path.open("rb") as f:
+            with _open_for_hash(path, sequential=False) as f:
                 for offset in offsets:
                     f.seek(offset)
                     chunk = f.read(block_size)
                     read += len(chunk)
                     h.update(chunk)
+                if drop_cache:
+                    _drop_from_cache(f)
         else:
-            with path.open("rb") as f:
+            with _open_for_hash(path, sequential=True) as f:
                 for chunk in iter(lambda: f.read(block_size), b""):
                     read += len(chunk)
                     h.update(chunk)
+                if drop_cache:
+                    _drop_from_cache(f)
         counters.count("quick_hash_bytes" if quick else "full_hash_bytes", read)
         counters.count("source_bytes_read", read)
         after = path.stat()
@@ -72,7 +124,12 @@ def compute_full_hash(path: Path, algorithm: str, block_size: int) -> HashResult
 
 
 def compute_identity(
-    path: Path, algorithm: str, block_size: int, quick_chunk_bytes: int, quick_samples: int
+    path: Path,
+    algorithm: str,
+    block_size: int,
+    quick_chunk_bytes: int,
+    quick_samples: int,
+    drop_cache: bool = False,
 ) -> tuple[HashResult, HashResult]:
     """Both digests for one file from **one** sequential read. Returns ``(full, quick)``.
 
@@ -82,6 +139,9 @@ def compute_identity(
     the stream flows by, so the quick digest is a by-product rather than a second pass. The
     digests are byte-identical to what :func:`compute_quick_hash` and :func:`compute_full_hash`
     produce, so hashes stored by earlier versions still compare.
+
+    ``drop_cache`` evicts the file's pages after reading — set it only for content that will not be
+    parsed afterwards, or the parse stage pays to read it back from disk.
 
     Memory is bounded by ``(quick_samples + 2) * quick_chunk_bytes`` — 4 MB at the defaults.
     """
@@ -96,7 +156,7 @@ def compute_identity(
             offsets = _quick_offsets(size, quick_chunk_bytes, quick_samples)
         captured: dict[int, bytearray] = {offset: bytearray() for offset in offsets}
         read = 0
-        with path.open("rb") as handle:
+        with _open_for_hash(path, sequential=True) as handle:
             position = 0
             while chunk := handle.read(block_size):
                 full.update(chunk)
@@ -107,6 +167,8 @@ def compute_identity(
                         captured[offset] += chunk[low - position : high - position]
                 position += len(chunk)
                 read += len(chunk)
+            if drop_cache:
+                _drop_from_cache(handle)
         counters.count("full_hash_bytes", read)
         counters.count("source_bytes_read", read)
         after = path.stat()

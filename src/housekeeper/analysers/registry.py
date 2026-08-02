@@ -240,7 +240,7 @@ def _run_content_analysis(
     # snapshot. Content-object id allocation order is not semantic (grouping orders by digest), so
     # the change is invisible downstream.
     candidates = database.reader().iter_rows(
-        f"""SELECT e.id,e.scan_run_id,e.absolute_path,e.suffix,e.device_id,e.inode_or_file_id,e.nlink
+        f"""SELECT e.id,e.scan_run_id,e.absolute_path,e.suffix,e.size_bytes,e.device_id,e.inode_or_file_id,e.nlink
             FROM filesystem_entries e
             LEFT JOIN entry_content_links l ON l.entry_id=e.id
             WHERE e.entry_type='file' AND l.entry_id IS NULL AND e.id IN ({entry_sql})
@@ -252,6 +252,32 @@ def _run_content_analysis(
         for entry in candidates
         if analyser_name in (None, "all") or entry["suffix"] in suffixes
     )
+
+    # A denominator for the identity phase so a multi-day hash stage shows a percentage rather than a
+    # bare climbing count. Counts unlinked files in scope: exact for an all-analyser pass (the common
+    # case), a slight over-estimate for a single narrow analyser whose suffix filter the service
+    # applies as it streams. The per-spec parse phase below revises the estimate to its own work.
+    if job_id:
+        identity_total = _count(
+            database.reader(),
+            f"""SELECT e.id FROM filesystem_entries e
+                LEFT JOIN entry_content_links l ON l.entry_id=e.id
+                WHERE e.entry_type='file' AND l.entry_id IS NULL AND e.id IN ({entry_sql})""",
+            entry_params,
+        )
+        update_job(database, job_id, total_estimate=identity_total, current_item="identity")
+    # Evict the page cache after hashing content the parse stage will never open — a file above the
+    # analysis size ceiling, or a suffix no analyser handles — so a long scan of large media does not
+    # push the database's own hot pages out of cache. Anything a parser *will* re-read is left cached.
+    parse_ceiling = int(config.section("scanner")["max_file_size_for_content_analysis"])
+    parseable_suffixes = set().union(*(spec.suffixes for spec in REGISTRY))
+
+    def _drop_after_hash(entry: dict[str, Any]) -> bool:
+        size = entry.get("size_bytes")
+        if size is not None and int(size) > parse_ceiling:
+            return True
+        suffix = (entry.get("suffix") or "").lower()
+        return suffix not in parseable_suffixes
 
     # Identity — full+quick digest, content-object link, signature row — for every eligible file,
     # hashed across `full_hash_workers` threads by the one shared service. It commits per batch (the
@@ -265,6 +291,7 @@ def _run_content_analysis(
         job_id,
         workers=int(performance_profile(config)["full_hash_workers"]),
         record_errors=False,
+        drop_cache=_drop_after_hash,
         progress_phase="identity",
     )
     counts["hashed"] += identity["hashed"]

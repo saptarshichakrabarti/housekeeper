@@ -198,9 +198,15 @@ DEFAULTS: dict[str, Any] = {
         # Worker counts live here and nowhere else. Top-level duplicates of these keys used to
         # shadow the profile unconditionally, so selecting "ssd" still ran full_hash_workers=1;
         # an operator who wants to depart from the profile now says so in `overrides`.
+        # SHA-256 (with SHA-NI) sustains ~1.5–2 GB/s per core and hashlib releases the GIL, so hash
+        # threads scale on fast storage until the device saturates. The counts below are the plan's
+        # proposed defaults pending a per-machine `benchmark_hashing --workers` sweep (see
+        # docs/performance.md); an operator who has measured their drive sets `overrides`. A rotational
+        # disk stays at one worker — concurrent reads there are seeks, not throughput.
         "profiles": {
             "hdd": {"full_hash_workers": 1, "parser_workers": 2},
-            "ssd": {"full_hash_workers": 4, "parser_workers": 4},
+            "ssd": {"full_hash_workers": 8, "parser_workers": 4},
+            "nvme": {"full_hash_workers": 16, "parser_workers": 6},
             "network": {"full_hash_workers": 1, "parser_workers": 2},
         },
         "overrides": {},
@@ -328,13 +334,26 @@ def config_fingerprint(config: AppConfig) -> str:
 #: network shares do not reach this on a mixed corpus once seek time is included; an SSD clears it
 #: comfortably. Deliberately well clear of both, because the penalty for guessing wrong is real work.
 SSD_BYTES_PER_SECOND = 200_000_000
+#: And above which it is treated as NVMe, worth more hash threads still. Set where a real SSD tops out
+#: and a fast NVMe drive keeps going. Note the sample this compares against is measured with the
+#: *current* worker count, so a drive climbs hdd → ssd → nvme over successive runs rather than in one
+#: leap — which is the safe direction (never more threads than a measurement has justified).
+NVME_BYTES_PER_SECOND = 1_500_000_000
 
 
 def observed_profile(bytes_per_second: float | None) -> str | None:
-    """Which profile a measured hashing throughput implies, or None if it implies nothing."""
+    """Which profile a measured hashing throughput implies, or None if it implies nothing.
+
+    A ladder, not a single threshold: a measurement can only ever *promote* toward more concurrency,
+    and only as far as the throughput it actually observed warrants.
+    """
     if not bytes_per_second or bytes_per_second <= 0:
         return None
-    return "ssd" if bytes_per_second >= SSD_BYTES_PER_SECOND else None
+    if bytes_per_second >= NVME_BYTES_PER_SECOND:
+        return "nvme"
+    if bytes_per_second >= SSD_BYTES_PER_SECOND:
+        return "ssd"
+    return None
 
 
 def performance_profile(

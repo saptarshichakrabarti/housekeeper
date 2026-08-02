@@ -4,11 +4,43 @@ import hashlib
 
 import pytest
 
+from housekeeper import hashing
 from housekeeper.hashing import (
     compute_full_hash,
+    compute_identity,
     compute_quick_hash,
     verify_file_against_manifest,
 )
+
+
+def test_cache_hygiene_never_changes_the_digest(tmp_path):
+    """O_NOATIME, fadvise and DONTNEED are performance hints; the bytes hashed must be identical."""
+    target = tmp_path / "f.bin"
+    payload = b"cache-hygiene payload " * 5000
+    target.write_bytes(payload)
+    expected = hashlib.sha256(payload).hexdigest()
+    assert compute_full_hash(target, "sha256", 4096).digest == expected
+    full, quick = compute_identity(target, "sha256", 4096, 1024, 2, drop_cache=True)
+    assert full.digest == expected
+    # The quick digest stays a by-product of the same read, identical to the standalone quick hash.
+    assert quick.digest == compute_quick_hash(target, 1024, 2, "sha256").digest
+
+
+def test_hashing_survives_a_platform_without_fadvise(tmp_path, monkeypatch):
+    """A platform (or mount) that rejects posix_fadvise must still hash correctly."""
+    target = tmp_path / "f.bin"
+    payload = b"no fadvise here" * 3000
+    target.write_bytes(payload)
+
+    def boom(*_args, **_kwargs):
+        raise OSError("posix_fadvise unsupported")
+
+    # Both the advice-on-open and the DONTNEED-after paths must degrade to a plain correct hash.
+    monkeypatch.setattr(hashing.os, "posix_fadvise", boom, raising=False)
+    result = compute_full_hash(target, "sha256", 4096)
+    assert result.stable and result.digest == hashlib.sha256(payload).hexdigest()
+    full, _quick = compute_identity(target, "sha256", 4096, 1024, 2, drop_cache=True)
+    assert full.digest == hashlib.sha256(payload).hexdigest()
 
 
 def test_full_hash_matches_hashlib(tmp_path):

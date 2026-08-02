@@ -46,7 +46,7 @@ def test_validate_rejects_an_unknown_key_inside_a_named_profile():
 
 def test_operator_named_profiles_and_overrides_are_allowed():
     config = load_config().data.copy()
-    profiles = {**config["performance"]["profiles"], "nvme": {"full_hash_workers": 8, "parser_workers": 8}}
+    profiles = {**config["performance"]["profiles"], "raid0": {"full_hash_workers": 8, "parser_workers": 8}}
     config = {
         **config,
         "performance": {
@@ -91,7 +91,7 @@ def test_selecting_a_profile_actually_selects_it(tmp_path):
     """Top-level worker keys used to shadow the profile, so "ssd" still ran one hash worker."""
     config = load_config(workspace_override=tmp_path)
     config.section("performance")["storage_profile"] = "ssd"
-    assert performance_profile(config)["full_hash_workers"] == 4
+    assert performance_profile(config)["full_hash_workers"] == 8
 
 
 def test_overrides_depart_from_the_profile_by_name(tmp_path):
@@ -130,10 +130,23 @@ def test_auto_prefers_a_measured_throughput_over_the_path_heuristic():
     assert performance_profile(config, local)["profile_name"] == "hdd"
     fast = performance_profile(config, local, SSD_BYTES_PER_SECOND * 1.5)
     assert fast["profile_name"] == "ssd"
-    assert int(fast["full_hash_workers"]) == 4
+    assert int(fast["full_hash_workers"]) == 8
     # A slow measurement must not *demote* below the heuristic, only decline to promote.
     assert observed_profile(1_000_000) is None
     assert performance_profile(config, local, 1_000_000)["profile_name"] == "hdd"
+
+
+def test_auto_promotes_to_nvme_on_a_fast_enough_measurement():
+    """The ladder climbs: an SSD-class rate picks ssd, an NVMe-class rate picks nvme."""
+    from housekeeper.config import NVME_BYTES_PER_SECOND, observed_profile
+
+    config = load_config()
+    config.section("performance")["storage_profile"] = "auto"
+    local = Path("/mnt/somedrive")
+    assert observed_profile(NVME_BYTES_PER_SECOND * 1.2) == "nvme"
+    fast = performance_profile(config, local, NVME_BYTES_PER_SECOND * 1.2)
+    assert fast["profile_name"] == "nvme"
+    assert int(fast["full_hash_workers"]) == 16
 
 
 def test_a_measurement_does_not_override_an_explicit_profile():

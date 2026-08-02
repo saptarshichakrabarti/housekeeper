@@ -33,7 +33,7 @@ object: reuse is an optimisation with no correctness stake, so best-effort adjac
 from __future__ import annotations
 
 import time
-from collections.abc import Iterable, Iterator, Mapping
+from collections.abc import Callable, Iterable, Iterator, Mapping
 from pathlib import Path
 from typing import Any
 
@@ -131,6 +131,7 @@ def ensure_content_identity(
     record_errors: bool = False,
     record_throughput: bool = True,
     hardlink_reuse: bool | None = None,
+    drop_cache: Callable[[Mapping[str, Any]], bool] | None = None,
     progress_phase: str = "hashing",
 ) -> dict[str, int]:
     """Hash every candidate once, link and sign it, and return ``{hashed, errors, bytes, reused}``.
@@ -160,6 +161,7 @@ def ensure_content_identity(
                 hashing["full_hash_block_bytes"],
                 hashing["quick_hash_chunk_bytes"],
                 hashing["quick_hash_middle_samples"],
+                drop_cache=bool(drop_cache(entry)) if drop_cache is not None else False,
             )
             return entry, followers, quick, full
         except OSError:
