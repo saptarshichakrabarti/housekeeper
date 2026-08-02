@@ -8,6 +8,7 @@ already here: the missing-entry epilogue at the bottom of the old loop worked ex
 """
 
 import hashlib
+import itertools
 import json
 import os
 import platform
@@ -28,6 +29,13 @@ from .path_utils import is_hidden_path, normalize_absolute_path, safe_relative_p
 #: that per-entry overhead disappears, small enough that an interrupted scan loses little and other
 #: processes see progress promptly.
 SCAN_BATCH_SIZE = 5_000
+
+#: Above this many entries in a single directory, that directory is streamed unsorted rather than
+#: read entirely into memory to sort — a 50M-file flat folder would otherwise be tens of GB of
+#: DirEntry objects at once. Reproducible ids (the sort) still hold for every directory under it,
+#: which is every real one; a folder this size is pathological and its audit order is not worth an
+#: out-of-memory kill.
+SCAN_DIR_SORT_LIMIT = 1_000_000
 
 #: Columns staged for each entry, in the order `_row` builds them.
 _ENTRY_COLUMNS = (
@@ -307,6 +315,31 @@ class DriveScanner:
 
     # ---------------------------------------------------------------- traversal
 
+    @staticmethod
+    def _read_directory(directory: Path, sort_limit: int):
+        """Return ``(entries, overflow)`` for one directory.
+
+        Within ``sort_limit`` a sorted list (so entry ids stay reproducible across runs); beyond it
+        the raw ``scandir`` iterator, streamed unsorted, so a pathologically large flat directory is
+        never fully materialised. May raise ``OSError`` exactly as ``os.scandir`` does.
+        """
+        iterator = os.scandir(directory)
+        buffered: list[os.DirEntry] = []
+        for dent in iterator:
+            buffered.append(dent)
+            if len(buffered) >= sort_limit:
+                # Chain the buffered head with the un-consumed tail; the caller streams both. The
+                # scandir handle closes when the chain is exhausted (or on GC if the walk stops).
+                return itertools.chain(buffered, iterator), True
+        iterator.close()
+        buffered.sort(key=lambda e: e.name.casefold())
+        return buffered, False
+
+    @staticmethod
+    def _identity(device: int | None, inode: int | None) -> tuple[int, int] | None:
+        """A directory's ``(device, inode)`` identity, or ``None`` when either is unknown."""
+        return (device, inode) if device is not None and inode is not None else None
+
     def _traverse(self, root: Path, run_id: int, source_root_id: int, job_id: int, counts: dict) -> None:
         """Walk the tree, staging entries in bounded batches.
 
@@ -318,12 +351,24 @@ class DriveScanner:
         excluded_names = frozenset(section.get("excluded_names", []))
         excluded_paths = frozenset(section.get("excluded_paths", []))
         batch_size = max(1, int(section.get("batch_size") or SCAN_BATCH_SIZE))
+        error_limit = int(section.get("pause_after_consecutive_errors", 0) or 0)
+        cycle_cap = max(0, int(section.get("cycle_guard_max_directories", 0) or 0))
         # `stay_on_filesystem` means exactly one thing: do not descend into a directory that lives
         # on a different device from the root. The entry is still recorded — a mount point is part
         # of this drive's inventory — but its contents belong to whatever is mounted there.
         root_device = self._device_of(root) if section.get("stay_on_filesystem") else None
         batch: list[tuple] = []
         processed = 0
+        # A run of consecutive unreadable entries is the signature of a drive that dropped mid-scan.
+        # Reset by any readable entry, so a few scattered permission errors never trip the breaker.
+        consecutive_errors = 0
+        cap_noted = False
+        # Directory identities already entered, so a bind mount or crafted symlink loop *within one
+        # filesystem* cannot be walked forever — stay_on_filesystem only stops cross-device loops.
+        visited: set[tuple[int, int]] = set()
+        root_identity = self._identity(*self._device_and_inode(root))
+        if root_identity is not None:
+            visited.add(root_identity)
         # (absolute directory, its path relative to the root, whether it is hidden). "" is the
         # root itself, which is never hidden by virtue of where it happens to be mounted.
         stack: list[tuple[Path, str, bool]] = [(root, "", False)]
@@ -331,14 +376,17 @@ class DriveScanner:
             check_cancelled(self.db, job_id)
             directory, rel_dir, dir_hidden = stack.pop()
             try:
-                # Sorted so entry ids are reproducible across runs of the same tree; readdir order
-                # is not stable. Nothing downstream may depend on id order (see 2.7), but a
-                # diffable audit trail is worth one sort per directory.
-                entries = sorted(os.scandir(directory), key=lambda e: e.name.casefold())
+                entries, overflow = self._read_directory(directory, SCAN_DIR_SORT_LIMIT)
             except OSError as exc:
                 counts["errors"] += 1
+                consecutive_errors += 1
                 update_job(self.db, job_id, error_count=counts["errors"], current_item=f"{directory}: {exc}")
+                if error_limit and consecutive_errors >= error_limit:
+                    self._pause_on_error_storm(batch, run_id, counts, processed, job_id, directory, consecutive_errors)
                 continue
+            if overflow:
+                counters.count("directories_streamed_unsorted")
+                update_job(self.db, job_id, current_item=f"{directory}: >{SCAN_DIR_SORT_LIMIT} entries, streamed unsorted")
             for dent in entries:
                 counters.count("entries_enumerated")
                 relative = f"{rel_dir}/{dent.name}" if rel_dir else dent.name
@@ -349,21 +397,57 @@ class DriveScanner:
                 rec = self.inspect_entry(path, root, dent, relative, hidden)
                 batch.append(self._row(rec, run_id, source_root_id, root, path))
                 processed += 1
+                if rec.read_error:
+                    counts["errors"] += 1
+                    consecutive_errors += 1
+                else:
+                    consecutive_errors = 0
                 if rec.entry_type == EntryType.FILE:
                     counts["files"] += 1
                     counts["bytes"] += rec.size_bytes
                 elif rec.entry_type == EntryType.DIRECTORY:
                     counts["dirs"] += 1
-                    if root_device is None or rec.device_id == root_device:
+                    descend = root_device is None or rec.device_id == root_device
+                    identity = self._identity(rec.device_id, rec.inode_or_file_id)
+                    if descend and identity is not None and identity in visited:
+                        counters.count("directories_skipped_as_cycles")
+                        descend = False
+                    if descend:
+                        if identity is not None and cycle_cap:
+                            if len(visited) < cycle_cap:
+                                visited.add(identity)
+                            elif not cap_noted:
+                                cap_noted = True
+                                update_job(self.db, job_id, current_item=f"cycle guard cap reached ({cycle_cap} dirs); descending unguarded")
                         stack.append((path, relative, hidden))
                 elif rec.entry_type == EntryType.SYMLINK:
                     counts["symlinks"] += 1
-                if rec.read_error:
-                    counts["errors"] += 1
                 if len(batch) >= batch_size:
                     self._flush(batch, run_id, counts, processed, job_id, str(directory))
+                if error_limit and consecutive_errors >= error_limit:
+                    self._pause_on_error_storm(batch, run_id, counts, processed, job_id, directory, consecutive_errors)
             self._checkpoint_counts(run_id, counts)
         self._flush(batch, run_id, counts, processed, job_id, str(root))
+
+    def _pause_on_error_storm(self, batch, run_id, counts, processed, job_id, where, consecutive) -> None:
+        """Commit what has been read, park the scan as PAUSED, and stop — instead of walking a dead
+        drive to the end. Resume re-walks safely (the entry upsert is idempotent)."""
+        self._flush(batch, run_id, counts, processed, job_id, str(where))
+        update_job(
+            self.db,
+            job_id,
+            "PAUSED",
+            current_item=f"paused after {consecutive} consecutive read errors near {where}",
+        )
+        raise JobPaused(f"scan paused after {consecutive} consecutive read errors")
+
+    @staticmethod
+    def _device_and_inode(path: Path) -> tuple[int | None, int | None]:
+        try:
+            st = os.stat(path, follow_symlinks=False)
+            return st.st_dev, getattr(st, "st_ino", None)
+        except OSError:
+            return None, None
 
     @staticmethod
     def _device_of(path: Path) -> int | None:

@@ -35,6 +35,14 @@ DEFAULTS: dict[str, Any] = {
         "max_file_size_for_content_analysis": 1073741824,
         "excluded_paths": [],
         "excluded_names": [],
+        # Park the scan (resumable) after this many consecutive unreadable entries — the signature of
+        # a drive that dropped off the bus mid-scan, which otherwise records millions of per-entry
+        # errors and keeps walking for hours. 0 disables the breaker.
+        "pause_after_consecutive_errors": 1000,
+        # Upper bound on the set of already-entered directory identities the cycle guard keeps in
+        # memory (~a tuple per directory). Beyond it new directories are descended unguarded — the
+        # safe direction — rather than growing memory without limit on a tree of millions of dirs.
+        "cycle_guard_max_directories": 10000000,
     },
     "hashing": {
         "algorithm": "sha256",
