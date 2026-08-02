@@ -177,6 +177,52 @@ def test_review_defaults_to_the_actionable_queue(database) -> None:
     assert "REVIEW_SAFE</td>" not in default  # never the bare code as the cell's text
 
 
+def test_review_empty_state_distinguishes_nothing_scanned(database) -> None:
+    pytest.importorskip("fastapi")
+    pytest.importorskip("httpx")
+    from fastapi.testclient import TestClient
+
+    from housekeeper.dashboard.app import create_app
+
+    client = TestClient(create_app(database))  # a fresh database: no scan has run
+    body = client.get("/review").text
+    assert "No files indexed yet" in body
+
+
+def test_review_empty_state_distinguishes_nothing_to_review(database) -> None:
+    pytest.importorskip("fastapi")
+    pytest.importorskip("httpx")
+    from fastapi.testclient import TestClient
+
+    from housekeeper.dashboard.app import create_app
+
+    conn = database.connect()
+    conn.execute(
+        "INSERT INTO scan_runs(id,source_root,source_root_fingerprint,status) VALUES(1,'/d','d','COMPLETE')"
+    )
+    conn.execute(
+        "INSERT INTO filesystem_entries(id,scan_run_id,source_root,absolute_path,relative_path,name,entry_type,size_bytes) "
+        "VALUES(1,1,'/d','/d/keep.bin','keep.bin','keep.bin','file',10)"
+    )
+    conn.execute("INSERT INTO classifications(entry_id,classification,confidence) VALUES(1,'KEEP',0.9)")
+    database.refresh_current_inventory_views()
+    conn.commit()
+    body = TestClient(create_app(database)).get("/review").text
+    # Files exist, but none are undecided review candidates: not "nothing scanned".
+    assert "Nothing needs review right now" in body
+    assert "Show all files" in body
+    assert "No files indexed yet" not in body
+
+
+def test_review_empty_state_distinguishes_no_filter_match(database) -> None:
+    pytest.importorskip("fastapi")
+    pytest.importorskip("httpx")
+    client = _review_client(database)
+    body = client.get("/review?classification=PROTECTED").text  # nothing is PROTECTED
+    assert "No entries match these filters" in body
+    assert "Clear filters" in body
+
+
 def test_review_show_all_reveals_the_full_inventory(database) -> None:
     pytest.importorskip("fastapi")
     pytest.importorskip("httpx")

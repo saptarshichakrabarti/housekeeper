@@ -713,6 +713,10 @@ def create_app(
             narrowed=narrowed,
             show_all_url=show_all_url,
             actionable_url=actionable_url,
+            # Cheap existence probe (LIMIT 1) so an empty queue can tell "nothing scanned" apart
+            # from "nothing needs review" apart from "these filters match nothing".
+            any_entries=bool(reader.fetch_one("SELECT 1 FROM current_entries LIMIT 1")),
+            has_active_filters=bool(chips),
             chips=chips,
             classifications=classifications,
             top_level_directories=top_level_directories,
