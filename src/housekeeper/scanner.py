@@ -271,15 +271,21 @@ class DriveScanner:
                 "storage_profile": profile["profile_name"],
             },
             config_fingerprint(self.config),
-            # Traversal is a single walk: one worker, recorded honestly. `scan_workers` was a knob
-            # that only ever changed this number in the job row.
-            worker_count=1,
+            # scandir+stat release the GIL, so a small pool overlaps a walk's I/O on fast or
+            # high-latency storage; hdd stays at one worker. Recorded honestly on the job row.
+            worker_count=int(profile.get("traversal_workers", 1)),
             parent_job_id=parent_job_id,
         )
         update_job(self.db, job_id, "RUNNING")
         counts = {"files": 0, "dirs": 0, "symlinks": 0, "errors": 0, "bytes": 0}
+        traversal_workers = max(1, int(profile.get("traversal_workers", 1)))
         try:
-            self._traverse(root, run_id, source_root_id, job_id, counts, initial_stack)
+            if traversal_workers > 1:
+                self._traverse_parallel(
+                    root, run_id, source_root_id, job_id, counts, initial_stack, traversal_workers
+                )
+            else:
+                self._traverse(root, run_id, source_root_id, job_id, counts, initial_stack)
         except (JobCancelled, JobPaused):
             # A scan that stops early — cancelled outright or paused at a checkpoint — leaves an
             # incomplete inventory; mark the run INTERRUPTED so it is never mistaken for a full scan.
@@ -490,6 +496,169 @@ class DriveScanner:
             current_item=f"paused after {consecutive} consecutive read errors near {where}",
         )
         raise JobPaused(f"scan paused after {consecutive} consecutive read errors")
+
+    # ------------------------------------------------------------ parallel traversal (opt-in)
+
+    def _scan_directory_for_worker(
+        self,
+        dir_tuple: tuple[Path, str, bool],
+        root: Path,
+        excluded_names: frozenset[str],
+        excluded_paths: frozenset[str],
+    ):
+        """Read one directory — the pure-I/O half of the walk, run on a worker thread.
+
+        Touches no database and no shared mutable state: it only reads the filesystem (``scandir`` +
+        ``stat``, which release the GIL) and returns this directory's records for the main thread to
+        stage. Counters are process-global and lock-guarded, so enumeration and stat counts are
+        recorded here exactly as the serial walk records them.
+        """
+        directory, rel_dir, dir_hidden = dir_tuple
+        try:
+            entries, overflow = self._read_directory(directory, SCAN_DIR_SORT_LIMIT)
+        except OSError as exc:
+            return [], False, str(exc)
+        listing: list[tuple[FileStatRecord, str, bool, Path]] = []
+        for dent in entries:
+            counters.count("entries_enumerated")
+            relative = f"{rel_dir}/{dent.name}" if rel_dir else dent.name
+            if dent.name in excluded_names or relative in excluded_paths:
+                continue
+            path = Path(dent.path)
+            hidden = dir_hidden or dent.name.startswith(".")
+            listing.append((self.inspect_entry(path, root, dent, relative, hidden), relative, hidden, path))
+        return listing, overflow, None
+
+    def _traverse_parallel(
+        self,
+        root: Path,
+        run_id: int,
+        source_root_id: int,
+        job_id: int,
+        counts: dict,
+        initial_stack: list[tuple[Path, str, bool]] | None,
+        workers: int,
+    ) -> None:
+        """Walk the tree with ``workers`` directory readers, all bookkeeping on this thread.
+
+        Only ``scandir``/``stat`` is offloaded; the single writer, the batch, the cycle guard and the
+        frontier stay here, so there is exactly one representation of scan state and no SQLite
+        connection ever crosses a thread. At ``workers == 1`` the serial walk is used instead, so
+        this path is purely additive.
+
+        The resume frontier here is everything not yet durably committed — queued directories, those
+        in flight, and those whose records sit in the unflushed batch. A resume re-walks all of them;
+        the entry upsert makes any resulting re-walk idempotent, so the cost is bounded redundancy,
+        never a lost or duplicated row.
+        """
+        from collections import deque
+        from concurrent.futures import FIRST_COMPLETED, ThreadPoolExecutor, wait
+
+        section = self.config.section("scanner")
+        excluded_names = frozenset(section.get("excluded_names", []))
+        excluded_paths = frozenset(section.get("excluded_paths", []))
+        batch_size = max(1, int(section.get("batch_size") or SCAN_BATCH_SIZE))
+        error_limit = int(section.get("pause_after_consecutive_errors", 0) or 0)
+        cycle_cap = max(0, int(section.get("cycle_guard_max_directories", 0) or 0))
+        root_device = self._device_of(root) if section.get("stay_on_filesystem") else None
+
+        batch: list[tuple] = []
+        processed = 0
+        consecutive_errors = 0
+        cap_noted = False
+        visited: set[tuple[int, int]] = set()
+        root_identity = self._identity(*self._device_and_inode(root))
+        if root_identity is not None:
+            visited.add(root_identity)
+        pending: deque[tuple[Path, str, bool]] = deque(
+            initial_stack if initial_stack is not None else [(root, "", False)]
+        )
+        inflight: dict = {}
+        # (rel, hidden) of directories whose records are in the current unflushed batch.
+        unflushed: list[tuple[str, bool]] = []
+
+        def frontier() -> list[tuple[str, bool]]:
+            return (
+                [(rd, dh) for (_p, rd, dh) in pending]
+                + [(rd, dh) for (_p, rd, dh) in inflight.values()]
+                + list(unflushed)
+            )
+
+        def flush(current: str) -> None:
+            self._flush(batch, run_id, counts, processed, job_id, current, frontier())
+            unflushed.clear()
+
+        with ThreadPoolExecutor(max_workers=workers) as pool:
+            try:
+                while pending or inflight:
+                    check_cancelled(self.db, job_id)
+                    while pending and len(inflight) < workers:
+                        dir_tuple = pending.popleft()
+                        future = pool.submit(
+                            self._scan_directory_for_worker,
+                            dir_tuple,
+                            root,
+                            excluded_names,
+                            excluded_paths,
+                        )
+                        inflight[future] = dir_tuple
+                    done, _ = wait(list(inflight), return_when=FIRST_COMPLETED)
+                    for future in done:
+                        directory, rel_dir, dir_hidden = inflight.pop(future)
+                        listing, overflow, error = future.result()
+                        if error is not None:
+                            counts["errors"] += 1
+                            consecutive_errors += 1
+                            update_job(self.db, job_id, error_count=counts["errors"], current_item=f"{directory}: {error}")
+                            if error_limit and consecutive_errors >= error_limit:
+                                self._pause_on_error_storm(batch, run_id, counts, processed, job_id, directory, consecutive_errors, frontier())
+                            continue
+                        if overflow:
+                            counters.count("directories_streamed_unsorted")
+                        # This directory's records are now in the batch: keep it in the frontier until
+                        # the batch is flushed, and enqueue its children only after it is processed
+                        # (so a flush mid-directory never lists a child that will be rediscovered).
+                        unflushed.append((rel_dir, dir_hidden))
+                        children: list[tuple[Path, str, bool]] = []
+                        for rec, relative, hidden, path in listing:
+                            batch.append(self._row(rec, run_id, source_root_id, root, path))
+                            processed += 1
+                            if rec.read_error:
+                                counts["errors"] += 1
+                                consecutive_errors += 1
+                            else:
+                                consecutive_errors = 0
+                            if rec.entry_type == EntryType.FILE:
+                                counts["files"] += 1
+                                counts["bytes"] += rec.size_bytes
+                            elif rec.entry_type == EntryType.DIRECTORY:
+                                counts["dirs"] += 1
+                                descend = root_device is None or rec.device_id == root_device
+                                identity = self._identity(rec.device_id, rec.inode_or_file_id)
+                                if descend and identity is not None and identity in visited:
+                                    counters.count("directories_skipped_as_cycles")
+                                    descend = False
+                                if descend:
+                                    if identity is not None and cycle_cap:
+                                        if len(visited) < cycle_cap:
+                                            visited.add(identity)
+                                        elif not cap_noted:
+                                            cap_noted = True
+                                            update_job(self.db, job_id, current_item=f"cycle guard cap reached ({cycle_cap} dirs); descending unguarded")
+                                    children.append((path, relative, hidden))
+                            elif rec.entry_type == EntryType.SYMLINK:
+                                counts["symlinks"] += 1
+                            if len(batch) >= batch_size:
+                                flush(str(directory))
+                            if error_limit and consecutive_errors >= error_limit:
+                                self._pause_on_error_storm(batch, run_id, counts, processed, job_id, directory, consecutive_errors, frontier())
+                        pending.extend(children)
+                    self._checkpoint_counts(run_id, counts)
+            except (JobCancelled, JobPaused):
+                pool.shutdown(wait=False, cancel_futures=True)
+                raise
+        # The walk is complete: clear the frontier (empty list stores NULL).
+        self._flush(batch, run_id, counts, processed, job_id, str(root), [])
 
     @staticmethod
     def _device_and_inode(path: Path) -> tuple[int | None, int | None]:

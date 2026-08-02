@@ -211,11 +211,14 @@ DEFAULTS: dict[str, Any] = {
         # proposed defaults pending a per-machine `benchmark_hashing --workers` sweep (see
         # docs/performance.md); an operator who has measured their drive sets `overrides`. A rotational
         # disk stays at one worker — concurrent reads there are seeks, not throughput.
+        # traversal_workers offloads scandir+stat (which release the GIL) to a small pool so a walk
+        # of high-latency storage overlaps its I/O; 1 keeps the single-threaded walk exactly. A
+        # rotational disk stays at 1 — parallel directory reads there are competing seeks.
         "profiles": {
-            "hdd": {"full_hash_workers": 1, "parser_workers": 2},
-            "ssd": {"full_hash_workers": 8, "parser_workers": 4},
-            "nvme": {"full_hash_workers": 16, "parser_workers": 6},
-            "network": {"full_hash_workers": 1, "parser_workers": 2},
+            "hdd": {"full_hash_workers": 1, "parser_workers": 2, "traversal_workers": 1},
+            "ssd": {"full_hash_workers": 8, "parser_workers": 4, "traversal_workers": 4},
+            "nvme": {"full_hash_workers": 16, "parser_workers": 6, "traversal_workers": 8},
+            "network": {"full_hash_workers": 1, "parser_workers": 2, "traversal_workers": 4},
         },
         "overrides": {},
         "batch_size": 1000,
