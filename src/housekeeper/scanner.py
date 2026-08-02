@@ -37,6 +37,11 @@ SCAN_BATCH_SIZE = 5_000
 #: out-of-memory kill.
 SCAN_DIR_SORT_LIMIT = 1_000_000
 
+#: Above this many pending directories the resume frontier is not persisted (a null frontier means
+#: "re-walk from the root"). A frontier this large means the walk is still early and wide, where a
+#: full re-walk costs little relative to the risk of writing a multi-megabyte blob every batch.
+FRONTIER_MAX_DIRECTORIES = 100_000
+
 #: Columns staged for each entry, in the order `_row` builds them.
 _ENTRY_COLUMNS = (
     "scan_run_id",
@@ -209,10 +214,12 @@ class DriveScanner:
             if resume
             else None
         )
-        run_id = (
-            int(old["id"])
-            if old and old["status"] != "COMPLETE"
-            else self.db.create_scan_run(
+        resuming = bool(old and old["status"] != "COMPLETE")
+        if resuming:
+            assert old is not None  # resuming implies old is set; narrows for the type checker
+            run_id = int(old["id"])
+        else:
+            run_id = self.db.create_scan_run(
                 str(root),
                 root_fp,
                 config_fingerprint(self.config),
@@ -220,8 +227,11 @@ class DriveScanner:
                 platform=platform.platform(),
                 python_version=sys.version,
             )
-        )
         self.last_run_id = run_id
+        # On resume, continue from the interrupted walk's frontier rather than re-walking the whole
+        # tree — the difference between O(remaining) and O(tree) on a multi-day scan. A missing or
+        # over-large frontier (or a fresh run) falls back to a full walk from the root.
+        initial_stack = self._resume_stack(root, run_id) if resuming else None
         previous_row = (
             self.db.fetch_one(
                 "SELECT id FROM scan_runs WHERE source_root_fingerprint=? AND id<>? AND status='COMPLETE' ORDER BY id DESC LIMIT 1",
@@ -269,7 +279,7 @@ class DriveScanner:
         update_job(self.db, job_id, "RUNNING")
         counts = {"files": 0, "dirs": 0, "symlinks": 0, "errors": 0, "bytes": 0}
         try:
-            self._traverse(root, run_id, source_root_id, job_id, counts)
+            self._traverse(root, run_id, source_root_id, job_id, counts, initial_stack)
         except (JobCancelled, JobPaused):
             # A scan that stops early — cancelled outright or paused at a checkpoint — leaves an
             # incomplete inventory; mark the run INTERRUPTED so it is never mistaken for a full scan.
@@ -340,12 +350,43 @@ class DriveScanner:
         """A directory's ``(device, inode)`` identity, or ``None`` when either is unknown."""
         return (device, inode) if device is not None and inode is not None else None
 
-    def _traverse(self, root: Path, run_id: int, source_root_id: int, job_id: int, counts: dict) -> None:
+    def _resume_stack(self, root: Path, run_id: int) -> list[tuple[Path, str, bool]] | None:
+        """Reconstruct the pending-directory stack from a resumed run's persisted frontier.
+
+        ``None`` when there is no usable frontier (a first interruption before any batch, an
+        over-large frontier stored as NULL, or a corrupt value), which makes the caller fall back to
+        a full re-walk from the root — correct, just not incremental.
+        """
+        row = self.db.fetch_one("SELECT frontier_json FROM scan_runs WHERE id=?", (run_id,))
+        if not row or not row["frontier_json"]:
+            return None
+        try:
+            frontier = json.loads(row["frontier_json"])
+        except (TypeError, ValueError):
+            return None
+        if not isinstance(frontier, list) or not frontier:
+            return None
+        # rel is relative to root; `root / ""` is root itself, so this reconstructs the absolute
+        # directory for every frontier entry including the root.
+        return [((root / rel), str(rel), bool(hidden)) for rel, hidden in frontier]
+
+    def _traverse(
+        self,
+        root: Path,
+        run_id: int,
+        source_root_id: int,
+        job_id: int,
+        counts: dict,
+        initial_stack: list[tuple[Path, str, bool]] | None = None,
+    ) -> None:
         """Walk the tree, staging entries in bounded batches.
 
         No per-entry query: the traversal only reads the filesystem and appends rows. Parent links
         and change detection are resolved afterwards, set-based, so nothing here needs an id back
         from the database.
+
+        ``initial_stack`` seeds the pending directories from a resumed run's frontier, so a scan
+        interrupted on day two continues from where it stopped rather than re-walking day one.
         """
         section = self.config.section("scanner")
         excluded_names = frozenset(section.get("excluded_names", []))
@@ -371,10 +412,17 @@ class DriveScanner:
             visited.add(root_identity)
         # (absolute directory, its path relative to the root, whether it is hidden). "" is the
         # root itself, which is never hidden by virtue of where it happens to be mounted.
-        stack: list[tuple[Path, str, bool]] = [(root, "", False)]
+        stack: list[tuple[Path, str, bool]] = (
+            list(initial_stack) if initial_stack is not None else [(root, "", False)]
+        )
         while stack:
             check_cancelled(self.db, job_id)
             directory, rel_dir, dir_hidden = stack.pop()
+            # The resume frontier for this directory: everything still pending, plus this directory
+            # itself (last, so it is re-walked first). Captured *before* the directory is read, so it
+            # excludes the directory's own children — a resume re-derives those by re-walking, and
+            # nothing already on the stack is walked twice.
+            frontier = [(rd, dh) for (_p, rd, dh) in stack] + [(rel_dir, dir_hidden)]
             try:
                 entries, overflow = self._read_directory(directory, SCAN_DIR_SORT_LIMIT)
             except OSError as exc:
@@ -382,7 +430,7 @@ class DriveScanner:
                 consecutive_errors += 1
                 update_job(self.db, job_id, error_count=counts["errors"], current_item=f"{directory}: {exc}")
                 if error_limit and consecutive_errors >= error_limit:
-                    self._pause_on_error_storm(batch, run_id, counts, processed, job_id, directory, consecutive_errors)
+                    self._pause_on_error_storm(batch, run_id, counts, processed, job_id, directory, consecutive_errors, frontier)
                 continue
             if overflow:
                 counters.count("directories_streamed_unsorted")
@@ -423,16 +471,18 @@ class DriveScanner:
                 elif rec.entry_type == EntryType.SYMLINK:
                     counts["symlinks"] += 1
                 if len(batch) >= batch_size:
-                    self._flush(batch, run_id, counts, processed, job_id, str(directory))
+                    self._flush(batch, run_id, counts, processed, job_id, str(directory), frontier)
                 if error_limit and consecutive_errors >= error_limit:
-                    self._pause_on_error_storm(batch, run_id, counts, processed, job_id, directory, consecutive_errors)
+                    self._pause_on_error_storm(batch, run_id, counts, processed, job_id, directory, consecutive_errors, frontier)
             self._checkpoint_counts(run_id, counts)
-        self._flush(batch, run_id, counts, processed, job_id, str(root))
+        # The walk is complete: clear the frontier (an empty list stores NULL) so a resumed reopen of
+        # this run — should one ever happen before it is marked COMPLETE — starts clean.
+        self._flush(batch, run_id, counts, processed, job_id, str(root), [])
 
-    def _pause_on_error_storm(self, batch, run_id, counts, processed, job_id, where, consecutive) -> None:
+    def _pause_on_error_storm(self, batch, run_id, counts, processed, job_id, where, consecutive, frontier=None) -> None:
         """Commit what has been read, park the scan as PAUSED, and stop — instead of walking a dead
         drive to the end. Resume re-walks safely (the entry upsert is idempotent)."""
-        self._flush(batch, run_id, counts, processed, job_id, str(where))
+        self._flush(batch, run_id, counts, processed, job_id, str(where), frontier)
         update_job(
             self.db,
             job_id,
@@ -481,7 +531,16 @@ class DriveScanner:
             rec.read_error,
         )
 
-    def _flush(self, batch: list[tuple], run_id: int, counts: dict, processed: int, job_id: int, current: str) -> None:
+    def _flush(
+        self,
+        batch: list[tuple],
+        run_id: int,
+        counts: dict,
+        processed: int,
+        job_id: int,
+        current: str,
+        frontier: list[tuple[str, bool]] | None = None,
+    ) -> None:
         """Write one batch and commit it. This is the scan's unit of durability."""
         if batch:
             columns = ",".join(_ENTRY_COLUMNS)
@@ -502,6 +561,18 @@ class DriveScanner:
             )
             batch.clear()
         self._checkpoint_counts(run_id, counts)
+        # Persist the resume frontier at the same cadence as durability. `frontier` is the pending
+        # directories captured when the current directory was popped — it excludes that directory's
+        # own not-yet-discovered children, so a resume re-walks the current directory to rediscover
+        # them without double-walking anything already on the stack. Too large a frontier stores NULL
+        # (a full re-walk), and None here means "leave whatever was last written".
+        if frontier is not None:
+            payload = (
+                json.dumps(frontier) if 0 < len(frontier) <= FRONTIER_MAX_DIRECTORIES else None
+            )
+            self.db.connect().execute(
+                "UPDATE scan_runs SET frontier_json=? WHERE id=?", (payload, run_id)
+            )
         self.db.connect().commit()
         update_job(
             self.db,

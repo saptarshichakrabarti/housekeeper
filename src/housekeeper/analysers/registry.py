@@ -3,7 +3,7 @@
 import gzip
 import hashlib
 import json
-from collections.abc import Callable
+from collections.abc import Callable, Mapping
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
@@ -272,7 +272,7 @@ def _run_content_analysis(
     parse_ceiling = int(config.section("scanner")["max_file_size_for_content_analysis"])
     parseable_suffixes = set().union(*(spec.suffixes for spec in REGISTRY))
 
-    def _drop_after_hash(entry: dict[str, Any]) -> bool:
+    def _drop_after_hash(entry: Mapping[str, Any]) -> bool:
         size = entry.get("size_bytes")
         if size is not None and int(size) > parse_ceiling:
             return True

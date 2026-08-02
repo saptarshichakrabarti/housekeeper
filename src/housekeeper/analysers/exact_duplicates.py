@@ -1,5 +1,8 @@
 """Exact duplicate analysis using a size → verified-content funnel without large lists."""
 
+from collections.abc import Iterable, Mapping
+from typing import Any, cast
+
 from ..config import AppConfig
 from ..core.identity import ensure_content_identity
 from ..database import Database
@@ -59,7 +62,9 @@ def _ensure_candidate_links(
     ensure_content_identity(
         database,
         config,
-        stream,
+        # sqlite3.Row is a mapping at runtime (the service reads it by key); typeshed does not model
+        # that, so the stream is cast to the documented contract rather than materialised to dicts.
+        cast("Iterable[Mapping[str, Any]]", stream),
         job_id,
         record_errors=True,
         progress_phase="hashing candidates",
