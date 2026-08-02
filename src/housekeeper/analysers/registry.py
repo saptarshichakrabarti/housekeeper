@@ -307,6 +307,11 @@ def _run_content_analysis(
         int(config.section("performance")["parser_memory_limit_mb"]),
     )
     artifacts_since_commit = 0
+    # The parse phase's own progress denominator, accumulated as each spec is planned. Without this
+    # the job keeps the *identity* phase's total, and the bar reads nonsense ("100% 40/1") the moment
+    # the parse loop processes more objects than the identity phase had files left to hash. Mirrors
+    # the exact-duplicates precedent: a job with two phases revises its total at the phase boundary.
+    parse_planned = 0
     try:
         for spec in wanted:
             # Hoisted out of the per-row loop below, where it re-hashed the whole configuration once
@@ -334,6 +339,14 @@ def _run_content_analysis(
             counts["skipped"] += max(0, eligible_total - pending)
             counters.count("artifact_cache_hits", max(0, eligible_total - pending))
             counters.count("artifact_cache_misses", pending)
+            parse_planned += eligible_total
+            if job_id:
+                update_job(
+                    database,
+                    job_id,
+                    total_estimate=parse_planned,
+                    current_item=f"analysing {spec.name}",
+                )
             timeout = min(
                 spec.timeout_seconds,
                 int(config.section("performance")["parser_timeout_seconds"]),

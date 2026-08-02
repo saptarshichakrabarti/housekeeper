@@ -318,12 +318,17 @@ class DriveScanner:
         self.db.refresh_current_inventory_views()
         self.db.connect().execute("DELETE FROM graph_layout_cache")
         self.db.connect().commit()
+        # Entries, not counter values: `counts` also carries `bytes`, so summing every value told
+        # the jobs page a 47-entry scan "processed 1,419" (43 files + 4 dirs + 1,372 bytes).
+        entries_processed = (
+            counts["files"] + counts["dirs"] + counts["symlinks"] + counts["errors"]
+        )
         update_job(
             self.db,
             job_id,
             "COMPLETED",
-            processed_count=sum(counts.values()),
-            success_count=sum(counts.values()),
+            processed_count=entries_processed,
+            success_count=entries_processed - counts["errors"],
         )
         self.db.refresh_materialized_summaries(run_id)
         # After the first completed scan the planner has no statistics; analyse once so the new
