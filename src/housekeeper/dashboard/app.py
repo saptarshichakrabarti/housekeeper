@@ -678,6 +678,17 @@ def create_app(
             )
         )
 
+    def open_review_sessions() -> list[dict]:
+        """Sessions a decision can still be recorded against — newest first. Shared by the wizard
+        and the entry drawer so both offer the same pickable set instead of a raw id field."""
+        return [
+            dict(row)
+            for row in reader.fetch_all(
+                "SELECT id,name,status FROM review_sessions WHERE status NOT IN "
+                "('LOCKED','EXPORTED','ARCHIVED') ORDER BY updated_at DESC LIMIT 50"
+            )
+        ]
+
     @app.get("/fragments/entry/{entry_id}", response_class=HTMLResponse)
     def entry_detail_fragment(entry_id: Annotated[int, ApiPath(ge=1)]):
         entry = reader.fetch_one(
@@ -699,6 +710,8 @@ def create_app(
                 entry=dict(entry),
                 artifacts=[dict(artifact) for artifact in artifacts],
                 has_run_page=runner is not None,
+                sessions=open_review_sessions(),
+                read_only=read_only,
             )
         )
 
@@ -783,13 +796,7 @@ def create_app(
             active_path="wizard",
             rules=RULES,
             read_only=read_only,
-            sessions=[
-                dict(row)
-                for row in reader.fetch_all(
-                    "SELECT id,name,status FROM review_sessions WHERE status NOT IN "
-                    "('LOCKED','EXPORTED','ARCHIVED') ORDER BY updated_at DESC LIMIT 50"
-                )
-            ],
+            sessions=open_review_sessions(),
         )
 
     @app.get("/fragments/wizard/preview", response_class=HTMLResponse)

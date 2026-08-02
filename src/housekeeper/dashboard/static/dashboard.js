@@ -45,11 +45,11 @@
       return;
     }
     var select = form.querySelector("select[name=decision]");
-    var session = form.querySelector("input[name=session_id]");
+    var session = form.querySelector("[name=session_id]");
     select.value = decision;
-    if (!session.value || !session.checkValidity()) {
-      announce("Enter a review session number, then use the shortcut again.");
-      session.focus();
+    if (!session || !session.value || !session.checkValidity()) {
+      announce("Choose a review session, then use the shortcut again.");
+      if (session) session.focus();
       return;
     }
     announce("Recording " + decision.toLowerCase().replaceAll("_", " ") + ".");
