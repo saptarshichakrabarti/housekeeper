@@ -1712,16 +1712,18 @@ def create_app(
             "ORDER BY relative_path LIMIT ?",
             (f"{escaped_prefix}%", f"{escaped_prefix}%", limit),
         )
-        body = (
-            f"<p>{thousands(len(rows))} matches for <strong>{escape(q)}</strong>. "
-            "Search is prefix-based and read-only.</p>"
-            + rows_table(
-                rows,
-                ["id", "name", "relative_path", "size_bytes", "modified_at"],
-                "No paths begin with that search. Try a shorter prefix.",
-            )
+        # Each result is inspectable via the shared drawer, and hitting the limit is stated plainly
+        # rather than silently dropping matches.
+        return template_page(
+            "Search",
+            "search.html",
+            q=q,
+            rows=[dict(row) for row in rows],
+            count=len(rows),
+            limit=limit,
+            truncated=len(rows) == limit,
+            active_path="search",
         )
-        return page("Search", body, active_path="search")
 
     @app.get("/api/overview")
     def api_overview():

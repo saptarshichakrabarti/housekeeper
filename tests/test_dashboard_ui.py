@@ -217,3 +217,17 @@ def test_global_prefix_search_is_read_only_and_formatted(dashboard_client) -> No
     assert "Documents/report.pdf" in results
     assert "12.4 KB" in results
     assert "prefix-based and read-only" in results
+    # Results are inspectable via the shared drawer, not inert text.
+    assert 'hx-get="/fragments/entry/1"' in results
+    assert 'id="detail-panel"' in results
+
+
+def test_search_states_when_results_are_truncated(dashboard_client) -> None:
+    # Three a-*.bin entries exist; a limit of two must say so rather than silently dropping one.
+    truncated = dashboard_client.get("/search?q=a-&limit=2").text
+    assert "Showing the first 2 matches" in truncated
+    assert "Refine the prefix" in truncated
+    # Under the limit, it reports an exact count with no truncation note.
+    exact = dashboard_client.get("/search?q=Documents").text
+    assert "1 match for" in exact
+    assert "Refine the prefix" not in exact
