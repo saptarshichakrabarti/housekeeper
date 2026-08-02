@@ -42,6 +42,13 @@ SCAN_DIR_SORT_LIMIT = 1_000_000
 #: full re-walk costs little relative to the risk of writing a multi-megabyte blob every batch.
 FRONTIER_MAX_DIRECTORIES = 100_000
 
+#: Rows per window for the set-based scan epilogue. Small enough that one window is seconds even on
+#: a billion-entry inventory — the point being that a cancel lands within a window, the WAL is
+#: settled per window instead of growing to the size of the whole diff, and a failure loses one
+#: window rather than hours. Not a config knob: no operator can choose it more meaningfully than
+#: "large enough to amortise per-statement overhead, small enough to stay interruptible".
+SET_OP_CHUNK_ROWS = 250_000
+
 #: Columns staged for each entry, in the order `_row` builds them.
 _ENTRY_COLUMNS = (
     "scan_run_id",
@@ -293,8 +300,8 @@ class DriveScanner:
             self.db.execute("UPDATE scan_runs SET status='INTERRUPTED' WHERE id=?", (run_id,))
             self.db.connect().commit()
             raise
-        self._link_parents(run_id)
-        self._record_changes(run_id, previous_id, force_rehash)
+        self._link_parents(run_id, job_id)
+        self._record_changes(run_id, previous_id, force_rehash, job_id)
         # One transaction: a run is COMPLETE exactly when it is this source's current inventory.
         # Splitting these would leave a window in which the newest complete scan is not the one
         # every current-state analyser reads.
@@ -766,34 +773,55 @@ class DriveScanner:
 
     # ---------------------------------------------------------------- set-based diff
 
-    def _link_parents(self, run_id: int) -> None:
-        """Resolve every entry's parent by path, in one statement.
+    def _id_bounds(self, run_id: int) -> tuple[int | None, int | None]:
+        """The ``(min, max)`` entry id of one run — the range the epilogue windows walk."""
+        row = self.db.fetch_one(
+            "SELECT MIN(id) AS lo, MAX(id) AS hi FROM filesystem_entries WHERE scan_run_id=?",
+            (run_id,),
+        )
+        return (row["lo"], row["hi"]) if row else (None, None)
+
+    def _window_guard(self, job_id: int | None):
+        return (lambda: check_cancelled(self.db, job_id)) if job_id else None
+
+    def _link_parents(self, run_id: int, job_id: int | None = None) -> None:
+        """Resolve every entry's parent by path, windowed by entry id.
 
         Doing this afterwards is what lets traversal be a pure append: it no longer needs the
-        database to hand back an id before it can descend into a subdirectory.
+        database to hand back an id before it can descend into a subdirectory. Each entry's parent
+        is computed independently, so the id-windowing changes nothing but the transaction size.
         """
-        self.db.connect().execute(
+        self.db.execute_windowed(
             """UPDATE filesystem_entries SET parent_entry_id=(
                  SELECT p.id FROM filesystem_entries p
                  WHERE p.scan_run_id=filesystem_entries.scan_run_id
                    AND p.relative_path=substr(filesystem_entries.relative_path,1,
                        length(filesystem_entries.relative_path)-length(filesystem_entries.name)-1))
-               WHERE scan_run_id=? AND instr(relative_path,'/')>0""",
+               WHERE scan_run_id=? AND instr(relative_path,'/')>0{window}""",
             (run_id,),
+            key="id",
+            bounds=self._id_bounds(run_id),
+            chunk=SET_OP_CHUNK_ROWS,
+            on_window=self._window_guard(job_id),
         )
         self.db.connect().commit()
 
-    def _record_changes(self, run_id: int, previous_id: int | None, force_rehash: bool) -> None:
+    def _record_changes(
+        self, run_id: int, previous_id: int | None, force_rehash: bool, job_id: int | None = None
+    ) -> None:
         conn = self.db.connect()
         if previous_id is None:
             conn.commit()
             return
-        params = (run_id, previous_id, run_id)
-        # 1. What happened to every entry in this run, in one statement instead of one query per
-        #    entry. `old.id IS NULL` is NEW; the stat tuple decides UNCHANGED; a file that is
-        #    neither is CONTENT_POSSIBLY_CHANGED and a directory is METADATA_CHANGED.
-        conn.execute(
-            f"""INSERT INTO scan_entry_changes(scan_run_id,entry_id,relative_path,change_status,evidence_json)
+        guard = self._window_guard(job_id)
+        cur_bounds = self._id_bounds(run_id)
+        prev_bounds = self._id_bounds(previous_id)
+        # 1. What happened to every entry in this run — windowed by cur.id, so the classification of
+        #    a billion entries is a sequence of committed steps. `old.id IS NULL` is NEW; the stat
+        #    tuple decides UNCHANGED; else CONTENT_POSSIBLY_CHANGED (file) or METADATA_CHANGED. INSERT
+        #    OR IGNORE behind UNIQUE(scan_run_id,entry_id): a resumed re-run of a window is a no-op.
+        self.db.execute_windowed(
+            f"""INSERT OR IGNORE INTO scan_entry_changes(scan_run_id,entry_id,relative_path,change_status,evidence_json)
                 SELECT ?,cur.id,cur.relative_path,
                   CASE WHEN cur.scan_status='ERROR' THEN 'ERROR'
                        WHEN old.id IS NULL THEN 'NEW'
@@ -805,46 +833,63 @@ class DriveScanner:
                 FROM filesystem_entries cur
                 LEFT JOIN filesystem_entries old
                   ON old.scan_run_id=? AND old.relative_path=cur.relative_path
-                WHERE cur.scan_run_id=?""",
-            params,
+                WHERE cur.scan_run_id=?{{window}}""",
+            (run_id, previous_id, run_id),
+            key="cur.id",
+            bounds=cur_bounds,
+            chunk=SET_OP_CHUNK_ROWS,
+            on_window=guard,
         )
         if not force_rehash:
-            # 2. Copy forward the verified identity of every file that did not change. This is the
-            #    whole point of an incremental scan and it is two statements, not two per file.
-            conn.execute(
+            # 2. Copy forward the verified identity of every file that did not change — the whole
+            #    point of an incremental scan. Windowed by cur.id; the upsert is already idempotent.
+            self.db.execute_windowed(
                 f"""INSERT INTO file_signatures(entry_id,quick_hash,full_hash,hash_algorithm,hash_status,hash_error,full_hash_computed_at)
                     SELECT cur.id,s.quick_hash,s.full_hash,s.hash_algorithm,s.hash_status,s.hash_error,s.full_hash_computed_at
                     FROM filesystem_entries cur
                     JOIN filesystem_entries old ON old.scan_run_id=? AND old.relative_path=cur.relative_path
                     JOIN file_signatures s ON s.entry_id=old.id
-                    WHERE cur.scan_run_id=? AND cur.entry_type='file' AND s.full_hash IS NOT NULL AND {_UNCHANGED}
+                    WHERE cur.scan_run_id=? AND cur.entry_type='file' AND s.full_hash IS NOT NULL AND {_UNCHANGED}{{window}}
                     ON CONFLICT(entry_id) DO UPDATE SET quick_hash=excluded.quick_hash,full_hash=excluded.full_hash,
                       hash_algorithm=excluded.hash_algorithm,hash_status=excluded.hash_status,
                       hash_error=excluded.hash_error,full_hash_computed_at=excluded.full_hash_computed_at""",
                 (previous_id, run_id),
+                key="cur.id",
+                bounds=cur_bounds,
+                chunk=SET_OP_CHUNK_ROWS,
+                on_window=guard,
             )
-            conn.execute(
+            self.db.execute_windowed(
                 f"""INSERT INTO entry_content_links(entry_id,content_object_id,link_status,size_verified,hash_verified,entry_stat_fingerprint)
                     SELECT cur.id,l.content_object_id,COALESCE(l.link_status,'VERIFIED'),1,1,{_FINGERPRINT_SQL}
                     FROM filesystem_entries cur
                     JOIN filesystem_entries old ON old.scan_run_id=? AND old.relative_path=cur.relative_path
                     JOIN file_signatures s ON s.entry_id=old.id
                     JOIN entry_content_links l ON l.entry_id=old.id
-                    WHERE cur.scan_run_id=? AND cur.entry_type='file' AND s.full_hash IS NOT NULL AND {_UNCHANGED}
+                    WHERE cur.scan_run_id=? AND cur.entry_type='file' AND s.full_hash IS NOT NULL AND {_UNCHANGED}{{window}}
                     ON CONFLICT(entry_id) DO UPDATE SET content_object_id=excluded.content_object_id,
                       link_status=excluded.link_status,entry_stat_fingerprint=excluded.entry_stat_fingerprint,
                       linked_at=CURRENT_TIMESTAMP""",
                 (previous_id, run_id),
+                key="cur.id",
+                bounds=cur_bounds,
+                chunk=SET_OP_CHUNK_ROWS,
+                on_window=guard,
             )
-        # 3. Anything in the previous run with no counterpart here is gone.
-        conn.execute(
-            """INSERT INTO scan_entry_changes(scan_run_id,entry_id,relative_path,change_status,evidence_json)
+        # 3. Anything in the previous run with no counterpart here is gone — windowed by old.id.
+        self.db.execute_windowed(
+            """INSERT OR IGNORE INTO scan_entry_changes(scan_run_id,entry_id,relative_path,change_status,evidence_json)
                SELECT ?,old.id,old.relative_path,'MISSING',json_object('previous_size',old.size_bytes)
                FROM filesystem_entries old LEFT JOIN filesystem_entries current
                ON current.scan_run_id=? AND current.relative_path=old.relative_path
-               WHERE old.scan_run_id=? AND current.id IS NULL""",
+               WHERE old.scan_run_id=? AND current.id IS NULL{window}""",
             (run_id, run_id, previous_id),
+            key="old.id",
+            bounds=prev_bounds,
+            chunk=SET_OP_CHUNK_ROWS,
+            on_window=guard,
         )
+        conn = self.db.connect()
         # 4. A changed or vanished entry invalidates any review decision recorded against it.
         conn.execute(
             f"""UPDATE review_decisions SET stale=1,updated_at=CURRENT_TIMESTAMP

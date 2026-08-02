@@ -248,6 +248,7 @@ class Database:
                 self._migrate_v8_to_v9(c)
         # After the migrations: the backfill above must settle before the index can be unique.
         self._ensure_duplicate_group_identity(c)
+        self._ensure_change_identity(c)
         self.refresh_current_inventory_views()
         c.commit()
 
@@ -701,6 +702,31 @@ class Database:
         c.execute(
             "CREATE UNIQUE INDEX IF NOT EXISTS idx_dupe_group_content "
             "ON exact_duplicate_groups(content_object_id) WHERE content_object_id IS NOT NULL"
+        )
+
+    @staticmethod
+    def _ensure_change_identity(c: sqlite3.Connection) -> None:
+        """A UNIQUE(scan_run_id, entry_id) index so the change diff can be windowed idempotently.
+
+        Windowing the change-classification and missing-detection INSERTs means a resumed run may
+        re-execute a window; ``INSERT OR IGNORE`` behind this index makes that a no-op instead of a
+        duplicate. Built once (skipped when it already exists, so the dedup scan is not paid every
+        open), after removing any pre-existing duplicate rows that would block the unique index —
+        the same shape as ``_ensure_duplicate_group_identity``. NULL entry ids are left alone (a
+        UNIQUE index treats them as distinct), so a change row without an entry never collides.
+        """
+        if c.execute(
+            "SELECT 1 FROM sqlite_master WHERE type='index' AND name='idx_changes_run_entry'"
+        ).fetchone():
+            return
+        c.execute(
+            """DELETE FROM scan_entry_changes WHERE entry_id IS NOT NULL AND id NOT IN (
+                 SELECT MIN(id) FROM scan_entry_changes WHERE entry_id IS NOT NULL
+                 GROUP BY scan_run_id, entry_id)"""
+        )
+        c.execute(
+            "CREATE UNIQUE INDEX IF NOT EXISTS idx_changes_run_entry "
+            "ON scan_entry_changes(scan_run_id, entry_id)"
         )
 
     #: Indexes that exist only for the duration of migration v8. Both statements below need one,
@@ -1248,6 +1274,44 @@ class Database:
         except Exception:
             c.rollback()
             raise
+
+    def execute_windowed(
+        self,
+        template: str,
+        params: tuple,
+        *,
+        key: str,
+        bounds: tuple[int | None, int | None],
+        chunk: int = 250_000,
+        on_window=None,
+    ) -> None:
+        """Run one set-based statement in id-windows, committing after each.
+
+        ``template`` must contain the literal ``{window}`` where an ``AND {key} BETWEEN ? AND ?``
+        clause is spliced; ``params`` are the statement's own parameters, in order, with the two
+        window bounds appended per window. This is how the scan epilogue's O(entries) statements —
+        parent linking, change classification, signature copy-forward, missing detection — become a
+        sequence of bounded, committed, cancellable steps instead of one multi-hour transaction that
+        pins the WAL, defers Ctrl-C, and rolls back hours of work if it fails near the end. The
+        windowed statements are idempotent (a real upsert, or ``INSERT OR IGNORE`` behind a unique
+        index), so re-running a window on resume changes nothing.
+
+        ``on_window`` is invoked after each window commits — the scanner passes its cancellation
+        check, so a stop lands within one window rather than after the whole statement.
+        """
+        lo, hi = bounds
+        if lo is None or hi is None:
+            return
+        sql = template.format(window=f" AND {key} BETWEEN ? AND ?")
+        conn = self.connect()
+        start, hi = int(lo), int(hi)
+        while start <= hi:
+            end = min(start + max(1, chunk) - 1, hi)
+            conn.execute(sql, (*params, start, end))
+            conn.commit()
+            if on_window is not None:
+                on_window()
+            start = end + 1
 
     def execute(self, sql: str, params: tuple | dict = ()) -> sqlite3.Cursor:
         return self.connect().execute(sql, params)
