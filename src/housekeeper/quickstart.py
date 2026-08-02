@@ -214,8 +214,9 @@ def _run_pipeline(
         ("photo-events", "IMAGE_ANALYSIS", run_photo_event_analysis),
         ("contact-sheets", "CONTACT_SHEET_GENERATION", run_contact_sheet_generation),
     )
-    # scan, exact-duplicates, content-analysis, canonical-roles, classify, review-priority, lifecycle.
-    FIXED_STAGE_COUNT = 7
+    # scan, exact-duplicates, content-analysis, canonical-roles, classify, review-priority,
+    # lifecycle, refresh-summaries.
+    FIXED_STAGE_COUNT = 8
     stage_total = (
         FIXED_STAGE_COUNT
         + len(STRUCTURAL_ANALYSERS)
@@ -394,6 +395,11 @@ def _run_pipeline(
             lambda job: run_lifecycle_analysis(database, config, scope, job_id=job),
         ),
     )
+    # The scanner refreshed the dashboard's materialized summaries at scan end — before any of the
+    # analysis above ran. Refresh again now that content objects, duplicate groups and
+    # classifications exist, so the overview does not report zeros until a manual "Refresh now".
+    begin_stage("refresh summaries")
+    database.refresh_materialized_summaries(scan_run_id)
     if generate_reports:
         begin_stage("reports")
         report_paths = step(

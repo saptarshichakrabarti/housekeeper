@@ -156,8 +156,31 @@ class DashboardService:
         )
         integrity = "not checked" if refreshed_at else "not yet computed"
         return OverviewViewModel(
-            integrity, max(0, logical_bytes - unique_bytes), metrics, charts, refreshed_at
+            integrity,
+            max(0, logical_bytes - unique_bytes),
+            metrics,
+            charts,
+            refreshed_at,
+            self._summaries_are_stale(refreshed_at),
         )
+
+    def _summaries_are_stale(self, refreshed_at: str | None) -> bool:
+        """Has any job completed since the summaries were last materialized?
+
+        A scan records a durable ``SCAN`` job that settles COMPLETED alongside every analysis job,
+        so the tiny jobs table captures both without touching the inventory — the overview stays a
+        summaries-plus-jobs read. Both timestamps are SQLite CURRENT_TIMESTAMP text (UTC, lexically
+        ordered), so a string compare is exact; an error-tolerant job still mutated state and counts.
+        A summary never computed but with completed work behind it is stale by definition.
+        """
+        row = self.database.fetch_one(
+            "SELECT MAX(completed_at) latest FROM jobs"
+            " WHERE status IN ('COMPLETED','COMPLETED_WITH_ERRORS')"
+        )
+        latest = row["latest"] if row else None
+        if latest is None:
+            return False
+        return refreshed_at is None or str(latest) > str(refreshed_at)
 
     def review_rows(self, filters: ReviewFilter, limit: int, after_id: int) -> list[ReviewRow]:
         where, params = filters.where_clause()

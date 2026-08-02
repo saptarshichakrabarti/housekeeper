@@ -26,6 +26,9 @@ class OverviewViewModel:
     metrics: tuple[Metric, ...]
     charts: tuple[Chart, ...]
     refreshed_at: str | None = None
+    # True when a scan or analysis job finished after the summaries were last materialized, so the
+    # numbers below predate the current state of the drive and a "Refresh now" would change them.
+    stale: bool = False
 
 
 @dataclass(frozen=True)

@@ -1,5 +1,5 @@
 <p>Local query and review surface. Database integrity: {{ model.integrity }}. File movement is CLI-only.</p>
-<p class="overview-refresh">Summary {% if model.refreshed_at %}refreshed {{ model.refreshed_at | relativetime }}{% else %}not yet computed{% endif %}.{% if can_refresh %}
+<p class="overview-refresh{% if model.stale %} overview-refresh--stale{% endif %}">Summary {% if model.refreshed_at %}refreshed {{ model.refreshed_at | relativetime }}{% else %}not yet computed{% endif %}.{% if model.stale %} <span class="stale-badge">Out of date — a scan or analysis has finished since.</span>{% endif %}{% if can_refresh %}
 <button hx-post="/refresh" hx-target="main" hx-swap="innerHTML">Refresh now</button>{% endif %}</p>
 <a class="hero-card card card--ok" href="/duplicates">
   <strong>Reclaimable space</strong>
