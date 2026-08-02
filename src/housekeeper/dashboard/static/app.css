@@ -436,15 +436,34 @@ kbd { background: var(--hk-surface); border: 1px solid var(--hk-border-strong); 
 .jobs-status--complete::before { content: "✓"; display: inline-grid; place-items: center; width: 1.4rem; height: 1.4rem; margin-bottom: .35rem; color: var(--hk-ok); border: 1px solid var(--hk-ok); border-radius: 50%; animation: hk-check .35s ease-out; }
 @keyframes hk-check { from { opacity: 0; transform: scale(.6); } to { opacity: 1; transform: scale(1); } }
 
-/* review detail drawer */
-#detail-drawer,
-aside#detail-drawer {
+/* review/duplicates detail drawer: a fixed side panel that overlays rather than reflowing the
+   table. It sits off-screen until content is swapped in (JS adds .is-open on htmx:afterSwap), so
+   opening a detail never shifts the rows underneath it. */
+.detail-backdrop {
+  position: fixed;
+  inset: 0;
+  background: rgba(0, 0, 0, .35);
+  z-index: 40;
+}
+.detail-panel {
+  position: fixed;
+  top: 0;
+  right: 0;
+  bottom: 0;
+  width: min(440px, 94vw);
   background: var(--hk-surface);
-  border: var(--hk-border-w) solid var(--hk-border);
-  border-radius: var(--hk-radius);
+  border-left: var(--hk-border-w) solid var(--hk-border);
   box-shadow: var(--hk-shadow-card);
-  padding: .6rem;
-  margin: 0 0 1rem;
+  padding: 1rem;
+  overflow-y: auto;
+  z-index: 50;
+  transform: translateX(100%);
+  transition: transform .2s ease;
+}
+.detail-panel.is-open { transform: translateX(0); }
+.detail-panel-head { display: flex; justify-content: flex-end; margin-bottom: .5rem; }
+@media (prefers-reduced-motion: reduce) {
+  .detail-panel { transition: none; }
 }
 
 /* graph explorer */

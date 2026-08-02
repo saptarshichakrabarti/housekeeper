@@ -17,6 +17,15 @@
     if (region) region.textContent = message;
   }
 
+  function setDrawer(open) {
+    var panel = document.getElementById("detail-panel");
+    var backdrop = document.getElementById("detail-backdrop");
+    if (!panel) return;
+    panel.classList.toggle("is-open", open);
+    panel.setAttribute("aria-hidden", open ? "false" : "true");
+    if (backdrop) backdrop.hidden = !open;
+  }
+
   function selectRow(row) {
     if (!row) return;
     if (selectedRow) {
@@ -85,6 +94,10 @@
 
   document.addEventListener("keydown", function (event) {
     var target = event.target;
+    if (event.key === "Escape") {  // close the drawer from anywhere, including its own inputs
+      setDrawer(false);
+      return;
+    }
     if (target.matches("input, select, textarea, [contenteditable=true]")) return;
     if (event.key === "j" || event.key === "k") {
       event.preventDefault();
@@ -98,6 +111,14 @@
   });
 
   document.addEventListener("click", function (event) {
+    if (event.target.closest && event.target.closest(".detail-panel-close")) {
+      setDrawer(false);
+      return;
+    }
+    if (event.target.id === "detail-backdrop") {
+      setDrawer(false);
+      return;
+    }
     var button = event.target.closest && event.target.closest("[data-copy]");
     if (!button) return;
     navigator.clipboard.writeText(button.dataset.copy).then(function () {
@@ -111,7 +132,11 @@
     if (event.target.matches("[data-auto-submit]")) event.target.form.requestSubmit();
   });
 
-  document.addEventListener("htmx:afterSwap", function (event) { observeJobs(event.detail.target); });
+  document.addEventListener("htmx:afterSwap", function (event) {
+    observeJobs(event.detail.target);
+    // Content landed in the drawer target: slide the fixed panel in without reflowing the table.
+    if (event.detail.target && event.detail.target.id === "detail-drawer") setDrawer(true);
+  });
   if (document.readyState === "loading") {
     document.addEventListener("DOMContentLoaded", function () { observeJobs(document); });
   } else {

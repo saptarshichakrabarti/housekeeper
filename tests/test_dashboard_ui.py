@@ -188,6 +188,19 @@ def test_review_show_all_reveals_the_full_inventory(database) -> None:
     assert "show_all=true" in body or "Next page" not in body
 
 
+def test_detail_drawer_is_a_fixed_side_panel(dashboard_client) -> None:
+    # The drawer target lives inside a fixed .detail-panel with its own close control and backdrop,
+    # so opening a detail overlays the page rather than reflowing the table beneath it.
+    body = dashboard_client.get("/review").text
+    panel_start = body.index('class="detail-panel"')
+    assert 'id="detail-backdrop"' in body
+    assert 'class="detail-panel-close"' in body
+    # The htmx swap target is nested within the panel (so swaps fill the panel, not the page flow).
+    assert body.index('id="detail-drawer"') > panel_start
+    # Both review and duplicates share the pattern.
+    assert 'class="detail-panel"' in dashboard_client.get("/duplicates").text
+
+
 def test_duplicates_lead_with_reclaimable_space_and_copyable_hash(dashboard_client) -> None:
     body = dashboard_client.get("/duplicates").text
     assert body.index("5.0 KB") < body.index("2.0 KB")

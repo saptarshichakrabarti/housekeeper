@@ -9,7 +9,11 @@
   </label>
   <noscript><button type="submit">Sort</button></noscript>
 </form>
-<aside id="detail-drawer" aria-live="polite">Open a group to compare its members.</aside>
+<div id="detail-backdrop" class="detail-backdrop" hidden></div>
+<aside id="detail-panel" class="detail-panel" aria-hidden="true" aria-label="Duplicate group details">
+  <div class="detail-panel-head"><button type="button" class="detail-panel-close" aria-label="Close details">Close ×</button></div>
+  <div id="detail-drawer" aria-live="polite">Open a group to compare its members.</div>
+</aside>
 <div class="table-scroll"><table>
   <thead><tr><th>Group</th><th>Preview</th><th>Hash</th><th>Members</th><th>File size</th><th>Reclaimable</th><th>Canonical entry</th><th>Detail</th></tr></thead>
   <tbody>{% for group in groups %}<tr>
