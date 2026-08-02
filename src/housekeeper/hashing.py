@@ -1,5 +1,6 @@
 import hashlib
 import os
+import time
 from pathlib import Path
 from typing import BinaryIO
 
@@ -9,6 +10,35 @@ from .models import HashResult
 #: These are optimisations, not requirements — a platform without them still hashes correctly.
 _HAS_FADVISE = hasattr(os, "posix_fadvise")
 _O_NOATIME = getattr(os, "O_NOATIME", 0)
+
+
+def blake3_available() -> bool:
+    """Whether the optional ``blake3`` wheel is importable — the gate on allowing that algorithm.
+
+    BLAKE3 is the state-of-the-art general hash (SIMD, internally parallel, several times SHA-256's
+    throughput per core), worth adopting only once a measurement shows hashing is a real share of a
+    stage — which on the recorded small-file corpus it is not (SHA-256 was 5% of identity). The CPU/
+    IO split recorded below is how that share is re-derived on a large-file corpus before switching.
+    """
+    try:
+        import blake3  # type: ignore[import-not-found]  # noqa: F401
+    except ImportError:
+        return False
+    return True
+
+
+def new_hasher(algorithm: str):
+    """A hasher object with the ``update``/``hexdigest`` protocol, for hashlib names or ``blake3``.
+
+    ``content_objects`` is keyed by ``(hash_algorithm, full_hash, size_bytes)``, so a workspace can
+    hold digests from more than one algorithm; cross-algorithm comparison (``coverage``) treats a
+    hash mismatch as *unknown*, never covered, which is the safe direction.
+    """
+    if algorithm.lower() == "blake3":
+        import blake3  # type: ignore[import-not-found]
+
+        return blake3.blake3()
+    return hashlib.new(algorithm)
 
 
 def _open_for_hash(path: Path, sequential: bool = True) -> BinaryIO:
@@ -75,7 +105,7 @@ def _hash(
 ) -> HashResult:
     try:
         before = path.stat()
-        h = hashlib.new(algorithm)
+        h = new_hasher(algorithm)
         size = before.st_size
         read = 0
         # Read a small file once instead; the digest is then simply the full digest, which is
@@ -148,7 +178,7 @@ def compute_identity(
     try:
         before = path.stat()
         size = before.st_size
-        full = hashlib.new(algorithm)
+        full = new_hasher(algorithm)
         if _samples_whole_file(size, quick_chunk_bytes, quick_samples):
             # The quick digest of a small file *is* its full digest, so there is nothing to sample.
             offsets: list[int] = []
@@ -156,21 +186,39 @@ def compute_identity(
             offsets = _quick_offsets(size, quick_chunk_bytes, quick_samples)
         captured: dict[int, bytearray] = {offset: bytearray() for offset in offsets}
         read = 0
+        # Split read time from digest time — only while recording, so production pays nothing. This
+        # is the measurement that decides whether a faster hash (BLAKE3) is worth adopting: on a
+        # small-file corpus the digest is a few percent of the stage; on large files on fast storage
+        # the balance can tip, and that is when the algorithm choice starts to matter.
+        timing = counters.is_recording()
+        io_ms = cpu_ms = 0.0
         with _open_for_hash(path, sequential=True) as handle:
             position = 0
-            while chunk := handle.read(block_size):
+            while True:
+                mark = time.perf_counter() if timing else 0.0
+                chunk = handle.read(block_size)
+                if timing:
+                    io_ms += (time.perf_counter() - mark) * 1000
+                if not chunk:
+                    break
+                mark = time.perf_counter() if timing else 0.0
                 full.update(chunk)
                 for offset in offsets:
                     low = max(offset, position)
                     high = min(offset + quick_chunk_bytes, position + len(chunk))
                     if low < high:
                         captured[offset] += chunk[low - position : high - position]
+                if timing:
+                    cpu_ms += (time.perf_counter() - mark) * 1000
                 position += len(chunk)
                 read += len(chunk)
             if drop_cache:
                 _drop_from_cache(handle)
         counters.count("full_hash_bytes", read)
         counters.count("source_bytes_read", read)
+        if timing:
+            counters.count("stage_ms:hash_io", int(io_ms))
+            counters.count("stage_ms:hash_cpu", int(cpu_ms))
         after = path.stat()
         stable = before.st_size == after.st_size and before.st_mtime_ns == after.st_mtime_ns
         if not stable:
@@ -179,7 +227,7 @@ def compute_identity(
         full_result = HashResult(full.hexdigest(), after.st_size, True, None)
         if not offsets:
             return full_result, full_result
-        quick = hashlib.new(algorithm)
+        quick = new_hasher(algorithm)
         for offset in offsets:
             quick.update(bytes(captured[offset]))
         return full_result, HashResult(quick.hexdigest(), after.st_size, True, None)

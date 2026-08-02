@@ -26,6 +26,36 @@ def test_cache_hygiene_never_changes_the_digest(tmp_path):
     assert quick.digest == compute_quick_hash(target, 1024, 2, "sha256").digest
 
 
+def test_hash_cpu_io_split_is_recorded(tmp_path):
+    """The measurement that decides whether a faster hash is worth adopting must be observable."""
+    from housekeeper.core import counters
+
+    target = tmp_path / "f.bin"
+    target.write_bytes(b"measure me " * 100_000)
+    with counters.recording() as counts:
+        compute_identity(target, "sha256", 65536, 4096, 2)
+    assert "stage_ms:hash_io" in counts
+    assert "stage_ms:hash_cpu" in counts
+
+
+def test_blake3_is_gated_on_availability(tmp_path):
+    """blake3 is allowed only where its wheel is installed; otherwise it is rejected, not attempted."""
+    from housekeeper.config import DEFAULTS, validate_config, merge_configs
+    from housekeeper.hashing import blake3_available, new_hasher
+
+    config = merge_configs(DEFAULTS, {"hashing": {"algorithm": "blake3"}})
+    if blake3_available():
+        validate_config(config)  # no raise
+        digest = new_hasher("blake3")
+        digest.update(b"abc")
+        assert len(digest.hexdigest()) == 64  # 256-bit, schema-compatible width
+    else:
+        with pytest.raises(ValueError, match="unsupported hash algorithm"):
+            validate_config(config)
+        with pytest.raises(ImportError):
+            new_hasher("blake3")
+
+
 def test_hashing_survives_a_platform_without_fadvise(tmp_path, monkeypatch):
     """A platform (or mount) that rejects posix_fadvise must still hash correctly."""
     target = tmp_path / "f.bin"

@@ -309,7 +309,14 @@ def validate_config(config: dict) -> None:
                     and value < 0
                 ):
                     raise ValueError(f"negative limit: {key}")
-    if config["hashing"]["algorithm"].lower() not in {"sha256", "sha512", "blake2b"}:
+    allowed_algorithms = {"sha256", "sha512", "blake2b"}
+    # BLAKE3 is optional: allowed only where its wheel is installed, so a workspace can never be
+    # configured to hash with an algorithm this machine cannot compute.
+    from .hashing import blake3_available
+
+    if blake3_available():
+        allowed_algorithms.add("blake3")
+    if config["hashing"]["algorithm"].lower() not in allowed_algorithms:
         raise ValueError("unsupported hash algorithm")
     if (
         config["graph"]["default_max_nodes"] > config["graph"]["hard_max_nodes"]
