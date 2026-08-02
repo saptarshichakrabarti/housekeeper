@@ -74,6 +74,9 @@ def main() -> None:
         db.execute("UPDATE scan_runs SET status='COMPLETE',completed_at=CURRENT_TIMESTAMP WHERE id=?", (run,))
         db.connect().commit()
         elapsed = time.perf_counter() - started
+        # Settle the WAL exactly as a real scan does at its end (optimize_after_write), so the peak
+        # reported is this rescan's own, not an accumulation the production path never carries.
+        db.checkpoint_wal("TRUNCATE")
         print(
             f"{iteration:>7}{entries:>12}{int(counted['sql_statements']):>12}"
             f"{int(counted['commits']):>10}{elapsed:>10.3f}{counted['wal_bytes_stage_end'] / 1e6:>12.1f}"

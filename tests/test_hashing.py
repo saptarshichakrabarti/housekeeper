@@ -40,7 +40,7 @@ def test_hash_cpu_io_split_is_recorded(tmp_path):
 
 def test_blake3_is_gated_on_availability(tmp_path):
     """blake3 is allowed only where its wheel is installed; otherwise it is rejected, not attempted."""
-    from housekeeper.config import DEFAULTS, validate_config, merge_configs
+    from housekeeper.config import DEFAULTS, merge_configs, validate_config
     from housekeeper.hashing import blake3_available, new_hasher
 
     config = merge_configs(DEFAULTS, {"hashing": {"algorithm": "blake3"}})

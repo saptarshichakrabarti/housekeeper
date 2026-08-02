@@ -8,8 +8,7 @@ and for rows whose device/inode are NULL.
 
 from __future__ import annotations
 
-from housekeeper.core.identity import _identity_boundary, _IDENTITY_KEY_EXPRS
-from housekeeper.database import Database
+from housekeeper.core.identity import _IDENTITY_KEY_EXPRS, _identity_boundary
 
 
 def _seed(database, rows):

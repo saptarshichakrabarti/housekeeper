@@ -2,6 +2,66 @@
 
 The pipeline uses streamed hashing, size candidate funnels, SQLite WAL, content-link reuse, bounded worker queues, isolated parser timeouts, keyset-style dashboard pagination, set-based scan diffing, and graph limits. Incremental scans reuse verified links when the prior stat fingerprint is unchanged and record change evidence. Materialized summaries keep repeated dashboard overview reads away from raw inventory tables.
 
+## Scaling to terabytes and multi-day runs
+
+A second body of work targets storage measured in terabytes and scans that run for days. It is
+operational-facing — see [long_runs.md](long_runs.md) — and rests on these mechanisms:
+
+* **One shared, parallel identity service** (`core/identity.py`). Full+quick digest, content link
+  and signature row for every candidate, hashed across `full_hash_workers` threads. The five serial
+  `compute_full_hash` loops (dedup candidates, marginal value, document minhash, cross-format
+  derivation, content-defined chunks, normalized content) and the content-analysis identity loop all
+  route through it; the dedup candidate pass — which runs before content analysis and did the bulk of
+  a first scan's byte volume on the main thread — is now parallel. It streams, so it never
+  materialises the candidate list.
+* **Hard-link identity reuse.** One representative per `(device, inode)` is hashed and the verified
+  result written for every hard link to it (gated on `nlink > 1` and `hashing.hardlink_identity_reuse`).
+  A backup drive of N hard-linked snapshots reads the data once, not N times.
+* **A worker-count ladder.** `nvme`/`ssd` profiles with more hash and traversal workers; `auto`
+  promotes a source `hdd → ssd → nvme` from measured throughput, never beyond what it observed.
+* **Page-cache hygiene.** `O_NOATIME` and `posix_fadvise(SEQUENTIAL/RANDOM)` on every hash read;
+  `POSIX_FADV_DONTNEED` after hashing content a parser will never re-open, so a terabyte streamed
+  through the cache does not evict the database's own hot pages. All degrade cleanly where absent.
+* **Traversal hardening.** A directory cycle guard (bind-mount loops terminate), a flat-directory
+  bound (a folder over `SCAN_DIR_SORT_LIMIT` is streamed unsorted, not held to sort), and an
+  error-storm breaker (`scanner.pause_after_consecutive_errors`) that parks a scan of a dead drive.
+* **Frontier resume.** `scan_runs.frontier_json` records the pending-directory stack at batch
+  cadence, so a resume is O(remaining), not O(tree).
+* **Opt-in parallel traversal.** `traversal_workers` offloads scandir+stat (which release the GIL)
+  to a pool while every mutation stays on one thread; 1 keeps the serial walk exactly.
+* **Windowed scan epilogue.** `execute_windowed` runs parent-linking, change classification,
+  signature copy-forward and missing detection in 250k-row committed windows behind a
+  `UNIQUE(scan_run_id, entry_id)` index, so the diff is interruptible, WAL-bounded, and idempotent on
+  resume — instead of one multi-hour transaction.
+* **Keyset-paged identity streams.** `iter_keyset` pages the long hashing streams so a reader never
+  pins the WAL across a whole stage; the composite `(device, inode, id)` key preserves hard-link
+  adjacency.
+* **A partial files-only size index** and an **8 KiB page size** for new databases.
+* **Optional BLAKE3** (`new_hasher`, allowed only where the wheel is installed) plus a
+  `stage_ms:hash_cpu`/`stage_ms:hash_io` split, so the "is a faster hash worth it" question is
+  re-derived by measurement rather than argued.
+
+### Decisions deferred by measurement, not built
+
+Consistent with the section below, two items the plan raised are recorded here as deliberately not
+built, with the reason:
+
+* **No mid-statement progress handler.** Windowing already bounds each epilogue statement to seconds,
+  so Ctrl-C lands between windows. A `set_progress_handler` interrupt would additionally abort a long
+  `refresh_materialized_summaries` or `ANALYZE`, but a stuck interrupt Event would abort the very
+  cleanup statements a failure path runs — so the footgun outweighs interrupting a bounded aggregate.
+* **`_work_plan`'s artifact stream keeps its single cursor.** Its `GROUP BY co.id` shape needs a
+  different keyset than the identity streams, and the identity hashing streams are the longer WAL
+  pin. Revisit if the parse stage's WAL growth is measured to matter.
+
+### Reserved for a measured gate
+
+Path interning (a v11 `paths` table to shrink per-snapshot bytes ~5–10×), a Rust parallel *walker*,
+io_uring, and switching the default hash to BLAKE3 are all left for a decision driven by the
+100M-row `generate_metadata_database.py --profile-only` shape and the `soak_rescan.py` cost curve —
+the instruments are shipped; the structural changes are not, because at the measured small-file
+scale they are not yet justified.
+
 ## Recorded synthetic baseline
 
 On 2026-07-16, the current development environment scanned the generated 10,000-entry fixture in **0.7516 seconds** (100,000 logical bytes; no directory hierarchy). This is a local synthetic metadata/I/O smoke measurement, not a portability promise. Reproduce it with:
@@ -52,6 +112,13 @@ lose the work is to weaken one when it becomes inconvenient.
 | `tests/test_acceleration.py` | a native backend that disagrees with Python, or a client that forks per request |
 | `benchmarks/baseline.json` | a change that alters entity counts |
 | `tests/test_stage_reuse.py` | stage reuse that skips work the current snapshot still needs, or fails to skip after an unchanged rescan |
+| `tests/test_identity_service.py` | the shared hasher diverging from the real digest, a second read for the quick hash, or a result that depends on the worker count |
+| `tests/test_hardlink_identity.py` | a hard-linked inode read more than once, or reuse hiding that the copies exist |
+| `tests/test_scanner_robustness.py` | a bind-mount loop that never terminates, a flat directory materialised whole, or an error storm walked to the end |
+| `tests/test_frontier_resume.py` | a resume that re-walks the whole tree, or a resumed inventory that differs from a clean scan's |
+| `tests/test_parallel_traversal.py` | the parallel walk diverging from the serial inventory or stat count, or deadlocking on cancel |
+| `tests/test_windowed_diff.py` | window size changing the diff, or a re-executed window duplicating change rows |
+| `tests/test_keyset.py` | a keyset page skipping or duplicating a row, or breaking hard-link adjacency |
 
 ## Stage reuse on a re-run
 

@@ -62,7 +62,7 @@ def _profile(db: Database) -> None:
         return
     print(f"{'object':<48}{'bytes':>16}{'pages':>12}")
     for row in rows:
-        print(f"{str(row[0]):<48}{int(row[1]):>16}{int(row[2]):>12}")
+        print(f"{row[0]!s:<48}{int(row[1]):>16}{int(row[2]):>12}")
 
 
 def main() -> None:

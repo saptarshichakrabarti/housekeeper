@@ -57,6 +57,23 @@ def test_pruning_keeps_the_requested_window_and_removes_the_rest(config, databas
     assert orphans == 0
 
 
+def test_pruning_removes_the_change_rows_of_pruned_runs(config, database, tmp_path):
+    """scan_entry_changes is one row per entry per run — the table most at risk of unbounded growth
+    on a long-lived workspace. It must be pruned with its run, not left behind."""
+    root = _corpus(tmp_path)
+    _scan_times(database, config, root, 5)
+    before = database.fetch_one("SELECT COUNT(*) n FROM scan_entry_changes")["n"]
+    assert before > 0, "the incremental rescans should have recorded change rows"
+
+    database.prune_snapshots(keep_per_source=1)
+    kept = {int(r["id"]) for r in database.fetch_all("SELECT id FROM scan_runs")}
+    orphaned = database.fetch_one(
+        f"SELECT COUNT(*) n FROM scan_entry_changes WHERE scan_run_id NOT IN ({','.join('?' for _ in kept)})",
+        tuple(kept),
+    )["n"]
+    assert orphaned == 0, "a pruned run's change rows survived the prune"
+
+
 def test_the_current_inventory_is_never_pruned(config, database, tmp_path):
     root = _corpus(tmp_path)
     _scan_times(database, config, root, 4)
