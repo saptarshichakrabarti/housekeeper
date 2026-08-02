@@ -192,6 +192,11 @@ def ensure_content_identity(
             return entry, followers, None, None
 
     counts = {"hashed": 0, "errors": 0, "bytes": 0, "reused": 0}
+    # Followers whose hard-link representative failed to hash. They cannot inherit a digest that was
+    # never computed, so re-attempt each on its own path rather than dropping it — a per-path
+    # permission or transient error on the representative need not doom its inode-mates, and even a
+    # genuinely unreadable inode must leave every follower with an error signature, not silence.
+    orphaned_followers: list[Mapping[str, Any]] = []
     started = time.perf_counter()
 
     def write_signature(entry_id: int, quick, hashed, status: str, error: str | None) -> None:
@@ -226,6 +231,9 @@ def ensure_content_identity(
                 if record_errors:
                     error = hashed.error if hashed is not None else "unreadable"
                     write_signature(int(entry["id"]), quick, hashed, "ERROR", error)
+                # The representative failed, so its inode-mates have no digest to inherit; re-hash
+                # them individually below rather than let them fall out of the run unsigned.
+                orphaned_followers.extend(followers)
                 continue
             link_success(entry, quick, hashed)
             counts["hashed"] += 1
@@ -249,4 +257,22 @@ def ensure_content_identity(
     if record_throughput:
         record_identity_throughput(database, counts["bytes"], time.perf_counter() - started)
     database.connect().commit()
+    if orphaned_followers:
+        # Re-run the stranded followers on their own paths. hardlink_reuse=False so each is hashed
+        # standalone (no further grouping, so no second orphaning tier); throughput is already
+        # recorded above. Their hashed/reused/errors/bytes fold back into this run's totals.
+        recovered = ensure_content_identity(
+            database,
+            config,
+            orphaned_followers,
+            job_id,
+            workers=workers,
+            record_errors=record_errors,
+            record_throughput=False,
+            hardlink_reuse=False,
+            drop_cache=drop_cache,
+            progress_phase=progress_phase,
+        )
+        for key in counts:
+            counts[key] += recovered[key]
     return counts

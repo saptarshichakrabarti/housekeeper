@@ -112,6 +112,74 @@ def test_parallel_scan_cancels_without_deadlock(tmp_path, monkeypatch):
         db.close()
 
 
+def test_parallel_resume_of_a_directory_spanning_many_flushes(tmp_path, monkeypatch):
+    """Regression: a directory larger than one batch must survive an interruption mid-directory.
+
+    The parallel frontier is dynamic (pending + inflight + unflushed + staging), and a flush clears
+    `unflushed`. Before the fix there was no `staging`, so a directory whose listing spanned two or
+    more flushes was dropped from the persisted frontier after its first flush; an interruption
+    partway through it lost its un-flushed tail — yet the resumed run was marked COMPLETE. The bug
+    only bites when *other* directories keep the frontier non-empty (an empty frontier stores NULL
+    and forces a safe full re-walk), so this makes the siblings slow to return: the big directory is
+    staged, and interrupted mid-flush, while the siblings are still in flight and on the queue.
+    """
+    import time
+
+    from housekeeper.config import load_config
+    from housekeeper.jobs import JobPaused
+
+    root = tmp_path / "src"
+    (root / "big").mkdir(parents=True)
+    for i in range(60):
+        (root / "big" / f"f{i:03d}.txt").write_text(f"payload {i}\n")
+    for s in range(10):
+        (root / f"sib{s}").mkdir()
+        (root / f"sib{s}" / "only.txt").write_text(f"sibling {s}\n")
+
+    config = load_config(workspace_override=tmp_path / "ws")
+    config.section("performance")["storage_profile"] = "ssd"
+    config.section("performance")["overrides"] = {"traversal_workers": 4}
+    config.section("scanner")["batch_size"] = 8
+    db = Database(config.database_path)
+    db.initialize()
+
+    # Siblings return slowly, so `big` (instant) is staged first — its flushes fire while the
+    # siblings are still in flight and queued, keeping the frontier non-empty but bug-triggering.
+    real_scan = DriveScanner._scan_directory_for_worker
+
+    def slow_siblings(self, dir_tuple, r, en, ep):
+        if dir_tuple[1].startswith("sib"):
+            time.sleep(0.3)
+        return real_scan(self, dir_tuple, r, en, ep)
+
+    monkeypatch.setattr(DriveScanner, "_scan_directory_for_worker", slow_siblings)
+
+    real_flush = DriveScanner._flush
+    flushes = {"n": 0}
+
+    def interrupting_flush(self, batch, run_id, counts, processed, job_id, current, frontier=None):
+        real_flush(self, batch, run_id, counts, processed, job_id, current, frontier)
+        flushes["n"] += 1
+        if flushes["n"] == 3:  # root's flush, then two of big's — well inside the big directory
+            raise JobPaused("interrupt mid-directory")
+
+    monkeypatch.setattr(DriveScanner, "_flush", interrupting_flush)
+    try:
+        DriveScanner(db, config).scan(root, incremental=False)
+    except JobPaused:
+        pass
+    partial = db.fetch_one("SELECT COUNT(*) n FROM filesystem_entries WHERE name LIKE 'f%'")["n"]
+    assert partial < 60, "the interruption should have landed before the big directory finished"
+
+    monkeypatch.setattr(DriveScanner, "_scan_directory_for_worker", real_scan)
+    monkeypatch.setattr(DriveScanner, "_flush", real_flush)
+    DriveScanner(db, config).scan(root, resume=True, incremental=False)
+    assert db.fetch_one("SELECT COUNT(*) n FROM filesystem_entries WHERE name LIKE 'f%'")["n"] == 60
+    assert db.fetch_one("SELECT COUNT(*) n FROM filesystem_entries WHERE name='only.txt'")["n"] == 10
+    assert db.fetch_one("SELECT status FROM scan_runs ORDER BY id DESC LIMIT 1")["status"] == "COMPLETE"
+    db.close()
+
+
 def test_parallel_resume_matches_a_clean_scan(tmp_path, monkeypatch):
     from housekeeper.config import load_config
     from housekeeper.jobs import JobPaused

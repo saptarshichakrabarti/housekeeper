@@ -588,12 +588,19 @@ class DriveScanner:
         inflight: dict = {}
         # (rel, hidden) of directories whose records are in the current unflushed batch.
         unflushed: list[tuple[str, bool]] = []
+        # The single directory being staged right now. It must stay in the frontier across its OWN
+        # mid-directory flushes — which clear `unflushed` — or an interruption partway through a
+        # directory larger than one batch would drop it, and its as-yet-undiscovered subtree, from
+        # the resume set and the run would still be marked COMPLETE with rows silently missing. The
+        # serial walk gets this for free from its pop-time snapshot; the parallel walk holds it here.
+        staging: list[tuple[str, bool]] = []
 
         def frontier() -> list[tuple[str, bool]]:
             return (
                 [(rd, dh) for (_p, rd, dh) in pending]
                 + [(rd, dh) for (_p, rd, dh) in inflight.values()]
                 + list(unflushed)
+                + list(staging)
             )
 
         def flush(current: str) -> None:
@@ -617,6 +624,9 @@ class DriveScanner:
                     done, _ = wait(list(inflight), return_when=FIRST_COMPLETED)
                     for future in done:
                         directory, rel_dir, dir_hidden = inflight.pop(future)
+                        # From here until this directory is fully staged it is the current directory,
+                        # so it belongs in the frontier through every flush and every error path.
+                        staging[:] = [(rel_dir, dir_hidden)]
                         listing, overflow, error = future.result()
                         if error is not None:
                             counts["errors"] += 1
@@ -624,13 +634,10 @@ class DriveScanner:
                             update_job(self.db, job_id, error_count=counts["errors"], current_item=f"{directory}: {error}")
                             if error_limit and consecutive_errors >= error_limit:
                                 self._pause_on_error_storm(batch, run_id, counts, processed, job_id, directory, consecutive_errors, frontier())
+                            staging.clear()
                             continue
                         if overflow:
                             counters.count("directories_streamed_unsorted")
-                        # This directory's records are now in the batch: keep it in the frontier until
-                        # the batch is flushed, and enqueue its children only after it is processed
-                        # (so a flush mid-directory never lists a child that will be rediscovered).
-                        unflushed.append((rel_dir, dir_hidden))
                         children: list[tuple[Path, str, bool]] = []
                         for rec, relative, hidden, path in listing:
                             batch.append(self._row(rec, run_id, source_root_id, root, path))
@@ -664,7 +671,13 @@ class DriveScanner:
                                 flush(str(directory))
                             if error_limit and consecutive_errors >= error_limit:
                                 self._pause_on_error_storm(batch, run_id, counts, processed, job_id, directory, consecutive_errors, frontier())
+                        # Children are queued now, so a later flush that lists them will not also be
+                        # re-derived by re-walking this directory. Move this directory from `staging`
+                        # to `unflushed`: it stays in the frontier only until the batch carrying its
+                        # rows is flushed, then leaves — its rows durable, its children on `pending`.
                         pending.extend(children)
+                        unflushed.append((rel_dir, dir_hidden))
+                        staging.clear()
                     self._checkpoint_counts(run_id, counts)
             except (JobCancelled, JobPaused):
                 pool.shutdown(wait=False, cancel_futures=True)

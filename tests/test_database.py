@@ -30,6 +30,32 @@ def test_content_object_is_deduplicated(tmp_path):
     assert first == second
 
 
+def test_vacuum_adopts_the_larger_page_size_on_a_wal_database(tmp_path):
+    """Regression: page_size must actually change on VACUUM, which SQLite ignores in WAL mode.
+
+    A legacy database created at 4096 bytes/page, in WAL mode, is the exact case the previous code
+    got wrong: ``PRAGMA page_size=8192; VACUUM`` is a silent no-op under WAL, so the file stayed at
+    the old size. vacuum() now drops to a rollback journal for the rebuild and restores WAL after.
+    """
+    path = tmp_path / "legacy.sqlite"
+    seed = sqlite3.connect(path)
+    seed.execute("PRAGMA page_size=4096")
+    seed.execute("PRAGMA journal_mode=WAL")
+    seed.execute("CREATE TABLE t(x)")
+    seed.executemany("INSERT INTO t(x) VALUES(?)", [(i,) for i in range(500)])
+    seed.commit()
+    seed.close()
+    assert sqlite3.connect(path).execute("PRAGMA page_size").fetchone()[0] == 4096
+
+    db = Database(path)
+    db.vacuum()
+    # The page size took, and the database is back in WAL mode with its data intact.
+    assert db.connect().execute("PRAGMA page_size").fetchone()[0] == 8192
+    assert db.connect().execute("PRAGMA journal_mode").fetchone()[0].lower() == "wal"
+    assert db.connect().execute("SELECT COUNT(*) FROM t").fetchone()[0] == 500
+    db.close()
+
+
 def test_backup_refuses_overwrite_and_copies(tmp_path):
     db = Database(tmp_path / "db.sqlite")
     db.initialize()

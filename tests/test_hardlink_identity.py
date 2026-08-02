@@ -97,6 +97,54 @@ def test_reuse_can_be_switched_off(config, database, tmp_path):
     )["n"] == 1
 
 
+def test_failed_representative_does_not_strand_its_followers(config, database, tmp_path, monkeypatch):
+    """Regression: if the hard-link representative fails to hash, its inode-mates must not vanish.
+
+    The representative carries the group; a follower inherits its digest from memory. Before the fix
+    a failed representative hit ``continue``, dropping the whole ``followers`` list — those paths got
+    neither a content link nor an error signature, yet the run finished 'clean' with rows missing.
+    Now the stranded followers are re-hashed on their own paths and still resolve to their content.
+    """
+    import housekeeper.core.identity as identity_module
+
+    root = tmp_path / "src"
+    root.mkdir()
+    body = "shared bytes behind four snapshot paths\n" * 60
+    (root / "original.dat").write_text(body)
+    for i in range(1, 4):  # four paths, one inode
+        _hardlink_or_skip(root / "original.dat", root / f"snapshot{i}.dat")
+    DriveScanner(database, config).scan(root, incremental=False)
+
+    # Fail exactly the first hash — the sole first-pass unit is the group representative; the three
+    # followers are re-attempted individually afterward and must succeed.
+    real_compute = identity_module.compute_identity
+    calls = {"n": 0}
+
+    def fail_first(*args, **kwargs):
+        calls["n"] += 1
+        if calls["n"] == 1:
+            raise OSError("representative unreadable")
+        return real_compute(*args, **kwargs)
+
+    monkeypatch.setattr(identity_module, "compute_identity", fail_first)
+    result = ensure_content_identity(database, config, _all_unlinked(database), record_errors=True)
+
+    assert result["hashed"] == 3, "the three stranded followers were re-hashed, not dropped"
+    assert result["errors"] == 1, "only the representative failed"
+    # The followers are linked to their content; the representative alone carries an ERROR signature.
+    linked = database.fetch_one(
+        "SELECT COUNT(*) n FROM entry_content_links l JOIN filesystem_entries e ON e.id=l.entry_id WHERE e.entry_type='file'"
+    )["n"]
+    assert linked == 3, "every follower got a content link despite the representative failing"
+    assert database.fetch_one(
+        """SELECT COUNT(DISTINCT l.content_object_id) n FROM entry_content_links l
+           JOIN filesystem_entries e ON e.id=l.entry_id WHERE e.entry_type='file'"""
+    )["n"] == 1, "the surviving followers all resolve to the one shared content object"
+    assert database.fetch_one(
+        "SELECT COUNT(*) n FROM file_signatures WHERE hash_status='ERROR'"
+    )["n"] == 1
+
+
 def test_hardlinked_backups_still_group_as_duplicates(config, database, tmp_path):
     """Reuse must not hide that the copies exist: they are still verified exact duplicates."""
     root = tmp_path / "src"

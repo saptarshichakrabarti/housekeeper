@@ -1151,7 +1151,11 @@ class Database:
         """Vacuum only when the filesystem has enough free room for a temporary copy.
 
         Also the one moment an existing database can adopt the larger page size (a fresh database
-        takes it at creation): the pragma is set here so the rebuild VACUUM performs writes it.
+        takes it at creation). The rebuild a VACUUM performs is what would rewrite every page at the
+        new size — but SQLite silently ignores a ``page_size`` change while the database is in WAL
+        mode, so the switch is a no-op there. To make it stick, drop to a rollback journal for the
+        duration: set the page size under ``journal_mode=DELETE``, VACUUM, then restore WAL. When the
+        page size already matches, this simply rebuilds and reclaims free pages as before.
         """
         if (
             self.path.exists()
@@ -1159,8 +1163,12 @@ class Database:
             < self.path.stat().st_size * 2
         ):
             raise OSError("insufficient free disk space for VACUUM")
-        self.connect().execute("PRAGMA page_size=8192")
-        self.connect().execute("VACUUM")
+        conn = self.connect()
+        conn.commit()  # journal_mode changes and VACUUM cannot run inside a transaction
+        conn.execute("PRAGMA journal_mode=DELETE")
+        conn.execute("PRAGMA page_size=8192")
+        conn.execute("VACUUM")
+        conn.execute("PRAGMA journal_mode=WAL")
 
     # The five overview charts, stored verbatim so the dashboard never re-runs these full-table
     # aggregates on a page load. Column order matches what DashboardService renders.
