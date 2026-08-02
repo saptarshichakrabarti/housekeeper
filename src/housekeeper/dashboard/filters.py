@@ -145,6 +145,22 @@ def _humanize_code(code: str) -> str:
     return text.replace("_", " ").capitalize()
 
 
+_JOB_TYPE_LABELS = {
+    "SCAN": "Scan",
+    "QUICKSTART": "Quick start",
+    "CONTENT_ANALYSIS": "Content identity",
+    "DATABASE_MAINTENANCE": "Database maintenance",
+    "PURGE": "Purge",
+}
+
+
+def job_type_label(value: object) -> str:
+    """A job type as a readable stage name, e.g. EXACT_DUPLICATE_ANALYSIS -> 'Exact duplicate analysis'."""
+    if value is None or value == "":
+        return ""
+    return _JOB_TYPE_LABELS.get(str(value), _humanize_code(str(value)))
+
+
 def classification_label(value: object) -> str:
     if value is None or value == "":
         return ""

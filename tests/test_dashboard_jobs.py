@@ -32,6 +32,30 @@ def _csrf(client):
     return client.get("/api/csrf").json()["token"]
 
 
+def test_job_type_renders_as_a_readable_stage_name(client, database):
+    job_id = create_job(database, "EXACT_DUPLICATE_ANALYSIS")
+    update_job(database, job_id, "RUNNING")
+    row_html = client.get("/fragments/jobs").text.split("<tbody>", 1)[1]
+    assert "Exact duplicate analysis" in row_html
+    assert "EXACT_DUPLICATE_ANALYSIS</td>" not in row_html  # raw code only in the tooltip
+    assert "title='EXACT_DUPLICATE_ANALYSIS'" in row_html
+
+
+def test_results_column_collapses_zero_counts_and_flags_errors(client, database):
+    clean = create_job(database, "CONTENT_ANALYSIS")
+    update_job(database, clean, "COMPLETED", success_count=1204, skip_count=0, error_count=0)
+    witherrors = create_job(database, "IMAGE_ANALYSIS")
+    update_job(database, witherrors, "COMPLETED_WITH_ERRORS", success_count=40, skip_count=2, error_count=3)
+    row_html = client.get("/fragments/jobs").text.split("<tbody>", 1)[1]
+    assert "1,204 ok" in row_html  # the clean run shows only its non-zero part
+    assert "40 ok · 2 skipped · " in row_html
+    assert "class='count-error'>3 errors" in row_html  # errors are called out
+    # The three separate zero-prone columns are gone from the header.
+    header = client.get("/fragments/jobs").text
+    assert "success_count" not in header and "skip_count" not in header
+    assert "<th>Results</th>" in header and "<th>Stage</th>" in header
+
+
 def test_running_job_shows_live_bar_and_rate(client, database):
     job_id = create_job(database, "SCAN")
     update_job(database, job_id, "RUNNING", processed_count=10)

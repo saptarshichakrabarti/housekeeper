@@ -38,6 +38,7 @@ def create_app(
         classification_label,
         decision_label,
         filesizeformat,
+        job_type_label,
         reason_labels,
         relativetime,
         thousands,
@@ -385,6 +386,22 @@ def create_app(
     def _stages_row_id(job_id: int) -> str:
         return f"job-stages-{job_id}"
 
+    def results_cell(row) -> str:
+        """Outcome counts, showing only the non-zero parts so a clean run isn't three zero columns.
+
+        Errors are called out; a job with nothing to report yet (or a pure zero row) renders empty.
+        """
+        parts = []
+        if int(row["success_count"] or 0):
+            parts.append(f"{escape(thousands(row['success_count']))} ok")
+        if int(row["skip_count"] or 0):
+            parts.append(f"{escape(thousands(row['skip_count']))} skipped")
+        if int(row["error_count"] or 0):
+            parts.append(
+                f"<span class='count-error'>{escape(thousands(row['error_count']))} errors</span>"
+            )
+        return " · ".join(parts)
+
     def jobs_table(rows, medians: dict[str, float] | None = None, roots: set[int] | None = None) -> str:
         headings = [
             "id",
@@ -392,12 +409,26 @@ def create_app(
             "status",
             "progress",
             "duration",
-            "success_count",
-            "skip_count",
-            "error_count",
+            "results",
             "updated_at",
         ]
-        header = "".join(f"<th>{escape(heading)}</th>" for heading in [*headings, "controls"])
+        # Readable column headers, and one "results" column in place of three near-always-zero
+        # success/skip/error columns — those now collapse into a single cell showing only what is
+        # non-zero (see results_cell), so a clean run reads as "1,204 ok" rather than three columns.
+        heading_labels = {
+            "id": "ID",
+            "job_type": "Stage",
+            "status": "Status",
+            "progress": "Progress",
+            "duration": "Duration",
+            "results": "Results",
+            "updated_at": "Updated",
+            "controls": "",
+        }
+        header = "".join(
+            f"<th>{escape(heading_labels.get(heading, heading))}</th>"
+            for heading in [*headings, "controls"]
+        )
         body = ""
         for row in rows:
             parent = row["parent_job_id"]
@@ -408,13 +439,16 @@ def create_app(
                     cells += f"<td>{progress_cell(row)}</td>"
                 elif heading == "duration":
                     cells += f"<td>{duration_cell(row, medians)}</td>"
+                elif heading == "results":
+                    cells += f"<td>{results_cell(row)}</td>"
                 elif heading == "job_type" and expandable:
                     # A pipeline root: its stages are one click away, from data already on the rows.
                     # The click replaces this row's own empty stages row (below) rather than
                     # inserting a new one, so clicking twice refreshes the table instead of
                     # stacking a second copy of it.
                     cells += (
-                        f"<td>{display_cell(heading, row[heading])} "
+                        f"<td title='{escape(str(row[heading]))}'>"
+                        f"{escape(job_type_label(row[heading]))} "
                         f"<button hx-get='/fragments/jobs/{int(row['id'])}/stages' "
                         f"hx-target='#{_stages_row_id(int(row['id']))}' "
                         f"hx-swap='outerHTML'>stages</button></td>"
@@ -425,7 +459,13 @@ def create_app(
                     # escalate to the pipeline root).
                     cells += (
                         f"<td title='stage of job #{int(parent)}; controls act on the whole run'>"
-                        f"↳ {display_cell(heading, row[heading])}</td>"
+                        f"↳ {escape(job_type_label(row[heading]))}</td>"
+                    )
+                elif heading == "job_type":
+                    # A standalone job: readable stage name, raw code kept in a tooltip.
+                    cells += (
+                        f"<td title='{escape(str(row[heading]))}'>"
+                        f"{escape(job_type_label(row[heading]))}</td>"
                     )
                 else:
                     cells += f"<td>{display_cell(heading, row[heading])}</td>"
