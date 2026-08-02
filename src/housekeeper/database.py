@@ -398,11 +398,16 @@ class Database:
         c.execute(
             """CREATE VIEW current_exact_duplicate_groups AS
                SELECT g.id,g.content_object_id,g.full_hash,g.size_bytes,COUNT(*) member_count,
+                      COUNT(DISTINCT CASE
+                              WHEN e.device_id IS NOT NULL AND e.inode_or_file_id IS NOT NULL
+                              THEN e.device_id || ':' || e.inode_or_file_id
+                              ELSE 'entry:' || m.entry_id END) distinct_inode_count,
                       COALESCE(MAX(CASE WHEN m.entry_id=g.canonical_entry_id THEN m.entry_id END),
                                MIN(m.entry_id)) canonical_entry_id,
                       g.canonical_selection_reason,g.verified
                FROM exact_duplicate_groups g
                JOIN current_exact_duplicate_members m ON m.group_id=g.id
+               JOIN current_entries e ON e.id=m.entry_id
                GROUP BY g.id,g.content_object_id,g.full_hash,g.size_bytes,
                         g.canonical_selection_reason,g.verified
                HAVING COUNT(*)>=2"""
@@ -1222,6 +1227,13 @@ class Database:
                 ),
                 "unique_content_bytes": scalar(
                     "SELECT COALESCE(SUM(size_bytes),0) FROM current_content_objects"
+                ),
+                # Hard-link-honest: within a duplicate group, paths sharing one inode free nothing
+                # when deleted, so reclaimable counts distinct inodes beyond the keeper, not paths.
+                # A snapshot drive where every "copy" is a hard link reads as 0 reclaimable, rightly.
+                "reclaimable_bytes": scalar(
+                    "SELECT COALESCE(SUM(size_bytes*(distinct_inode_count-1)),0) "
+                    "FROM current_exact_duplicate_groups"
                 ),
                 "entries": scalar("SELECT COUNT(*) FROM current_entries"),
                 "content_objects": scalar("SELECT COUNT(*) FROM current_content_objects"),

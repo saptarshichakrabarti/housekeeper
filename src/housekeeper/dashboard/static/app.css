@@ -300,6 +300,7 @@ nav a[aria-current="page"], .header-title a[aria-current="page"] { font-weight: 
 .metric-card:focus-visible, .hero-card:focus-visible { outline: 3px solid var(--hk-accent); outline-offset: 2px; }
 .card-link-hint { color: var(--hk-link); font-size: .78rem; }
 .card-description { color: var(--hk-text-muted); font-size: .72rem; line-height: 1.3; }
+.hint { color: var(--hk-text-muted); font-size: .82rem; }
 .stale-badge {
   background: var(--hk-warn-bg);
   color: var(--hk-warn);

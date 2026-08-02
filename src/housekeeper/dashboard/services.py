@@ -65,6 +65,12 @@ class DashboardService:
         )
         logical_bytes = int(overview.get("logical_bytes", 0))
         unique_bytes = int(overview.get("unique_content_bytes", 0))
+        # Prefer the hard-link-honest reclaimable materialized by the analyser (distinct inodes
+        # beyond the keeper). Fall back to the old logical-minus-unique estimate only for a summary
+        # written before that key existed, so an un-refreshed database still shows a number.
+        reclaimable_bytes = int(
+            overview.get("reclaimable_bytes", max(0, logical_bytes - unique_bytes))
+        )
         review_candidates = sum(
             int(count)
             for classification, count in classifications.items()
@@ -157,7 +163,7 @@ class DashboardService:
         integrity = "not checked" if refreshed_at else "not yet computed"
         return OverviewViewModel(
             integrity,
-            max(0, logical_bytes - unique_bytes),
+            reclaimable_bytes,
             metrics,
             charts,
             refreshed_at,

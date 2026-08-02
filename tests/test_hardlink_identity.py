@@ -145,6 +145,41 @@ def test_failed_representative_does_not_strand_its_followers(config, database, t
     )["n"] == 1
 
 
+def test_reclaimable_space_counts_distinct_inodes_not_paths(config, database, tmp_path):
+    """Hard-linked 'duplicates' free no space: reclaimable counts inodes beyond the keeper, not paths.
+
+    A snapshot drive is full of paths that share one inode. Counting redundant *paths* tells a user
+    they can reclaim gigabytes that deleting hard links would never free. The honest figure counts
+    distinct physical inodes: here four snapshot paths over one inode, plus one independent copy, so
+    exactly one copy's worth is reclaimable — not four.
+    """
+    from housekeeper.dashboard.services import DashboardService
+
+    root = tmp_path / "src"
+    root.mkdir()
+    body = "a payload duplicated across snapshots and one real copy\n" * 100
+    size = len(body.encode())
+    (root / "original.dat").write_text(body)
+    for i in range(1, 4):  # three more hard links → four paths, one inode
+        _hardlink_or_skip(root / "original.dat", root / f"snap{i}.dat")
+    (root / "independent.dat").write_text(body)  # same bytes, a genuinely separate inode
+
+    DriveScanner(database, config).scan(root, incremental=False)
+    ensure_content_identity(database, config, _all_unlinked(database))
+    run_exact_duplicate_analysis(database, config)
+
+    group = database.fetch_one(
+        "SELECT member_count,distinct_inode_count,size_bytes FROM current_exact_duplicate_groups"
+    )
+    assert group["member_count"] == 5  # five paths all resolve to the one content object
+    assert group["distinct_inode_count"] == 2  # one shared inode + one independent inode
+    assert group["size_bytes"] * (group["distinct_inode_count"] - 1) == size
+
+    database.refresh_materialized_summaries()
+    model = DashboardService(database.reader()).overview()
+    assert model.reclaimable_bytes == size, "counting paths would have reported four copies' worth"
+
+
 def test_hardlinked_backups_still_group_as_duplicates(config, database, tmp_path):
     """Reuse must not hide that the copies exist: they are still verified exact duplicates."""
     root = tmp_path / "src"

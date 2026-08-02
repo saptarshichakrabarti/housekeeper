@@ -879,8 +879,8 @@ def create_app(
         if sort not in order_by:
             raise HTTPException(422, "invalid duplicate sort")
         rows = reader.fetch_all(
-            f"""SELECT g.id,g.full_hash,g.member_count,g.size_bytes,
-                       g.size_bytes*(g.member_count-1) reclaimable_bytes,g.canonical_entry_id,
+            f"""SELECT g.id,g.full_hash,g.member_count,g.size_bytes,g.distinct_inode_count,
+                       g.size_bytes*(g.distinct_inode_count-1) reclaimable_bytes,g.canonical_entry_id,
                        (SELECT rg.id FROM current_exact_duplicate_members dm
                         JOIN entry_content_links ecl ON ecl.entry_id=dm.entry_id
                         JOIN current_relationship_group_members rgm ON rgm.content_object_id=ecl.content_object_id
