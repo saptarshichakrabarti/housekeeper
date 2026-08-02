@@ -367,6 +367,23 @@ def checkpoint(
         database.connect().commit()
 
 
+def _settle_stage_wal(database: Database) -> None:
+    """At a stage boundary: record the WAL's peak size and checkpoint what it can, best-effort.
+
+    A PASSIVE checkpoint never waits for a reader, so it is safe to run after every stage — it keeps
+    the WAL left by one analyser from being carried, and grown, by the next. Wrapped so a settle can
+    never convert a real stage failure into a checkpoint error when it runs from a ``finally``.
+    """
+    from .core import counters
+
+    try:
+        if counters.is_recording():
+            counters.record_max("wal_bytes_stage_end", database.wal_bytes())
+        database.checkpoint_wal("PASSIVE")
+    except Exception:  # noqa: BLE001,S110 - a best-effort settle must never mask the stage's own outcome
+        pass
+
+
 @contextmanager
 def tracked_job(
     database: Database,
@@ -438,6 +455,9 @@ def tracked_job(
     finally:
         if previous_handler is not None:
             signal.signal(signal.SIGINT, previous_handler)
+        # Whatever the outcome — committed, paused, cancelled, rolled back — this is a stage
+        # boundary, so settle the WAL here rather than letting it accumulate across the pipeline.
+        _settle_stage_wal(database)
 
 
 def threading_main_thread() -> bool:

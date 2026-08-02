@@ -41,6 +41,12 @@ DEFAULTS: dict[str, Any] = {
         "quick_hash_chunk_bytes": 1048576,
         "quick_hash_middle_samples": 2,
         "full_hash_block_bytes": 8388608,
+        # Hash one representative per (device, inode) group and copy the verified result to every
+        # other hard link to it, rather than reading the same physical bytes once per path. Gated on
+        # nlink > 1, so it can only ever affect files the filesystem itself reports as shared. On a
+        # snapshot-style backup drive this is the difference between reading the data once and once
+        # per retained snapshot; off, every path is hashed independently.
+        "hardlink_identity_reuse": True,
     },
     "archives": {
         # Nested archives are inventoried, never expanded (decompression-bomb safety), so there is

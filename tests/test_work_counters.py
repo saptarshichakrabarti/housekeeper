@@ -282,6 +282,24 @@ def quickstart_rerun_counts(tmp_path_factory):
     return runs
 
 
+def test_stage_boundaries_keep_the_wal_bounded(quickstart_rerun_counts):
+    """A settled stage boundary is what keeps a days-long pipeline's WAL from growing without end.
+
+    ``tracked_job`` records the WAL's peak size at every stage exit and PASSIVE-checkpoints it, so no
+    stage carries and grows the log the previous one left. The number is tiny on this fixture; the
+    assertion is a *ceiling*, and it is here so a change that stops settling the WAL — or opens a
+    reader that pins it across a stage — trips a machine-independent counter rather than a
+    disk-full on a real inventory. The teeth at scale are in the soak guard (test_corpus_shapes).
+    """
+    first = quickstart_rerun_counts["first"]
+    assert "wal_bytes_stage_end" in first, "no stage recorded a WAL peak"
+    # A generous multiple of the 4000-page autocheckpoint ceiling (~16 MB at the 4 KiB default): on
+    # this corpus the real figure is a fraction of it, but a runaway would blow straight past this.
+    assert first["wal_bytes_stage_end"] < 128 * 1024 * 1024, (
+        f"WAL peaked at {first['wal_bytes_stage_end']} bytes at a stage boundary"
+    )
+
+
 def test_unchanged_quickstart_rerun_stays_a_small_constant_per_entry(quickstart_rerun_counts):
     """The whole ~21-stage pipeline, not just the scan, on a tree nobody touched.
 

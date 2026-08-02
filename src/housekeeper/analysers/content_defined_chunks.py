@@ -13,7 +13,6 @@ from ..chunking.index import store_chunks
 from ..chunking.overlap import compute_overlap, generate_overlap_candidates
 from ..chunking.profiles import get_or_create_chunk_profile_id, profile_from_config
 from ..chunking.python_backend import chunk_file
-from ..hashing import compute_full_hash
 from ..relationships import upsert_content_relationship
 
 ALGORITHM = "fastcdc_gear"
@@ -33,29 +32,18 @@ def _representative_path(database, content_object_id: int) -> Path | None:
 
 
 def _ensure_hashed_large_files(database, config, minimum_file: int, scope) -> None:
-    algorithm = config.section("hashing")["algorithm"]
-    block = config.section("hashing")["full_hash_block_bytes"]
+    from ..core.identity import ensure_content_identity
+
     entry_sql, params = scope.entry_id_sql()
-    for row in database.iter_rows(
-        f"""SELECT e.id,e.absolute_path,e.size_bytes FROM filesystem_entries e
-           LEFT JOIN entry_content_links l ON l.entry_id=e.id
+    stream = database.reader().iter_rows(
+        f"""SELECT e.id,e.scan_run_id,e.absolute_path,e.size_bytes,e.device_id,e.inode_or_file_id,e.nlink
+           FROM filesystem_entries e LEFT JOIN entry_content_links l ON l.entry_id=e.id
            WHERE e.entry_type='file' AND l.entry_id IS NULL AND e.size_bytes>=?
-           AND e.id IN ({entry_sql})""",
+           AND e.id IN ({entry_sql})
+           ORDER BY e.device_id,e.inode_or_file_id,e.id""",
         (minimum_file, *params),
-    ):
-        path = Path(row["absolute_path"])
-        if not path.is_file() or path.is_symlink():
-            continue
-        result = compute_full_hash(path, algorithm, block)
-        if not result.stable or not result.digest:
-            continue
-        cid = database.get_or_create_content_object(algorithm, result.digest, result.size)
-        database.connect().execute(
-            "INSERT OR REPLACE INTO file_signatures(entry_id,full_hash,hash_algorithm,hash_status,full_hash_computed_at) VALUES(?,?,?, 'VERIFIED', CURRENT_TIMESTAMP)",
-            (int(row["id"]), result.digest, algorithm),
-        )
-        database.link_entry_content(int(row["id"]), cid, "", "VERIFIED")
-    database.connect().commit()
+    )
+    ensure_content_identity(database, config, stream, progress_phase="hashing large files")
 
 
 def _index_bytes(database, profile_id: int) -> int:

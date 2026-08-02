@@ -45,6 +45,7 @@ _ENTRY_COLUMNS = (
     "size_bytes",
     "device_id",
     "inode_or_file_id",
+    "nlink",
     "mode",
     "created_at",
     "modified_at",
@@ -150,6 +151,7 @@ class DriveScanner:
                 st.st_mode,
                 st.st_dev,
                 getattr(st, "st_ino", None),
+                getattr(st, "st_nlink", None),
             )
         except OSError as exc:
             return FileStatRecord(
@@ -387,6 +389,7 @@ class DriveScanner:
             rec.size_bytes,
             rec.device_id,
             rec.inode_or_file_id,
+            rec.nlink,
             rec.mode,
             rec.created_at,
             rec.modified_at,

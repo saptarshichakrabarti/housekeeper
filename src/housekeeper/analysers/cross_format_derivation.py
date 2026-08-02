@@ -20,33 +20,20 @@ EXPORT = {".pdf", ".html", ".htm"}
 
 
 def _ensure_hashed(database, config, scope) -> None:
-    from ..hashing import compute_full_hash
+    from ..core.identity import ensure_content_identity
 
-    algorithm = config.section("hashing")["algorithm"]
-    block = config.section("hashing")["full_hash_block_bytes"]
     suffixes = EDITABLE | EXPORT
     marks = ",".join("?" for _ in suffixes)
     entry_sql, scope_params = scope.entry_id_sql()
-    for row in database.iter_rows(
-        f"""SELECT e.id,e.absolute_path FROM filesystem_entries e
-            LEFT JOIN entry_content_links l ON l.entry_id=e.id
+    stream = database.reader().iter_rows(
+        f"""SELECT e.id,e.scan_run_id,e.absolute_path,e.device_id,e.inode_or_file_id,e.nlink
+            FROM filesystem_entries e LEFT JOIN entry_content_links l ON l.entry_id=e.id
             WHERE e.entry_type='file' AND l.entry_id IS NULL AND lower(e.suffix) IN ({marks})
-            AND e.id IN ({entry_sql})""",
+            AND e.id IN ({entry_sql})
+            ORDER BY e.device_id,e.inode_or_file_id,e.id""",
         (*suffixes, *scope_params),
-    ):
-        path = Path(row["absolute_path"])
-        if not path.is_file() or path.is_symlink():
-            continue
-        result = compute_full_hash(path, algorithm, block)
-        if not result.stable or not result.digest:
-            continue
-        cid = database.get_or_create_content_object(algorithm, result.digest, result.size)
-        database.connect().execute(
-            "INSERT OR REPLACE INTO file_signatures(entry_id,full_hash,hash_algorithm,hash_status,full_hash_computed_at) VALUES(?,?,?, 'VERIFIED', CURRENT_TIMESTAMP)",
-            (int(row["id"]), result.digest, algorithm),
-        )
-        database.link_entry_content(int(row["id"]), cid, "", "VERIFIED")
-    database.connect().commit()
+    )
+    ensure_content_identity(database, config, stream, progress_phase="hashing derivations")
 
 
 def run_cross_format_derivation_analysis(database, config, scope=None, job_id=None) -> dict[str, int]:

@@ -16,7 +16,7 @@ SCHEMA = """
 CREATE TABLE IF NOT EXISTS schema_migrations(version INTEGER PRIMARY KEY);
 CREATE TABLE IF NOT EXISTS migration_progress(migration_version INTEGER PRIMARY KEY, cursor_value INTEGER NOT NULL DEFAULT 0, status TEXT NOT NULL DEFAULT 'PENDING', updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP, detail_json TEXT NOT NULL DEFAULT '{}');
 CREATE TABLE IF NOT EXISTS scan_runs(id INTEGER PRIMARY KEY, source_root TEXT NOT NULL, source_root_fingerprint TEXT NOT NULL, started_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP, completed_at TEXT, status TEXT NOT NULL, hostname TEXT, platform TEXT, python_version TEXT, config_hash TEXT, files_seen INTEGER DEFAULT 0, directories_seen INTEGER DEFAULT 0, symlinks_seen INTEGER DEFAULT 0, errors_seen INTEGER DEFAULT 0, bytes_seen INTEGER DEFAULT 0, last_checkpoint_at TEXT);
-CREATE TABLE IF NOT EXISTS filesystem_entries(id INTEGER PRIMARY KEY, scan_run_id INTEGER NOT NULL REFERENCES scan_runs(id), parent_entry_id INTEGER REFERENCES filesystem_entries(id), source_root_id INTEGER REFERENCES source_roots(id), source_root TEXT NOT NULL, absolute_path TEXT NOT NULL, relative_path TEXT NOT NULL, name TEXT NOT NULL, suffix TEXT, entry_type TEXT NOT NULL, is_hidden INTEGER DEFAULT 0, is_symlink INTEGER DEFAULT 0, symlink_target TEXT, size_bytes INTEGER DEFAULT 0, device_id INTEGER, inode_or_file_id INTEGER, mode INTEGER, owner TEXT, group_name TEXT, created_at REAL, modified_at REAL, metadata_changed_at REAL, accessed_at REAL, birth_time_available INTEGER DEFAULT 0, scan_status TEXT, read_error TEXT, first_seen_at TEXT DEFAULT CURRENT_TIMESTAMP, last_seen_at TEXT DEFAULT CURRENT_TIMESTAMP, UNIQUE(scan_run_id, relative_path));
+CREATE TABLE IF NOT EXISTS filesystem_entries(id INTEGER PRIMARY KEY, scan_run_id INTEGER NOT NULL REFERENCES scan_runs(id), parent_entry_id INTEGER REFERENCES filesystem_entries(id), source_root_id INTEGER REFERENCES source_roots(id), source_root TEXT NOT NULL, absolute_path TEXT NOT NULL, relative_path TEXT NOT NULL, name TEXT NOT NULL, suffix TEXT, entry_type TEXT NOT NULL, is_hidden INTEGER DEFAULT 0, is_symlink INTEGER DEFAULT 0, symlink_target TEXT, size_bytes INTEGER DEFAULT 0, device_id INTEGER, inode_or_file_id INTEGER, nlink INTEGER, mode INTEGER, owner TEXT, group_name TEXT, created_at REAL, modified_at REAL, metadata_changed_at REAL, accessed_at REAL, birth_time_available INTEGER DEFAULT 0, scan_status TEXT, read_error TEXT, first_seen_at TEXT DEFAULT CURRENT_TIMESTAMP, last_seen_at TEXT DEFAULT CURRENT_TIMESTAMP, UNIQUE(scan_run_id, relative_path));
 CREATE TABLE IF NOT EXISTS file_signatures(entry_id INTEGER PRIMARY KEY REFERENCES filesystem_entries(id) ON DELETE CASCADE, extension_mime TEXT, detected_mime TEXT, detected_type TEXT, signature_source TEXT, quick_hash TEXT, full_hash TEXT, hash_algorithm TEXT, hash_status TEXT, hash_error TEXT, full_hash_computed_at TEXT);
 CREATE TABLE IF NOT EXISTS classifications(entry_id INTEGER PRIMARY KEY REFERENCES filesystem_entries(id) ON DELETE CASCADE, classification TEXT NOT NULL, confidence REAL, primary_reason_code TEXT, reason_codes_json TEXT, rule_ids_json TEXT, explanation TEXT, canonical_entry_id INTEGER, requires_manual_approval INTEGER, classified_at TEXT DEFAULT CURRENT_TIMESTAMP);
 CREATE TABLE IF NOT EXISTS analysis_jobs(id INTEGER PRIMARY KEY, job_type TEXT, started_at TEXT DEFAULT CURRENT_TIMESTAMP, completed_at TEXT, status TEXT, processed_count INTEGER DEFAULT 0, error_count INTEGER DEFAULT 0, config_hash TEXT, error_summary TEXT);
@@ -539,6 +539,7 @@ class Database:
                 "symlink_target": "TEXT",
                 "device_id": "INTEGER",
                 "inode_or_file_id": "INTEGER",
+                "nlink": "INTEGER",
                 "mode": "INTEGER",
                 "owner": "TEXT",
                 "group_name": "TEXT",
@@ -1045,6 +1046,18 @@ class Database:
         c.execute("PRAGMA optimize")
         c.commit()
         self.checkpoint_wal("TRUNCATE")
+
+    def wal_bytes(self) -> int:
+        """Size of the write-ahead log file right now, in bytes (0 if none exists).
+
+        A settled database has a small or empty WAL; a WAL that grows without bound over a long
+        stage is the symptom that a reader's snapshot is pinning it (checkpoints cannot advance past
+        the oldest reader). Cheap enough to sample at every stage boundary, and only sampled there.
+        """
+        try:
+            return (self.path.parent / f"{self.path.name}-wal").stat().st_size
+        except OSError:
+            return 0
 
     def checkpoint_wal(self, mode: str = "PASSIVE") -> tuple[int, int, int]:
         if mode not in {"PASSIVE", "FULL", "RESTART", "TRUNCATE"}:

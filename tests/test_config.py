@@ -174,13 +174,13 @@ def test_throughput_observations_round_trip_on_the_source_root(config, database,
 
 def test_a_tiny_sample_is_not_recorded_as_a_measurement(config, database, tmp_path):
     """Elapsed time over a few KB is pool startup, not the drive."""
-    from housekeeper.analysers.registry import _record_identity_throughput
+    from housekeeper.core.identity import record_identity_throughput
     from housekeeper.scanner import DriveScanner, build_source_root_fingerprint
 
     root = tmp_path / "tiny"
     root.mkdir()
     (root / "a.txt").write_text("hello", encoding="utf-8")
     DriveScanner(database, config).scan(root, incremental=False)
-    _record_identity_throughput(database, 4096, 0.001)
+    record_identity_throughput(database, 4096, 0.001)
     database.connect().commit()
     assert database.observed_hash_throughput(build_source_root_fingerprint(root)) is None
