@@ -8,6 +8,7 @@ already here: the missing-entry epilogue at the bottom of the old loop worked ex
 """
 
 import hashlib
+import itertools
 import json
 import os
 import platform
@@ -29,6 +30,25 @@ from .path_utils import is_hidden_path, normalize_absolute_path, safe_relative_p
 #: processes see progress promptly.
 SCAN_BATCH_SIZE = 5_000
 
+#: Above this many entries in a single directory, that directory is streamed unsorted rather than
+#: read entirely into memory to sort — a 50M-file flat folder would otherwise be tens of GB of
+#: DirEntry objects at once. Reproducible ids (the sort) still hold for every directory under it,
+#: which is every real one; a folder this size is pathological and its audit order is not worth an
+#: out-of-memory kill.
+SCAN_DIR_SORT_LIMIT = 1_000_000
+
+#: Above this many pending directories the resume frontier is not persisted (a null frontier means
+#: "re-walk from the root"). A frontier this large means the walk is still early and wide, where a
+#: full re-walk costs little relative to the risk of writing a multi-megabyte blob every batch.
+FRONTIER_MAX_DIRECTORIES = 100_000
+
+#: Rows per window for the set-based scan epilogue. Small enough that one window is seconds even on
+#: a billion-entry inventory — the point being that a cancel lands within a window, the WAL is
+#: settled per window instead of growing to the size of the whole diff, and a failure loses one
+#: window rather than hours. Not a config knob: no operator can choose it more meaningfully than
+#: "large enough to amortise per-statement overhead, small enough to stay interruptible".
+SET_OP_CHUNK_ROWS = 250_000
+
 #: Columns staged for each entry, in the order `_row` builds them.
 _ENTRY_COLUMNS = (
     "scan_run_id",
@@ -45,6 +65,7 @@ _ENTRY_COLUMNS = (
     "size_bytes",
     "device_id",
     "inode_or_file_id",
+    "nlink",
     "mode",
     "created_at",
     "modified_at",
@@ -150,6 +171,7 @@ class DriveScanner:
                 st.st_mode,
                 st.st_dev,
                 getattr(st, "st_ino", None),
+                getattr(st, "st_nlink", None),
             )
         except OSError as exc:
             return FileStatRecord(
@@ -199,10 +221,12 @@ class DriveScanner:
             if resume
             else None
         )
-        run_id = (
-            int(old["id"])
-            if old and old["status"] != "COMPLETE"
-            else self.db.create_scan_run(
+        resuming = bool(old and old["status"] != "COMPLETE")
+        if resuming:
+            assert old is not None  # resuming implies old is set; narrows for the type checker
+            run_id = int(old["id"])
+        else:
+            run_id = self.db.create_scan_run(
                 str(root),
                 root_fp,
                 config_fingerprint(self.config),
@@ -210,8 +234,11 @@ class DriveScanner:
                 platform=platform.platform(),
                 python_version=sys.version,
             )
-        )
         self.last_run_id = run_id
+        # On resume, continue from the interrupted walk's frontier rather than re-walking the whole
+        # tree — the difference between O(remaining) and O(tree) on a multi-day scan. A missing or
+        # over-large frontier (or a fresh run) falls back to a full walk from the root.
+        initial_stack = self._resume_stack(root, run_id) if resuming else None
         previous_row = (
             self.db.fetch_one(
                 "SELECT id FROM scan_runs WHERE source_root_fingerprint=? AND id<>? AND status='COMPLETE' ORDER BY id DESC LIMIT 1",
@@ -251,15 +278,21 @@ class DriveScanner:
                 "storage_profile": profile["profile_name"],
             },
             config_fingerprint(self.config),
-            # Traversal is a single walk: one worker, recorded honestly. `scan_workers` was a knob
-            # that only ever changed this number in the job row.
-            worker_count=1,
+            # scandir+stat release the GIL, so a small pool overlaps a walk's I/O on fast or
+            # high-latency storage; hdd stays at one worker. Recorded honestly on the job row.
+            worker_count=int(profile.get("traversal_workers", 1)),
             parent_job_id=parent_job_id,
         )
         update_job(self.db, job_id, "RUNNING")
         counts = {"files": 0, "dirs": 0, "symlinks": 0, "errors": 0, "bytes": 0}
+        traversal_workers = max(1, int(profile.get("traversal_workers", 1)))
         try:
-            self._traverse(root, run_id, source_root_id, job_id, counts)
+            if traversal_workers > 1:
+                self._traverse_parallel(
+                    root, run_id, source_root_id, job_id, counts, initial_stack, traversal_workers
+                )
+            else:
+                self._traverse(root, run_id, source_root_id, job_id, counts, initial_stack)
         except (JobCancelled, JobPaused):
             # A scan that stops early — cancelled outright or paused at a checkpoint — leaves an
             # incomplete inventory; mark the run INTERRUPTED so it is never mistaken for a full scan.
@@ -267,8 +300,8 @@ class DriveScanner:
             self.db.execute("UPDATE scan_runs SET status='INTERRUPTED' WHERE id=?", (run_id,))
             self.db.connect().commit()
             raise
-        self._link_parents(run_id)
-        self._record_changes(run_id, previous_id, force_rehash)
+        self._link_parents(run_id, job_id)
+        self._record_changes(run_id, previous_id, force_rehash, job_id)
         # One transaction: a run is COMPLETE exactly when it is this source's current inventory.
         # Splitting these would leave a window in which the newest complete scan is not the one
         # every current-state analyser reads.
@@ -285,12 +318,17 @@ class DriveScanner:
         self.db.refresh_current_inventory_views()
         self.db.connect().execute("DELETE FROM graph_layout_cache")
         self.db.connect().commit()
+        # Entries, not counter values: `counts` also carries `bytes`, so summing every value told
+        # the jobs page a 47-entry scan "processed 1,419" (43 files + 4 dirs + 1,372 bytes).
+        entries_processed = (
+            counts["files"] + counts["dirs"] + counts["symlinks"] + counts["errors"]
+        )
         update_job(
             self.db,
             job_id,
             "COMPLETED",
-            processed_count=sum(counts.values()),
-            success_count=sum(counts.values()),
+            processed_count=entries_processed,
+            success_count=entries_processed - counts["errors"],
         )
         self.db.refresh_materialized_summaries(run_id)
         # After the first completed scan the planner has no statistics; analyse once so the new
@@ -305,38 +343,116 @@ class DriveScanner:
 
     # ---------------------------------------------------------------- traversal
 
-    def _traverse(self, root: Path, run_id: int, source_root_id: int, job_id: int, counts: dict) -> None:
+    @staticmethod
+    def _read_directory(directory: Path, sort_limit: int):
+        """Return ``(entries, overflow)`` for one directory.
+
+        Within ``sort_limit`` a sorted list (so entry ids stay reproducible across runs); beyond it
+        the raw ``scandir`` iterator, streamed unsorted, so a pathologically large flat directory is
+        never fully materialised. May raise ``OSError`` exactly as ``os.scandir`` does.
+        """
+        iterator = os.scandir(directory)
+        buffered: list[os.DirEntry] = []
+        for dent in iterator:
+            buffered.append(dent)
+            if len(buffered) >= sort_limit:
+                # Chain the buffered head with the un-consumed tail; the caller streams both. The
+                # scandir handle closes when the chain is exhausted (or on GC if the walk stops).
+                return itertools.chain(buffered, iterator), True
+        iterator.close()
+        buffered.sort(key=lambda e: e.name.casefold())
+        return buffered, False
+
+    @staticmethod
+    def _identity(device: int | None, inode: int | None) -> tuple[int, int] | None:
+        """A directory's ``(device, inode)`` identity, or ``None`` when either is unknown."""
+        return (device, inode) if device is not None and inode is not None else None
+
+    def _resume_stack(self, root: Path, run_id: int) -> list[tuple[Path, str, bool]] | None:
+        """Reconstruct the pending-directory stack from a resumed run's persisted frontier.
+
+        ``None`` when there is no usable frontier (a first interruption before any batch, an
+        over-large frontier stored as NULL, or a corrupt value), which makes the caller fall back to
+        a full re-walk from the root — correct, just not incremental.
+        """
+        row = self.db.fetch_one("SELECT frontier_json FROM scan_runs WHERE id=?", (run_id,))
+        if not row or not row["frontier_json"]:
+            return None
+        try:
+            frontier = json.loads(row["frontier_json"])
+        except (TypeError, ValueError):
+            return None
+        if not isinstance(frontier, list) or not frontier:
+            return None
+        # rel is relative to root; `root / ""` is root itself, so this reconstructs the absolute
+        # directory for every frontier entry including the root.
+        return [((root / rel), str(rel), bool(hidden)) for rel, hidden in frontier]
+
+    def _traverse(
+        self,
+        root: Path,
+        run_id: int,
+        source_root_id: int,
+        job_id: int,
+        counts: dict,
+        initial_stack: list[tuple[Path, str, bool]] | None = None,
+    ) -> None:
         """Walk the tree, staging entries in bounded batches.
 
         No per-entry query: the traversal only reads the filesystem and appends rows. Parent links
         and change detection are resolved afterwards, set-based, so nothing here needs an id back
         from the database.
+
+        ``initial_stack`` seeds the pending directories from a resumed run's frontier, so a scan
+        interrupted on day two continues from where it stopped rather than re-walking day one.
         """
         section = self.config.section("scanner")
         excluded_names = frozenset(section.get("excluded_names", []))
         excluded_paths = frozenset(section.get("excluded_paths", []))
         batch_size = max(1, int(section.get("batch_size") or SCAN_BATCH_SIZE))
+        error_limit = int(section.get("pause_after_consecutive_errors", 0) or 0)
+        cycle_cap = max(0, int(section.get("cycle_guard_max_directories", 0) or 0))
         # `stay_on_filesystem` means exactly one thing: do not descend into a directory that lives
         # on a different device from the root. The entry is still recorded — a mount point is part
         # of this drive's inventory — but its contents belong to whatever is mounted there.
         root_device = self._device_of(root) if section.get("stay_on_filesystem") else None
         batch: list[tuple] = []
         processed = 0
+        # A run of consecutive unreadable entries is the signature of a drive that dropped mid-scan.
+        # Reset by any readable entry, so a few scattered permission errors never trip the breaker.
+        consecutive_errors = 0
+        cap_noted = False
+        # Directory identities already entered, so a bind mount or crafted symlink loop *within one
+        # filesystem* cannot be walked forever — stay_on_filesystem only stops cross-device loops.
+        visited: set[tuple[int, int]] = set()
+        root_identity = self._identity(*self._device_and_inode(root))
+        if root_identity is not None:
+            visited.add(root_identity)
         # (absolute directory, its path relative to the root, whether it is hidden). "" is the
         # root itself, which is never hidden by virtue of where it happens to be mounted.
-        stack: list[tuple[Path, str, bool]] = [(root, "", False)]
+        stack: list[tuple[Path, str, bool]] = (
+            list(initial_stack) if initial_stack is not None else [(root, "", False)]
+        )
         while stack:
             check_cancelled(self.db, job_id)
             directory, rel_dir, dir_hidden = stack.pop()
+            # The resume frontier for this directory: everything still pending, plus this directory
+            # itself (last, so it is re-walked first). Captured *before* the directory is read, so it
+            # excludes the directory's own children — a resume re-derives those by re-walking, and
+            # nothing already on the stack is walked twice.
+            frontier = [(rd, dh) for (_p, rd, dh) in stack] + [(rel_dir, dir_hidden)]
             try:
-                # Sorted so entry ids are reproducible across runs of the same tree; readdir order
-                # is not stable. Nothing downstream may depend on id order (see 2.7), but a
-                # diffable audit trail is worth one sort per directory.
-                entries = sorted(os.scandir(directory), key=lambda e: e.name.casefold())
+                entries, overflow = self._read_directory(directory, SCAN_DIR_SORT_LIMIT)
             except OSError as exc:
                 counts["errors"] += 1
+                consecutive_errors += 1
                 update_job(self.db, job_id, error_count=counts["errors"], current_item=f"{directory}: {exc}")
+                if error_limit and consecutive_errors >= error_limit:
+                    self._pause_on_error_storm(batch, run_id, counts, processed, job_id, directory, consecutive_errors, frontier)
                 continue
+            if overflow:
+                counters.count("directories_streamed_unsorted")
+                update_job(self.db, job_id, current_item=f"{directory}: >{SCAN_DIR_SORT_LIMIT} entries, streamed unsorted")
             for dent in entries:
                 counters.count("entries_enumerated")
                 relative = f"{rel_dir}/{dent.name}" if rel_dir else dent.name
@@ -347,21 +463,235 @@ class DriveScanner:
                 rec = self.inspect_entry(path, root, dent, relative, hidden)
                 batch.append(self._row(rec, run_id, source_root_id, root, path))
                 processed += 1
+                if rec.read_error:
+                    counts["errors"] += 1
+                    consecutive_errors += 1
+                else:
+                    consecutive_errors = 0
                 if rec.entry_type == EntryType.FILE:
                     counts["files"] += 1
                     counts["bytes"] += rec.size_bytes
                 elif rec.entry_type == EntryType.DIRECTORY:
                     counts["dirs"] += 1
-                    if root_device is None or rec.device_id == root_device:
+                    descend = root_device is None or rec.device_id == root_device
+                    identity = self._identity(rec.device_id, rec.inode_or_file_id)
+                    if descend and identity is not None and identity in visited:
+                        counters.count("directories_skipped_as_cycles")
+                        descend = False
+                    if descend:
+                        if identity is not None and cycle_cap:
+                            if len(visited) < cycle_cap:
+                                visited.add(identity)
+                            elif not cap_noted:
+                                cap_noted = True
+                                update_job(self.db, job_id, current_item=f"cycle guard cap reached ({cycle_cap} dirs); descending unguarded")
                         stack.append((path, relative, hidden))
                 elif rec.entry_type == EntryType.SYMLINK:
                     counts["symlinks"] += 1
-                if rec.read_error:
-                    counts["errors"] += 1
                 if len(batch) >= batch_size:
-                    self._flush(batch, run_id, counts, processed, job_id, str(directory))
+                    self._flush(batch, run_id, counts, processed, job_id, str(directory), frontier)
+                if error_limit and consecutive_errors >= error_limit:
+                    self._pause_on_error_storm(batch, run_id, counts, processed, job_id, directory, consecutive_errors, frontier)
             self._checkpoint_counts(run_id, counts)
-        self._flush(batch, run_id, counts, processed, job_id, str(root))
+        # The walk is complete: clear the frontier (an empty list stores NULL) so a resumed reopen of
+        # this run — should one ever happen before it is marked COMPLETE — starts clean.
+        self._flush(batch, run_id, counts, processed, job_id, str(root), [])
+
+    def _pause_on_error_storm(self, batch, run_id, counts, processed, job_id, where, consecutive, frontier=None) -> None:
+        """Commit what has been read, park the scan as PAUSED, and stop — instead of walking a dead
+        drive to the end. Resume re-walks safely (the entry upsert is idempotent)."""
+        self._flush(batch, run_id, counts, processed, job_id, str(where), frontier)
+        update_job(
+            self.db,
+            job_id,
+            "PAUSED",
+            current_item=f"paused after {consecutive} consecutive read errors near {where}",
+        )
+        raise JobPaused(f"scan paused after {consecutive} consecutive read errors")
+
+    # ------------------------------------------------------------ parallel traversal (opt-in)
+
+    def _scan_directory_for_worker(
+        self,
+        dir_tuple: tuple[Path, str, bool],
+        root: Path,
+        excluded_names: frozenset[str],
+        excluded_paths: frozenset[str],
+    ):
+        """Read one directory — the pure-I/O half of the walk, run on a worker thread.
+
+        Touches no database and no shared mutable state: it only reads the filesystem (``scandir`` +
+        ``stat``, which release the GIL) and returns this directory's records for the main thread to
+        stage. Counters are process-global and lock-guarded, so enumeration and stat counts are
+        recorded here exactly as the serial walk records them.
+        """
+        directory, rel_dir, dir_hidden = dir_tuple
+        try:
+            entries, overflow = self._read_directory(directory, SCAN_DIR_SORT_LIMIT)
+        except OSError as exc:
+            return [], False, str(exc)
+        listing: list[tuple[FileStatRecord, str, bool, Path]] = []
+        for dent in entries:
+            counters.count("entries_enumerated")
+            relative = f"{rel_dir}/{dent.name}" if rel_dir else dent.name
+            if dent.name in excluded_names or relative in excluded_paths:
+                continue
+            path = Path(dent.path)
+            hidden = dir_hidden or dent.name.startswith(".")
+            listing.append((self.inspect_entry(path, root, dent, relative, hidden), relative, hidden, path))
+        return listing, overflow, None
+
+    def _traverse_parallel(
+        self,
+        root: Path,
+        run_id: int,
+        source_root_id: int,
+        job_id: int,
+        counts: dict,
+        initial_stack: list[tuple[Path, str, bool]] | None,
+        workers: int,
+    ) -> None:
+        """Walk the tree with ``workers`` directory readers, all bookkeeping on this thread.
+
+        Only ``scandir``/``stat`` is offloaded; the single writer, the batch, the cycle guard and the
+        frontier stay here, so there is exactly one representation of scan state and no SQLite
+        connection ever crosses a thread. At ``workers == 1`` the serial walk is used instead, so
+        this path is purely additive.
+
+        The resume frontier here is everything not yet durably committed — queued directories, those
+        in flight, and those whose records sit in the unflushed batch. A resume re-walks all of them;
+        the entry upsert makes any resulting re-walk idempotent, so the cost is bounded redundancy,
+        never a lost or duplicated row.
+        """
+        from collections import deque
+        from concurrent.futures import FIRST_COMPLETED, ThreadPoolExecutor, wait
+
+        section = self.config.section("scanner")
+        excluded_names = frozenset(section.get("excluded_names", []))
+        excluded_paths = frozenset(section.get("excluded_paths", []))
+        batch_size = max(1, int(section.get("batch_size") or SCAN_BATCH_SIZE))
+        error_limit = int(section.get("pause_after_consecutive_errors", 0) or 0)
+        cycle_cap = max(0, int(section.get("cycle_guard_max_directories", 0) or 0))
+        root_device = self._device_of(root) if section.get("stay_on_filesystem") else None
+
+        batch: list[tuple] = []
+        processed = 0
+        consecutive_errors = 0
+        cap_noted = False
+        visited: set[tuple[int, int]] = set()
+        root_identity = self._identity(*self._device_and_inode(root))
+        if root_identity is not None:
+            visited.add(root_identity)
+        pending: deque[tuple[Path, str, bool]] = deque(
+            initial_stack if initial_stack is not None else [(root, "", False)]
+        )
+        inflight: dict = {}
+        # (rel, hidden) of directories whose records are in the current unflushed batch.
+        unflushed: list[tuple[str, bool]] = []
+        # The single directory being staged right now. It must stay in the frontier across its OWN
+        # mid-directory flushes — which clear `unflushed` — or an interruption partway through a
+        # directory larger than one batch would drop it, and its as-yet-undiscovered subtree, from
+        # the resume set and the run would still be marked COMPLETE with rows silently missing. The
+        # serial walk gets this for free from its pop-time snapshot; the parallel walk holds it here.
+        staging: list[tuple[str, bool]] = []
+
+        def frontier() -> list[tuple[str, bool]]:
+            return (
+                [(rd, dh) for (_p, rd, dh) in pending]
+                + [(rd, dh) for (_p, rd, dh) in inflight.values()]
+                + list(unflushed)
+                + list(staging)
+            )
+
+        def flush(current: str) -> None:
+            self._flush(batch, run_id, counts, processed, job_id, current, frontier())
+            unflushed.clear()
+
+        with ThreadPoolExecutor(max_workers=workers) as pool:
+            try:
+                while pending or inflight:
+                    check_cancelled(self.db, job_id)
+                    while pending and len(inflight) < workers:
+                        dir_tuple = pending.popleft()
+                        future = pool.submit(
+                            self._scan_directory_for_worker,
+                            dir_tuple,
+                            root,
+                            excluded_names,
+                            excluded_paths,
+                        )
+                        inflight[future] = dir_tuple
+                    done, _ = wait(list(inflight), return_when=FIRST_COMPLETED)
+                    for future in done:
+                        directory, rel_dir, dir_hidden = inflight.pop(future)
+                        # From here until this directory is fully staged it is the current directory,
+                        # so it belongs in the frontier through every flush and every error path.
+                        staging[:] = [(rel_dir, dir_hidden)]
+                        listing, overflow, error = future.result()
+                        if error is not None:
+                            counts["errors"] += 1
+                            consecutive_errors += 1
+                            update_job(self.db, job_id, error_count=counts["errors"], current_item=f"{directory}: {error}")
+                            if error_limit and consecutive_errors >= error_limit:
+                                self._pause_on_error_storm(batch, run_id, counts, processed, job_id, directory, consecutive_errors, frontier())
+                            staging.clear()
+                            continue
+                        if overflow:
+                            counters.count("directories_streamed_unsorted")
+                        children: list[tuple[Path, str, bool]] = []
+                        for rec, relative, hidden, path in listing:
+                            batch.append(self._row(rec, run_id, source_root_id, root, path))
+                            processed += 1
+                            if rec.read_error:
+                                counts["errors"] += 1
+                                consecutive_errors += 1
+                            else:
+                                consecutive_errors = 0
+                            if rec.entry_type == EntryType.FILE:
+                                counts["files"] += 1
+                                counts["bytes"] += rec.size_bytes
+                            elif rec.entry_type == EntryType.DIRECTORY:
+                                counts["dirs"] += 1
+                                descend = root_device is None or rec.device_id == root_device
+                                identity = self._identity(rec.device_id, rec.inode_or_file_id)
+                                if descend and identity is not None and identity in visited:
+                                    counters.count("directories_skipped_as_cycles")
+                                    descend = False
+                                if descend:
+                                    if identity is not None and cycle_cap:
+                                        if len(visited) < cycle_cap:
+                                            visited.add(identity)
+                                        elif not cap_noted:
+                                            cap_noted = True
+                                            update_job(self.db, job_id, current_item=f"cycle guard cap reached ({cycle_cap} dirs); descending unguarded")
+                                    children.append((path, relative, hidden))
+                            elif rec.entry_type == EntryType.SYMLINK:
+                                counts["symlinks"] += 1
+                            if len(batch) >= batch_size:
+                                flush(str(directory))
+                            if error_limit and consecutive_errors >= error_limit:
+                                self._pause_on_error_storm(batch, run_id, counts, processed, job_id, directory, consecutive_errors, frontier())
+                        # Children are queued now, so a later flush that lists them will not also be
+                        # re-derived by re-walking this directory. Move this directory from `staging`
+                        # to `unflushed`: it stays in the frontier only until the batch carrying its
+                        # rows is flushed, then leaves — its rows durable, its children on `pending`.
+                        pending.extend(children)
+                        unflushed.append((rel_dir, dir_hidden))
+                        staging.clear()
+                    self._checkpoint_counts(run_id, counts)
+            except (JobCancelled, JobPaused):
+                pool.shutdown(wait=False, cancel_futures=True)
+                raise
+        # The walk is complete: clear the frontier (empty list stores NULL).
+        self._flush(batch, run_id, counts, processed, job_id, str(root), [])
+
+    @staticmethod
+    def _device_and_inode(path: Path) -> tuple[int | None, int | None]:
+        try:
+            st = os.stat(path, follow_symlinks=False)
+            return st.st_dev, getattr(st, "st_ino", None)
+        except OSError:
+            return None, None
 
     @staticmethod
     def _device_of(path: Path) -> int | None:
@@ -387,6 +717,7 @@ class DriveScanner:
             rec.size_bytes,
             rec.device_id,
             rec.inode_or_file_id,
+            rec.nlink,
             rec.mode,
             rec.created_at,
             rec.modified_at,
@@ -394,7 +725,16 @@ class DriveScanner:
             rec.read_error,
         )
 
-    def _flush(self, batch: list[tuple], run_id: int, counts: dict, processed: int, job_id: int, current: str) -> None:
+    def _flush(
+        self,
+        batch: list[tuple],
+        run_id: int,
+        counts: dict,
+        processed: int,
+        job_id: int,
+        current: str,
+        frontier: list[tuple[str, bool]] | None = None,
+    ) -> None:
         """Write one batch and commit it. This is the scan's unit of durability."""
         if batch:
             columns = ",".join(_ENTRY_COLUMNS)
@@ -415,6 +755,18 @@ class DriveScanner:
             )
             batch.clear()
         self._checkpoint_counts(run_id, counts)
+        # Persist the resume frontier at the same cadence as durability. `frontier` is the pending
+        # directories captured when the current directory was popped — it excludes that directory's
+        # own not-yet-discovered children, so a resume re-walks the current directory to rediscover
+        # them without double-walking anything already on the stack. Too large a frontier stores NULL
+        # (a full re-walk), and None here means "leave whatever was last written".
+        if frontier is not None:
+            payload = (
+                json.dumps(frontier) if 0 < len(frontier) <= FRONTIER_MAX_DIRECTORIES else None
+            )
+            self.db.connect().execute(
+                "UPDATE scan_runs SET frontier_json=? WHERE id=?", (payload, run_id)
+            )
         self.db.connect().commit()
         update_job(
             self.db,
@@ -439,34 +791,55 @@ class DriveScanner:
 
     # ---------------------------------------------------------------- set-based diff
 
-    def _link_parents(self, run_id: int) -> None:
-        """Resolve every entry's parent by path, in one statement.
+    def _id_bounds(self, run_id: int) -> tuple[int | None, int | None]:
+        """The ``(min, max)`` entry id of one run — the range the epilogue windows walk."""
+        row = self.db.fetch_one(
+            "SELECT MIN(id) AS lo, MAX(id) AS hi FROM filesystem_entries WHERE scan_run_id=?",
+            (run_id,),
+        )
+        return (row["lo"], row["hi"]) if row else (None, None)
+
+    def _window_guard(self, job_id: int | None):
+        return (lambda: check_cancelled(self.db, job_id)) if job_id else None
+
+    def _link_parents(self, run_id: int, job_id: int | None = None) -> None:
+        """Resolve every entry's parent by path, windowed by entry id.
 
         Doing this afterwards is what lets traversal be a pure append: it no longer needs the
-        database to hand back an id before it can descend into a subdirectory.
+        database to hand back an id before it can descend into a subdirectory. Each entry's parent
+        is computed independently, so the id-windowing changes nothing but the transaction size.
         """
-        self.db.connect().execute(
+        self.db.execute_windowed(
             """UPDATE filesystem_entries SET parent_entry_id=(
                  SELECT p.id FROM filesystem_entries p
                  WHERE p.scan_run_id=filesystem_entries.scan_run_id
                    AND p.relative_path=substr(filesystem_entries.relative_path,1,
                        length(filesystem_entries.relative_path)-length(filesystem_entries.name)-1))
-               WHERE scan_run_id=? AND instr(relative_path,'/')>0""",
+               WHERE scan_run_id=? AND instr(relative_path,'/')>0{window}""",
             (run_id,),
+            key="id",
+            bounds=self._id_bounds(run_id),
+            chunk=SET_OP_CHUNK_ROWS,
+            on_window=self._window_guard(job_id),
         )
         self.db.connect().commit()
 
-    def _record_changes(self, run_id: int, previous_id: int | None, force_rehash: bool) -> None:
+    def _record_changes(
+        self, run_id: int, previous_id: int | None, force_rehash: bool, job_id: int | None = None
+    ) -> None:
         conn = self.db.connect()
         if previous_id is None:
             conn.commit()
             return
-        params = (run_id, previous_id, run_id)
-        # 1. What happened to every entry in this run, in one statement instead of one query per
-        #    entry. `old.id IS NULL` is NEW; the stat tuple decides UNCHANGED; a file that is
-        #    neither is CONTENT_POSSIBLY_CHANGED and a directory is METADATA_CHANGED.
-        conn.execute(
-            f"""INSERT INTO scan_entry_changes(scan_run_id,entry_id,relative_path,change_status,evidence_json)
+        guard = self._window_guard(job_id)
+        cur_bounds = self._id_bounds(run_id)
+        prev_bounds = self._id_bounds(previous_id)
+        # 1. What happened to every entry in this run — windowed by cur.id, so the classification of
+        #    a billion entries is a sequence of committed steps. `old.id IS NULL` is NEW; the stat
+        #    tuple decides UNCHANGED; else CONTENT_POSSIBLY_CHANGED (file) or METADATA_CHANGED. INSERT
+        #    OR IGNORE behind UNIQUE(scan_run_id,entry_id): a resumed re-run of a window is a no-op.
+        self.db.execute_windowed(
+            f"""INSERT OR IGNORE INTO scan_entry_changes(scan_run_id,entry_id,relative_path,change_status,evidence_json)
                 SELECT ?,cur.id,cur.relative_path,
                   CASE WHEN cur.scan_status='ERROR' THEN 'ERROR'
                        WHEN old.id IS NULL THEN 'NEW'
@@ -478,46 +851,63 @@ class DriveScanner:
                 FROM filesystem_entries cur
                 LEFT JOIN filesystem_entries old
                   ON old.scan_run_id=? AND old.relative_path=cur.relative_path
-                WHERE cur.scan_run_id=?""",
-            params,
+                WHERE cur.scan_run_id=?{{window}}""",
+            (run_id, previous_id, run_id),
+            key="cur.id",
+            bounds=cur_bounds,
+            chunk=SET_OP_CHUNK_ROWS,
+            on_window=guard,
         )
         if not force_rehash:
-            # 2. Copy forward the verified identity of every file that did not change. This is the
-            #    whole point of an incremental scan and it is two statements, not two per file.
-            conn.execute(
+            # 2. Copy forward the verified identity of every file that did not change — the whole
+            #    point of an incremental scan. Windowed by cur.id; the upsert is already idempotent.
+            self.db.execute_windowed(
                 f"""INSERT INTO file_signatures(entry_id,quick_hash,full_hash,hash_algorithm,hash_status,hash_error,full_hash_computed_at)
                     SELECT cur.id,s.quick_hash,s.full_hash,s.hash_algorithm,s.hash_status,s.hash_error,s.full_hash_computed_at
                     FROM filesystem_entries cur
                     JOIN filesystem_entries old ON old.scan_run_id=? AND old.relative_path=cur.relative_path
                     JOIN file_signatures s ON s.entry_id=old.id
-                    WHERE cur.scan_run_id=? AND cur.entry_type='file' AND s.full_hash IS NOT NULL AND {_UNCHANGED}
+                    WHERE cur.scan_run_id=? AND cur.entry_type='file' AND s.full_hash IS NOT NULL AND {_UNCHANGED}{{window}}
                     ON CONFLICT(entry_id) DO UPDATE SET quick_hash=excluded.quick_hash,full_hash=excluded.full_hash,
                       hash_algorithm=excluded.hash_algorithm,hash_status=excluded.hash_status,
                       hash_error=excluded.hash_error,full_hash_computed_at=excluded.full_hash_computed_at""",
                 (previous_id, run_id),
+                key="cur.id",
+                bounds=cur_bounds,
+                chunk=SET_OP_CHUNK_ROWS,
+                on_window=guard,
             )
-            conn.execute(
+            self.db.execute_windowed(
                 f"""INSERT INTO entry_content_links(entry_id,content_object_id,link_status,size_verified,hash_verified,entry_stat_fingerprint)
                     SELECT cur.id,l.content_object_id,COALESCE(l.link_status,'VERIFIED'),1,1,{_FINGERPRINT_SQL}
                     FROM filesystem_entries cur
                     JOIN filesystem_entries old ON old.scan_run_id=? AND old.relative_path=cur.relative_path
                     JOIN file_signatures s ON s.entry_id=old.id
                     JOIN entry_content_links l ON l.entry_id=old.id
-                    WHERE cur.scan_run_id=? AND cur.entry_type='file' AND s.full_hash IS NOT NULL AND {_UNCHANGED}
+                    WHERE cur.scan_run_id=? AND cur.entry_type='file' AND s.full_hash IS NOT NULL AND {_UNCHANGED}{{window}}
                     ON CONFLICT(entry_id) DO UPDATE SET content_object_id=excluded.content_object_id,
                       link_status=excluded.link_status,entry_stat_fingerprint=excluded.entry_stat_fingerprint,
                       linked_at=CURRENT_TIMESTAMP""",
                 (previous_id, run_id),
+                key="cur.id",
+                bounds=cur_bounds,
+                chunk=SET_OP_CHUNK_ROWS,
+                on_window=guard,
             )
-        # 3. Anything in the previous run with no counterpart here is gone.
-        conn.execute(
-            """INSERT INTO scan_entry_changes(scan_run_id,entry_id,relative_path,change_status,evidence_json)
+        # 3. Anything in the previous run with no counterpart here is gone — windowed by old.id.
+        self.db.execute_windowed(
+            """INSERT OR IGNORE INTO scan_entry_changes(scan_run_id,entry_id,relative_path,change_status,evidence_json)
                SELECT ?,old.id,old.relative_path,'MISSING',json_object('previous_size',old.size_bytes)
                FROM filesystem_entries old LEFT JOIN filesystem_entries current
                ON current.scan_run_id=? AND current.relative_path=old.relative_path
-               WHERE old.scan_run_id=? AND current.id IS NULL""",
+               WHERE old.scan_run_id=? AND current.id IS NULL{window}""",
             (run_id, run_id, previous_id),
+            key="old.id",
+            bounds=prev_bounds,
+            chunk=SET_OP_CHUNK_ROWS,
+            on_window=guard,
         )
+        conn = self.db.connect()
         # 4. A changed or vanished entry invalidates any review decision recorded against it.
         conn.execute(
             f"""UPDATE review_decisions SET stale=1,updated_at=CURRENT_TIMESTAMP

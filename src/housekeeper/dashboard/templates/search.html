@@ -1,0 +1,20 @@
+<form role="search" action="/search" method="get" class="search-form">
+  <input type="search" name="q" value="{{ q }}" minlength="1" maxlength="500" placeholder="Path or name prefix" aria-label="Search paths">
+  <button type="submit">Search</button>
+</form>
+<p>{% if truncated %}Showing the first {{ limit | thousands }} matches{% else %}{{ count | thousands }} match{{ 'es' if count != 1 }}{% endif %} for <strong>{{ q }}</strong>. Search is prefix-based and read-only.{% if truncated %} Refine the prefix to narrow the results.{% endif %}</p>
+
+<div id="detail-backdrop" class="detail-backdrop" hidden></div>
+<aside id="detail-panel" class="detail-panel" aria-hidden="true" aria-label="Entry details">
+  <div class="detail-panel-head"><button type="button" class="detail-panel-close" aria-label="Close details">Close ×</button></div>
+  <div id="detail-drawer" aria-live="polite">Select a result to inspect it.</div>
+</aside>
+
+<div class="table-scroll"><table>
+  <thead><tr><th>Name</th><th>Path</th><th>Size</th><th>Modified</th><th>Inspect</th></tr></thead>
+  <tbody>{% for row in rows %}<tr>
+    <td>{{ row.name }}</td><td>{{ row.relative_path }}</td>
+    <td>{{ row.size_bytes | filesizeformat }}</td><td>{{ row.modified_at | relativetime }}</td>
+    <td><button hx-get="/fragments/entry/{{ row.id }}" hx-target="#detail-drawer" aria-label="Inspect {{ row.name }}">Inspect</button></td>
+  </tr>{% else %}<tr><td class="empty-state" colspan="5">No paths begin with that search. Try a shorter prefix.</td></tr>{% endfor %}</tbody>
+</table></div>

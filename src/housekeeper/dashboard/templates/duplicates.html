@@ -9,14 +9,18 @@
   </label>
   <noscript><button type="submit">Sort</button></noscript>
 </form>
-<aside id="detail-drawer" aria-live="polite">Open a group to compare its members.</aside>
+<div id="detail-backdrop" class="detail-backdrop" hidden></div>
+<aside id="detail-panel" class="detail-panel" aria-hidden="true" aria-label="Duplicate group details">
+  <div class="detail-panel-head"><button type="button" class="detail-panel-close" aria-label="Close details">Close ×</button></div>
+  <div id="detail-drawer" aria-live="polite">Open a group to compare its members.</div>
+</aside>
 <div class="table-scroll"><table>
   <thead><tr><th>Group</th><th>Preview</th><th>Hash</th><th>Members</th><th>File size</th><th>Reclaimable</th><th>Canonical entry</th><th>Detail</th></tr></thead>
   <tbody>{% for group in groups %}<tr>
     <td>{{ group.id | thousands }}</td>
     <td>{% if group.has_contact_sheet %}<a href="/images/{{ group.image_group_id }}"><img class="duplicate-thumbnail" src="/contact-sheets/{{ group.image_group_id }}.jpg" alt="Contact sheet for visual comparison"></a>{% else %}<span aria-hidden="true">—</span>{% endif %}</td>
     <td><code title="{{ group.full_hash }}">{{ group.full_hash[:12] }}…</code> <button class="copy-button" type="button" data-copy="{{ group.full_hash }}" aria-label="Copy full hash">Copy</button></td>
-    <td>{{ group.member_count | thousands }}</td><td>{{ group.size_bytes | filesizeformat }}</td><td><strong>{{ group.reclaimable_bytes | filesizeformat }}</strong></td>
+    <td>{{ group.member_count | thousands }}{% if group.distinct_inode_count is defined and group.distinct_inode_count < group.member_count %}<span class="hint"> · {{ group.distinct_inode_count | thousands }} inode{{ 's' if group.distinct_inode_count != 1 }}</span>{% endif %}</td><td>{{ group.size_bytes | filesizeformat }}</td><td><strong>{{ group.reclaimable_bytes | filesizeformat }}</strong></td>
     <td>{{ group.canonical_entry_id | thousands }}</td><td><button hx-get="/fragments/duplicates/{{ group.id }}" hx-target="#detail-drawer">Compare</button></td>
   </tr>{% else %}<tr><td class="empty-state" colspan="8">No duplicates yet{% if has_run_page %} — run analyse → exact-duplicates from the <a href="/control">Run page</a>{% endif %}.</td></tr>{% endfor %}</tbody>
 </table></div>

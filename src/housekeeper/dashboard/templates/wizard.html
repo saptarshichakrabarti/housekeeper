@@ -8,7 +8,7 @@ manifest-verified CLI flow: <code>export-review → validate-manifest → move-t
 {% endif %}
 {% if not sessions %}
 <p class="empty-state">No open review session. Create one first:
-<code>housekeeper review new &lt;name&gt;</code>.</p>
+<code>housekeeper review create &lt;name&gt;</code>.</p>
 {% else %}
 <form class="jobs-filter" hx-get="/fragments/wizard/preview" hx-target="#wizard-preview" hx-swap="innerHTML">
   <label>Session <select name="session_id">

@@ -15,8 +15,8 @@ from .core import counters
 SCHEMA = """
 CREATE TABLE IF NOT EXISTS schema_migrations(version INTEGER PRIMARY KEY);
 CREATE TABLE IF NOT EXISTS migration_progress(migration_version INTEGER PRIMARY KEY, cursor_value INTEGER NOT NULL DEFAULT 0, status TEXT NOT NULL DEFAULT 'PENDING', updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP, detail_json TEXT NOT NULL DEFAULT '{}');
-CREATE TABLE IF NOT EXISTS scan_runs(id INTEGER PRIMARY KEY, source_root TEXT NOT NULL, source_root_fingerprint TEXT NOT NULL, started_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP, completed_at TEXT, status TEXT NOT NULL, hostname TEXT, platform TEXT, python_version TEXT, config_hash TEXT, files_seen INTEGER DEFAULT 0, directories_seen INTEGER DEFAULT 0, symlinks_seen INTEGER DEFAULT 0, errors_seen INTEGER DEFAULT 0, bytes_seen INTEGER DEFAULT 0, last_checkpoint_at TEXT);
-CREATE TABLE IF NOT EXISTS filesystem_entries(id INTEGER PRIMARY KEY, scan_run_id INTEGER NOT NULL REFERENCES scan_runs(id), parent_entry_id INTEGER REFERENCES filesystem_entries(id), source_root_id INTEGER REFERENCES source_roots(id), source_root TEXT NOT NULL, absolute_path TEXT NOT NULL, relative_path TEXT NOT NULL, name TEXT NOT NULL, suffix TEXT, entry_type TEXT NOT NULL, is_hidden INTEGER DEFAULT 0, is_symlink INTEGER DEFAULT 0, symlink_target TEXT, size_bytes INTEGER DEFAULT 0, device_id INTEGER, inode_or_file_id INTEGER, mode INTEGER, owner TEXT, group_name TEXT, created_at REAL, modified_at REAL, metadata_changed_at REAL, accessed_at REAL, birth_time_available INTEGER DEFAULT 0, scan_status TEXT, read_error TEXT, first_seen_at TEXT DEFAULT CURRENT_TIMESTAMP, last_seen_at TEXT DEFAULT CURRENT_TIMESTAMP, UNIQUE(scan_run_id, relative_path));
+CREATE TABLE IF NOT EXISTS scan_runs(id INTEGER PRIMARY KEY, source_root TEXT NOT NULL, source_root_fingerprint TEXT NOT NULL, started_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP, completed_at TEXT, status TEXT NOT NULL, hostname TEXT, platform TEXT, python_version TEXT, config_hash TEXT, files_seen INTEGER DEFAULT 0, directories_seen INTEGER DEFAULT 0, symlinks_seen INTEGER DEFAULT 0, errors_seen INTEGER DEFAULT 0, bytes_seen INTEGER DEFAULT 0, last_checkpoint_at TEXT, frontier_json TEXT);
+CREATE TABLE IF NOT EXISTS filesystem_entries(id INTEGER PRIMARY KEY, scan_run_id INTEGER NOT NULL REFERENCES scan_runs(id), parent_entry_id INTEGER REFERENCES filesystem_entries(id), source_root_id INTEGER REFERENCES source_roots(id), source_root TEXT NOT NULL, absolute_path TEXT NOT NULL, relative_path TEXT NOT NULL, name TEXT NOT NULL, suffix TEXT, entry_type TEXT NOT NULL, is_hidden INTEGER DEFAULT 0, is_symlink INTEGER DEFAULT 0, symlink_target TEXT, size_bytes INTEGER DEFAULT 0, device_id INTEGER, inode_or_file_id INTEGER, nlink INTEGER, mode INTEGER, owner TEXT, group_name TEXT, created_at REAL, modified_at REAL, metadata_changed_at REAL, accessed_at REAL, birth_time_available INTEGER DEFAULT 0, scan_status TEXT, read_error TEXT, first_seen_at TEXT DEFAULT CURRENT_TIMESTAMP, last_seen_at TEXT DEFAULT CURRENT_TIMESTAMP, UNIQUE(scan_run_id, relative_path));
 CREATE TABLE IF NOT EXISTS file_signatures(entry_id INTEGER PRIMARY KEY REFERENCES filesystem_entries(id) ON DELETE CASCADE, extension_mime TEXT, detected_mime TEXT, detected_type TEXT, signature_source TEXT, quick_hash TEXT, full_hash TEXT, hash_algorithm TEXT, hash_status TEXT, hash_error TEXT, full_hash_computed_at TEXT);
 CREATE TABLE IF NOT EXISTS classifications(entry_id INTEGER PRIMARY KEY REFERENCES filesystem_entries(id) ON DELETE CASCADE, classification TEXT NOT NULL, confidence REAL, primary_reason_code TEXT, reason_codes_json TEXT, rule_ids_json TEXT, explanation TEXT, canonical_entry_id INTEGER, requires_manual_approval INTEGER, classified_at TEXT DEFAULT CURRENT_TIMESTAMP);
 CREATE TABLE IF NOT EXISTS analysis_jobs(id INTEGER PRIMARY KEY, job_type TEXT, started_at TEXT DEFAULT CURRENT_TIMESTAMP, completed_at TEXT, status TEXT, processed_count INTEGER DEFAULT 0, error_count INTEGER DEFAULT 0, config_hash TEXT, error_summary TEXT);
@@ -24,7 +24,7 @@ CREATE TABLE IF NOT EXISTS exact_duplicate_groups(id INTEGER PRIMARY KEY, conten
 CREATE TABLE IF NOT EXISTS exact_duplicate_members(group_id INTEGER REFERENCES exact_duplicate_groups(id) ON DELETE CASCADE, entry_id INTEGER REFERENCES filesystem_entries(id) ON DELETE CASCADE, is_canonical INTEGER, readable INTEGER, PRIMARY KEY(group_id,entry_id));
 CREATE TABLE IF NOT EXISTS directory_summaries(entry_id INTEGER PRIMARY KEY REFERENCES filesystem_entries(id) ON DELETE CASCADE, recursive_file_count INTEGER, recursive_directory_count INTEGER, recursive_size_bytes INTEGER, unique_full_hash_count INTEGER, duplicate_file_count INTEGER, extension_distribution_json TEXT, earliest_modified_at REAL, latest_modified_at REAL, content_signature TEXT);
 CREATE TABLE IF NOT EXISTS move_transactions(id INTEGER PRIMARY KEY, transaction_run_id TEXT, source_entry_id INTEGER, source_path TEXT, destination_path TEXT, expected_size INTEGER, expected_hash TEXT, pre_move_hash TEXT, post_move_hash TEXT, status TEXT, started_at TEXT DEFAULT CURRENT_TIMESTAMP, completed_at TEXT, error TEXT, restored_at TEXT, restore_status TEXT);
-CREATE INDEX IF NOT EXISTS idx_entries_path ON filesystem_entries(relative_path); CREATE INDEX IF NOT EXISTS idx_entries_size ON filesystem_entries(size_bytes); CREATE INDEX IF NOT EXISTS idx_sig_full ON file_signatures(full_hash); CREATE INDEX IF NOT EXISTS idx_classification ON classifications(classification);
+CREATE INDEX IF NOT EXISTS idx_entries_path ON filesystem_entries(relative_path); CREATE INDEX IF NOT EXISTS idx_sig_full ON file_signatures(full_hash); CREATE INDEX IF NOT EXISTS idx_classification ON classifications(classification);
 CREATE TABLE IF NOT EXISTS source_roots(id INTEGER PRIMARY KEY, display_name TEXT NOT NULL, source_fingerprint TEXT NOT NULL UNIQUE, filesystem_uuid TEXT, volume_label TEXT, device_metadata_json TEXT NOT NULL DEFAULT '{}', first_seen_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP, last_seen_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP, last_mount_path TEXT NOT NULL, latest_complete_scan_run_id INTEGER REFERENCES scan_runs(id));
 CREATE TABLE IF NOT EXISTS content_objects(id INTEGER PRIMARY KEY, hash_algorithm TEXT NOT NULL, full_hash TEXT NOT NULL, size_bytes INTEGER NOT NULL, first_seen_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP, last_seen_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP, verification_status TEXT NOT NULL DEFAULT 'VERIFIED', readability_status TEXT NOT NULL DEFAULT 'UNKNOWN', content_kind TEXT, detected_mime TEXT, detected_type TEXT, analysis_state TEXT NOT NULL DEFAULT 'PENDING', created_by_scan_run_id INTEGER REFERENCES scan_runs(id), UNIQUE(hash_algorithm, full_hash, size_bytes));
 CREATE TABLE IF NOT EXISTS entry_content_links(entry_id INTEGER PRIMARY KEY REFERENCES filesystem_entries(id) ON DELETE CASCADE, content_object_id INTEGER NOT NULL REFERENCES content_objects(id), linked_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP, link_status TEXT NOT NULL, size_verified INTEGER NOT NULL DEFAULT 0, hash_verified INTEGER NOT NULL DEFAULT 0, entry_stat_fingerprint TEXT NOT NULL DEFAULT '');
@@ -138,6 +138,43 @@ CREATE VIEW IF NOT EXISTS image_similarity_members AS
 """
 
 
+def _keyset_pages(execute, sql, params, key_exprs, key_of, batch_size):
+    """Stream ``sql`` in keyset pages, closing the cursor between pages.
+
+    A single ``execute``+``fetchmany`` loop holds one read snapshot for its whole lifetime, and in
+    WAL that snapshot pins the log: a checkpoint cannot reclaim any frame newer than it, so on a
+    days-long stage the WAL grows to the size of everything the writer commits meanwhile. Paging by
+    a keyset — fetch a bounded page, close the cursor (releasing the snapshot), re-open past the last
+    key — lets a checkpoint advance between pages, so the WAL stays bounded.
+
+    ``sql`` must contain the literal ``{keyset}`` in its ``WHERE`` and carry no ``ORDER BY``/``LIMIT``
+    of its own (both are appended here). ``key_exprs`` are the ordering/comparison expressions and
+    ``key_of(row)`` returns the matching boundary tuple. The comparison is a row-value ``>``, so the
+    ordering must be ascending on exactly ``key_exprs``. Each page sees a *fresh* snapshot; for the
+    anti-join candidate queries this only ever removes rows already processed, which is correct.
+    """
+    order = ",".join(key_exprs)
+    cols = "(" + ",".join(key_exprs) + ")"
+    marks = "(" + ",".join("?" for _ in key_exprs) + ")"
+    boundary = None
+    while True:
+        if boundary is None:
+            query = sql.format(keyset="") + f" ORDER BY {order} LIMIT ?"
+            page_params = (*params, batch_size)
+        else:
+            query = sql.format(keyset=f" AND {cols} > {marks}") + f" ORDER BY {order} LIMIT ?"
+            page_params = (*params, *boundary, batch_size)
+        cursor = execute(query, page_params)
+        rows = cursor.fetchall()
+        cursor.close()
+        if not rows:
+            return
+        yield from rows
+        if len(rows) < batch_size:
+            return
+        boundary = key_of(rows[-1])
+
+
 class Database:
     # The insert path ran on SQLite's 2 MB default page cache while writing a multi-GB inventory,
     # so every B-tree descent above that went back to the OS. Cache is allocated lazily, so a
@@ -162,10 +199,17 @@ class Database:
     def connect(self) -> sqlite3.Connection:
         if self.conn is None:
             self.path.parent.mkdir(parents=True, exist_ok=True)
+            # A larger page shallows the B-trees of a multi-hundred-GB inventory, so a lookup touches
+            # fewer pages. It can only be chosen while the database is empty (before any page is
+            # allocated) and before WAL is enabled — an existing file keeps its page size until a
+            # VACUUM. Checked before connect(), which itself creates the file.
+            fresh = not self.path.exists() or self.path.stat().st_size == 0
             self.conn = sqlite3.connect(
                 self.path, check_same_thread=False, factory=counters.Connection
             )
             self.conn.row_factory = sqlite3.Row
+            if fresh:
+                self.conn.execute("PRAGMA page_size=8192")
             self.conn.execute("PRAGMA foreign_keys=ON")
             self.conn.execute("PRAGMA journal_mode=WAL")
             self.conn.execute("PRAGMA busy_timeout=5000")
@@ -248,6 +292,7 @@ class Database:
                 self._migrate_v8_to_v9(c)
         # After the migrations: the backfill above must settle before the index can be unique.
         self._ensure_duplicate_group_identity(c)
+        self._ensure_change_identity(c)
         self.refresh_current_inventory_views()
         c.commit()
 
@@ -353,11 +398,16 @@ class Database:
         c.execute(
             """CREATE VIEW current_exact_duplicate_groups AS
                SELECT g.id,g.content_object_id,g.full_hash,g.size_bytes,COUNT(*) member_count,
+                      COUNT(DISTINCT CASE
+                              WHEN e.device_id IS NOT NULL AND e.inode_or_file_id IS NOT NULL
+                              THEN e.device_id || ':' || e.inode_or_file_id
+                              ELSE 'entry:' || m.entry_id END) distinct_inode_count,
                       COALESCE(MAX(CASE WHEN m.entry_id=g.canonical_entry_id THEN m.entry_id END),
                                MIN(m.entry_id)) canonical_entry_id,
                       g.canonical_selection_reason,g.verified
                FROM exact_duplicate_groups g
                JOIN current_exact_duplicate_members m ON m.group_id=g.id
+               JOIN current_entries e ON e.id=m.entry_id
                GROUP BY g.id,g.content_object_id,g.full_hash,g.size_bytes,
                         g.canonical_selection_reason,g.verified
                HAVING COUNT(*)>=2"""
@@ -445,9 +495,16 @@ class Database:
         # quickstart stage a 58-hour operation.
         "CREATE INDEX IF NOT EXISTS idx_entries_run_parent_name ON filesystem_entries(scan_run_id,parent_entry_id,name)",
         # Rename detection looks up by (run, size); size alone matched across every historical scan.
+        # NOT partial: the rename queries join file_signatures rather than stating entry_type='file',
+        # so a partial predicate would make the planner ignore this index.
         "CREATE INDEX IF NOT EXISTS idx_entries_run_size ON filesystem_entries(scan_run_id,size_bytes)",
         # Reappearance-after-missing looks up a path within a source root.
         "CREATE INDEX IF NOT EXISTS idx_entries_source_path ON filesystem_entries(source_root_id,relative_path)",
+        # The exact-duplicate size funnel only ever groups files, and directory rows never enter it —
+        # so the bare-size index is partial on entry_type='file'. That skips the index write for every
+        # directory entry (a real fraction of a deep tree) and drops those rows from the index
+        # entirely. Every consumer states entry_type='file', which is what keeps the planner using it.
+        "CREATE INDEX IF NOT EXISTS idx_entries_size_file ON filesystem_entries(size_bytes) WHERE entry_type='file'",
     )
     # Byte-for-byte duplicates of a UNIQUE constraint's automatic index, or a redundant prefix of
     # one of the composites above: pure write amplification and ~365 MB on a real inventory.
@@ -463,6 +520,7 @@ class Database:
         "idx_entries_path",
         "idx_content_hash",  # == UNIQUE(hash_algorithm,full_hash,size_bytes)
         "idx_artifact_lookup",  # == UNIQUE(content_object_id,analyser_name,analyser_version,configuration_fingerprint)
+        "idx_entries_size",  # superseded by the partial idx_entries_size_file (files-only)
     )
 
     def _ensure_entry_indexes(self, c: sqlite3.Connection) -> None:
@@ -525,6 +583,7 @@ class Database:
                 "errors_seen": "INTEGER DEFAULT 0",
                 "bytes_seen": "INTEGER DEFAULT 0",
                 "last_checkpoint_at": "TEXT",
+                "frontier_json": "TEXT",
             },
         )
         self._ensure_columns(
@@ -539,6 +598,7 @@ class Database:
                 "symlink_target": "TEXT",
                 "device_id": "INTEGER",
                 "inode_or_file_id": "INTEGER",
+                "nlink": "INTEGER",
                 "mode": "INTEGER",
                 "owner": "TEXT",
                 "group_name": "TEXT",
@@ -699,6 +759,31 @@ class Database:
         c.execute(
             "CREATE UNIQUE INDEX IF NOT EXISTS idx_dupe_group_content "
             "ON exact_duplicate_groups(content_object_id) WHERE content_object_id IS NOT NULL"
+        )
+
+    @staticmethod
+    def _ensure_change_identity(c: sqlite3.Connection) -> None:
+        """A UNIQUE(scan_run_id, entry_id) index so the change diff can be windowed idempotently.
+
+        Windowing the change-classification and missing-detection INSERTs means a resumed run may
+        re-execute a window; ``INSERT OR IGNORE`` behind this index makes that a no-op instead of a
+        duplicate. Built once (skipped when it already exists, so the dedup scan is not paid every
+        open), after removing any pre-existing duplicate rows that would block the unique index —
+        the same shape as ``_ensure_duplicate_group_identity``. NULL entry ids are left alone (a
+        UNIQUE index treats them as distinct), so a change row without an entry never collides.
+        """
+        if c.execute(
+            "SELECT 1 FROM sqlite_master WHERE type='index' AND name='idx_changes_run_entry'"
+        ).fetchone():
+            return
+        c.execute(
+            """DELETE FROM scan_entry_changes WHERE entry_id IS NOT NULL AND id NOT IN (
+                 SELECT MIN(id) FROM scan_entry_changes WHERE entry_id IS NOT NULL
+                 GROUP BY scan_run_id, entry_id)"""
+        )
+        c.execute(
+            "CREATE UNIQUE INDEX IF NOT EXISTS idx_changes_run_entry "
+            "ON scan_entry_changes(scan_run_id, entry_id)"
         )
 
     #: Indexes that exist only for the duration of migration v8. Both statements below need one,
@@ -1046,6 +1131,18 @@ class Database:
         c.commit()
         self.checkpoint_wal("TRUNCATE")
 
+    def wal_bytes(self) -> int:
+        """Size of the write-ahead log file right now, in bytes (0 if none exists).
+
+        A settled database has a small or empty WAL; a WAL that grows without bound over a long
+        stage is the symptom that a reader's snapshot is pinning it (checkpoints cannot advance past
+        the oldest reader). Cheap enough to sample at every stage boundary, and only sampled there.
+        """
+        try:
+            return (self.path.parent / f"{self.path.name}-wal").stat().st_size
+        except OSError:
+            return 0
+
     def checkpoint_wal(self, mode: str = "PASSIVE") -> tuple[int, int, int]:
         if mode not in {"PASSIVE", "FULL", "RESTART", "TRUNCATE"}:
             raise ValueError("invalid WAL checkpoint mode")
@@ -1056,14 +1153,27 @@ class Database:
         return (int(row[0]), int(row[1]), int(row[2]))
 
     def vacuum(self) -> None:
-        """Vacuum only when the filesystem has enough free room for a temporary copy."""
+        """Vacuum only when the filesystem has enough free room for a temporary copy.
+
+        Also the one moment an existing database can adopt the larger page size (a fresh database
+        takes it at creation). The rebuild a VACUUM performs is what would rewrite every page at the
+        new size — but SQLite silently ignores a ``page_size`` change while the database is in WAL
+        mode, so the switch is a no-op there. To make it stick, drop to a rollback journal for the
+        duration: set the page size under ``journal_mode=DELETE``, VACUUM, then restore WAL. When the
+        page size already matches, this simply rebuilds and reclaims free pages as before.
+        """
         if (
             self.path.exists()
             and os.statvfs(self.path.parent).f_bavail * os.statvfs(self.path.parent).f_frsize
             < self.path.stat().st_size * 2
         ):
             raise OSError("insufficient free disk space for VACUUM")
-        self.connect().execute("VACUUM")
+        conn = self.connect()
+        conn.commit()  # journal_mode changes and VACUUM cannot run inside a transaction
+        conn.execute("PRAGMA journal_mode=DELETE")
+        conn.execute("PRAGMA page_size=8192")
+        conn.execute("VACUUM")
+        conn.execute("PRAGMA journal_mode=WAL")
 
     # The five overview charts, stored verbatim so the dashboard never re-runs these full-table
     # aggregates on a page load. Column order matches what DashboardService renders.
@@ -1117,6 +1227,13 @@ class Database:
                 ),
                 "unique_content_bytes": scalar(
                     "SELECT COALESCE(SUM(size_bytes),0) FROM current_content_objects"
+                ),
+                # Hard-link-honest: within a duplicate group, paths sharing one inode free nothing
+                # when deleted, so reclaimable counts distinct inodes beyond the keeper, not paths.
+                # A snapshot drive where every "copy" is a hard link reads as 0 reclaimable, rightly.
+                "reclaimable_bytes": scalar(
+                    "SELECT COALESCE(SUM(size_bytes*(distinct_inode_count-1)),0) "
+                    "FROM current_exact_duplicate_groups"
                 ),
                 "entries": scalar("SELECT COUNT(*) FROM current_entries"),
                 "content_objects": scalar("SELECT COUNT(*) FROM current_content_objects"),
@@ -1235,6 +1352,50 @@ class Database:
             c.rollback()
             raise
 
+    def execute_windowed(
+        self,
+        template: str,
+        params: tuple,
+        *,
+        key: str,
+        bounds: tuple[int | None, int | None],
+        chunk: int = 250_000,
+        on_window=None,
+    ) -> None:
+        """Run one set-based statement in id-windows, committing after each.
+
+        ``template`` must contain the literal ``{window}`` where an ``AND {key} BETWEEN ? AND ?``
+        clause is spliced; ``params`` are the statement's own parameters, in order, with the two
+        window bounds appended per window. This is how the scan epilogue's O(entries) statements —
+        parent linking, change classification, signature copy-forward, missing detection — become a
+        sequence of bounded, committed, cancellable steps instead of one multi-hour transaction that
+        pins the WAL, defers Ctrl-C, and rolls back hours of work if it fails near the end. The
+        windowed statements are idempotent (a real upsert, or ``INSERT OR IGNORE`` behind a unique
+        index), so re-running a window on resume changes nothing.
+
+        ``on_window`` is invoked after each window commits — the scanner passes its cancellation
+        check, so a stop lands within one window rather than after the whole statement.
+        """
+        lo, hi = bounds
+        if lo is None or hi is None:
+            return
+        sql = template.format(window=f" AND {key} BETWEEN ? AND ?")
+        conn = self.connect()
+        start, hi = int(lo), int(hi)
+        while start <= hi:
+            end = min(start + max(1, chunk) - 1, hi)
+            conn.execute(sql, (*params, start, end))
+            conn.commit()
+            if on_window is not None:
+                on_window()
+            start = end + 1
+
+    def iter_keyset(self, sql, params, *, key_exprs, key_of, batch_size: int = 5_000):
+        """Stream ``sql`` in keyset pages on the writer connection. See :func:`_keyset_pages`."""
+        if batch_size < 1:
+            raise ValueError("batch_size must be positive")
+        yield from _keyset_pages(self.connect().execute, sql, params, key_exprs, key_of, batch_size)
+
     def execute(self, sql: str, params: tuple | dict = ()) -> sqlite3.Cursor:
         return self.connect().execute(sql, params)
 
@@ -1327,3 +1488,16 @@ class _ReadDB:
         cursor = self._db._read_conn().execute(sql, params)
         while batch := cursor.fetchmany(batch_size):
             yield from batch
+
+    def iter_keyset(self, sql, params, *, key_exprs, key_of, batch_size: int = 5_000):
+        """Stream ``sql`` in keyset pages on the thread's read connection. See :func:`_keyset_pages`.
+
+        The read connection is reused, but each page is a fresh statement, so no snapshot is held
+        across pages — which is the whole point: a long identity or artifact stage no longer pins the
+        WAL while the writer commits behind it.
+        """
+        if batch_size < 1:
+            raise ValueError("batch_size must be positive")
+        yield from _keyset_pages(
+            self._db._read_conn().execute, sql, params, key_exprs, key_of, batch_size
+        )

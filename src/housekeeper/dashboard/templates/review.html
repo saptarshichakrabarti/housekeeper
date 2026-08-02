@@ -1,12 +1,22 @@
 <p>Cursor-paginated review queue. Decisions are recorded to a review session; this page never moves files.</p>
 
+<p class="review-scope">
+{% if actionable %}
+  <strong>Items that need review</strong> — candidates with no decision yet.
+  <a href="{{ show_all_url }}">Show all files</a>
+{% else %}
+  <strong>{% if narrowed %}Filtered view{% else %}All files{% endif %}</strong> — the full inventory, including kept and decided items.
+  <a href="{{ actionable_url }}">Only items that need review</a>
+{% endif %}
+</p>
+
 <form class="filter-bar" action="/review" method="get" hx-get="/review" hx-target="main" hx-select="main" hx-swap="outerHTML" hx-push-url="true">
   <h2>Filter review</h2>
   <div class="filter-grid">
     <label>Classification
       <select name="classification">
         <option value="">Any</option>
-        {% for option in classifications %}<option value="{{ option }}"{% if filters.classification == option %} selected{% endif %}>{{ option }}</option>{% endfor %}
+        {% for option in classifications %}<option value="{{ option }}"{% if filters.classification == option %} selected{% endif %}>{{ option | classification_label }}</option>{% endfor %}
       </select>
     </label>
     <label>Extension <input name="extension" value="{{ filters.extension or '' }}" placeholder=".pdf"></label>
@@ -43,9 +53,13 @@
   <span><kbd>4</kbd> more analysis</span><span><kbd>5</kbd> approve for review</span><span><kbd>6</kbd> reject</span>
 </details>
 <div id="review-announcer" class="sr-only" aria-live="polite"></div>
-<aside id="detail-drawer" aria-live="polite">Select an entry for details.</aside>
+<div id="detail-backdrop" class="detail-backdrop" hidden></div>
+<aside id="detail-panel" class="detail-panel" aria-hidden="true" aria-label="Entry details">
+  <div class="detail-panel-head"><button type="button" class="detail-panel-close" aria-label="Close details">Close ×</button></div>
+  <div id="detail-drawer" aria-live="polite">Select an entry for details.</div>
+</aside>
 <div class="table-scroll">
 <table class="review-table"><thead><tr><th>ID</th><th>Preview</th><th>Name</th><th>Path</th><th>Source</th><th>Top level</th><th>Classification</th><th>Decision</th><th>Reasons</th><th>Notes</th><th>Size</th><th>Modified</th><th>Flags</th></tr></thead>
-<tbody>{% for row in rows %}<tr class="review-row" tabindex="0" data-entry-url="/fragments/entry/{{ row.entry_id }}" aria-label="{{ row.name }}, {{ row.size_bytes | filesizeformat | striptags }}"><td><button class="review-detail-button" hx-get="/fragments/entry/{{ row.entry_id }}" hx-target="#detail-drawer" aria-label="Inspect {{ row.name }}">{{ row.entry_id | thousands }}</button></td><td>{% if row.image_group_id and row.image_group_id in available_image_groups %}<a href="/images/{{ row.image_group_id }}"><img class="review-thumbnail" src="/contact-sheets/{{ row.image_group_id }}.jpg" alt="Visual comparison available"></a>{% else %}<span aria-hidden="true">—</span>{% endif %}</td><td>{{ row.name }}</td><td>{{ row.relative_path }}</td><td>{{ row.source_root }}</td><td>{{ row.top_level_directory }}</td><td>{{ row.classification or '' }}</td><td>{{ row.decision or '' }}</td><td>{{ row.reason_codes }}</td><td>{{ row.notes }}</td><td>{{ row.size_bytes | filesizeformat }}</td><td>{{ row.modified_at | relativetime }}</td><td>{% if row.duplicate_member %}duplicate {% endif %}{% if row.project_member %}project {% endif %}{% if row.stale %}stale{% endif %}</td></tr>{% else %}<tr><td class="empty-state" colspan="13">No matching review entries. Adjust the filters{% if has_run_page %}, or run analyse → exact-duplicates from the <a href="/control">Run page</a>{% endif %}.</td></tr>{% endfor %}</tbody></table>
+<tbody>{% for row in rows %}<tr class="review-row" tabindex="0" data-entry-url="/fragments/entry/{{ row.entry_id }}" aria-label="{{ row.name }}, {{ row.size_bytes | filesizeformat | striptags }}"><td><button class="review-detail-button" hx-get="/fragments/entry/{{ row.entry_id }}" hx-target="#detail-drawer" aria-label="Inspect {{ row.name }}">{{ row.entry_id | thousands }}</button></td><td>{% if row.image_group_id and row.image_group_id in available_image_groups %}<a href="/images/{{ row.image_group_id }}"><img class="review-thumbnail" src="/contact-sheets/{{ row.image_group_id }}.jpg" alt="Visual comparison available"></a>{% else %}<span aria-hidden="true">—</span>{% endif %}</td><td>{{ row.name }}</td><td>{{ row.relative_path }}</td><td>{{ row.source_root }}</td><td>{{ row.top_level_directory }}</td><td>{% if row.classification %}<span title="{{ row.classification }}">{{ row.classification | classification_label }}</span>{% endif %}</td><td>{% if row.decision %}<span title="{{ row.decision }}">{{ row.decision | decision_label }}</span>{% endif %}</td><td>{% for label in row.reason_codes | reason_labels %}<span class="reason-badge">{{ label }}</span>{% endfor %}</td><td>{{ row.notes }}</td><td>{{ row.size_bytes | filesizeformat }}</td><td>{{ row.modified_at | relativetime }}</td><td>{% if row.duplicate_member %}duplicate {% endif %}{% if row.project_member %}project {% endif %}{% if row.stale %}stale{% endif %}</td></tr>{% else %}<tr><td class="empty-state" colspan="13">{% if not any_entries %}No files indexed yet. Run a scan{% if has_run_page %} from the <a href="/control">Run page</a>{% endif %} to get started.{% elif has_active_filters %}No entries match these filters. <a href="{{ actionable_url if not actionable else '/review' }}">Clear filters</a>.{% elif actionable %}Nothing needs review right now — no undecided candidates. <a href="{{ show_all_url }}">Show all files</a>{% if has_run_page %}, or run analysis from the <a href="/control">Run page</a>{% endif %}.{% else %}No entries to show.{% endif %}</td></tr>{% endfor %}</tbody></table>
 </div>
 {% if next_id %}<p><a href="{{ next_url }}">Next page</a></p>{% endif %}

@@ -74,6 +74,14 @@ HOT_PATH_QUERIES = [
         forbids=("SCAN e", "SCAN l", "SCAN entry_content_links"),
     ),
     Case(
+        # 3.3: the duplicate-size funnel must resolve through the partial (files-only) size index,
+        # not a full-table scan. A COVERING INDEX scan of it *is* a "SCAN" line, so this asserts the
+        # index by name rather than forbidding the word.
+        "size_funnel_groups",
+        "SELECT size_bytes FROM filesystem_entries WHERE entry_type='file' GROUP BY size_bytes HAVING COUNT(*)>1",
+        requires=("idx_entries_size_file",),
+    ),
+    Case(
         # Visiting every unlinked file is correct here; the anti-join side must not be a scan.
         "unlinked_anti_join",
         """SELECT e.id FROM filesystem_entries e

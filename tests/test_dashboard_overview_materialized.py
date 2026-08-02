@@ -92,6 +92,38 @@ def test_overview_view_model_is_ttl_cached(database, config, fixture_root):
     assert service.overview() is not first
 
 
+def test_overview_is_fresh_right_after_a_scan(database, config, fixture_root):
+    # The scanner materializes the summaries at scan end, so nothing has happened since: not stale.
+    _scan(database, config, fixture_root)
+    assert DashboardService(database.reader()).overview().stale is False
+
+
+def test_overview_goes_stale_when_a_job_finishes_after_the_last_refresh(database, config, fixture_root):
+    _scan(database, config, fixture_root)
+    service = DashboardService(database.reader())
+    assert service.overview().stale is False
+
+    # A job that settled *after* the summaries were materialized makes the overview stale — the
+    # displayed numbers predate it. A far-future timestamp beats the refresh regardless of clock.
+    database.connect().execute(
+        "INSERT INTO jobs(job_type,status,completed_at) VALUES('CONTENT_ANALYSIS','COMPLETED','2099-01-01 00:00:00')"
+    )
+    database.connect().commit()
+    service.invalidate_overview()
+    assert service.overview().stale is True
+
+
+def test_overview_not_stale_from_activity_that_predates_the_refresh(database, config, fixture_root):
+    # A job that completed in the distant past (before the just-materialized summaries) is not a
+    # staleness signal — only activity newer than the refresh counts.
+    _scan(database, config, fixture_root)
+    database.connect().execute(
+        "INSERT INTO jobs(job_type,status,completed_at) VALUES('CONTENT_ANALYSIS','COMPLETED','2000-01-01 00:00:00')"
+    )
+    database.connect().commit()
+    assert DashboardService(database.reader()).overview().stale is False
+
+
 def test_overview_before_any_refresh_is_empty_not_a_crash(database):
     # A brand-new database has no summaries yet: the overview must render zeros, not scan or fail.
     model = DashboardService(database.reader()).overview()

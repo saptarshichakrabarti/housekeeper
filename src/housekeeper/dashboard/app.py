@@ -33,7 +33,16 @@ def create_app(
 
     from ..graph.builder import build_projection
     from ..review.decisions import record_decision
-    from .filters import ReviewFilter, filesizeformat, relativetime, thousands
+    from .filters import (
+        ReviewFilter,
+        classification_label,
+        decision_label,
+        filesizeformat,
+        job_type_label,
+        reason_labels,
+        relativetime,
+        thousands,
+    )
     from .services import DashboardService
 
     csrf_token = secrets.token_urlsafe(24)
@@ -56,6 +65,9 @@ def create_app(
         filesizeformat=filesizeformat,
         thousands=thousands,
         relativetime=relativetime,
+        classification_label=classification_label,
+        decision_label=decision_label,
+        reason_labels=reason_labels,
     )
     app = FastAPI(title="drive_housekeeper", docs_url=None, redoc_url=None)
     app.mount("/static", StaticFiles(directory=static_dir), name="static")
@@ -374,6 +386,22 @@ def create_app(
     def _stages_row_id(job_id: int) -> str:
         return f"job-stages-{job_id}"
 
+    def results_cell(row) -> str:
+        """Outcome counts, showing only the non-zero parts so a clean run isn't three zero columns.
+
+        Errors are called out; a job with nothing to report yet (or a pure zero row) renders empty.
+        """
+        parts = []
+        if int(row["success_count"] or 0):
+            parts.append(f"{escape(thousands(row['success_count']))} ok")
+        if int(row["skip_count"] or 0):
+            parts.append(f"{escape(thousands(row['skip_count']))} skipped")
+        if int(row["error_count"] or 0):
+            parts.append(
+                f"<span class='count-error'>{escape(thousands(row['error_count']))} errors</span>"
+            )
+        return " · ".join(parts)
+
     def jobs_table(rows, medians: dict[str, float] | None = None, roots: set[int] | None = None) -> str:
         headings = [
             "id",
@@ -381,12 +409,26 @@ def create_app(
             "status",
             "progress",
             "duration",
-            "success_count",
-            "skip_count",
-            "error_count",
+            "results",
             "updated_at",
         ]
-        header = "".join(f"<th>{escape(heading)}</th>" for heading in [*headings, "controls"])
+        # Readable column headers, and one "results" column in place of three near-always-zero
+        # success/skip/error columns — those now collapse into a single cell showing only what is
+        # non-zero (see results_cell), so a clean run reads as "1,204 ok" rather than three columns.
+        heading_labels = {
+            "id": "ID",
+            "job_type": "Stage",
+            "status": "Status",
+            "progress": "Progress",
+            "duration": "Duration",
+            "results": "Results",
+            "updated_at": "Updated",
+            "controls": "",
+        }
+        header = "".join(
+            f"<th>{escape(heading_labels.get(heading, heading))}</th>"
+            for heading in [*headings, "controls"]
+        )
         body = ""
         for row in rows:
             parent = row["parent_job_id"]
@@ -397,13 +439,16 @@ def create_app(
                     cells += f"<td>{progress_cell(row)}</td>"
                 elif heading == "duration":
                     cells += f"<td>{duration_cell(row, medians)}</td>"
+                elif heading == "results":
+                    cells += f"<td>{results_cell(row)}</td>"
                 elif heading == "job_type" and expandable:
                     # A pipeline root: its stages are one click away, from data already on the rows.
                     # The click replaces this row's own empty stages row (below) rather than
                     # inserting a new one, so clicking twice refreshes the table instead of
                     # stacking a second copy of it.
                     cells += (
-                        f"<td>{display_cell(heading, row[heading])} "
+                        f"<td title='{escape(str(row[heading]))}'>"
+                        f"{escape(job_type_label(row[heading]))} "
                         f"<button hx-get='/fragments/jobs/{int(row['id'])}/stages' "
                         f"hx-target='#{_stages_row_id(int(row['id']))}' "
                         f"hx-swap='outerHTML'>stages</button></td>"
@@ -414,7 +459,13 @@ def create_app(
                     # escalate to the pipeline root).
                     cells += (
                         f"<td title='stage of job #{int(parent)}; controls act on the whole run'>"
-                        f"↳ {display_cell(heading, row[heading])}</td>"
+                        f"↳ {escape(job_type_label(row[heading]))}</td>"
+                    )
+                elif heading == "job_type":
+                    # A standalone job: readable stage name, raw code kept in a tooltip.
+                    cells += (
+                        f"<td title='{escape(str(row[heading]))}'>"
+                        f"{escape(job_type_label(row[heading]))}</td>"
                     )
                 else:
                     cells += f"<td>{display_cell(heading, row[heading])}</td>"
@@ -561,7 +612,14 @@ def create_app(
         top_level_directory: str | None = None,
         modified_after: float | None = None,
         modified_before: float | None = None,
+        show_all: bool = False,
     ):
+        # Actionable-by-default: an unfiltered visit lands on the items that still need a decision —
+        # review candidates with none recorded — not the whole drive. An explicit classification,
+        # decision, protected or stale filter means the user asked for a specific slice, so honour
+        # it; `show_all=true` opts out of the default entirely.
+        narrowed = any(v is not None for v in (classification, decision, protected, stale))
+        actionable = not show_all and not narrowed
         filters = ReviewFilter(
             classification=classification,
             suffix=extension,
@@ -577,6 +635,7 @@ def create_app(
             top_level_directory=top_level_directory,
             minimum_age_timestamp=modified_after,
             maximum_age_timestamp=modified_before,
+            actionable=actionable,
         )
         rows = service.review_rows(filters, limit, after_id)
         filter_values: dict[str, object] = {
@@ -598,6 +657,9 @@ def create_app(
         active_params = {
             key: value for key, value in filter_values.items() if value is not None and value != ""
         }
+        # Toggle between the actionable default and the whole inventory, preserving any other filters.
+        show_all_url = "/review?" + urlencode({**active_params, "show_all": "true"})
+        actionable_url = "/review" + (f"?{urlencode(active_params)}" if active_params else "")
         chip_labels = {
             "classification": "Classification",
             "extension": "Extension",
@@ -626,6 +688,8 @@ def create_app(
             )
         next_id = rows[-1].entry_id if rows else None
         next_params = {"limit": limit, **active_params, "after_id": next_id}
+        if show_all:  # keep "all files" sticky across pages; the default needs no marker
+            next_params["show_all"] = "true"
         classifications = [
             str(row["classification"])
             for row in reader.fetch_all(
@@ -645,6 +709,14 @@ def create_app(
             next_id=next_id,
             next_url=f"/review?{urlencode(next_params)}" if next_id else "",
             filters=filter_values,
+            actionable=actionable,
+            narrowed=narrowed,
+            show_all_url=show_all_url,
+            actionable_url=actionable_url,
+            # Cheap existence probe (LIMIT 1) so an empty queue can tell "nothing scanned" apart
+            # from "nothing needs review" apart from "these filters match nothing".
+            any_entries=bool(reader.fetch_one("SELECT 1 FROM current_entries LIMIT 1")),
+            has_active_filters=bool(chips),
             chips=chips,
             classifications=classifications,
             top_level_directories=top_level_directories,
@@ -678,6 +750,17 @@ def create_app(
             )
         )
 
+    def open_review_sessions() -> list[dict]:
+        """Sessions a decision can still be recorded against — newest first. Shared by the wizard
+        and the entry drawer so both offer the same pickable set instead of a raw id field."""
+        return [
+            dict(row)
+            for row in reader.fetch_all(
+                "SELECT id,name,status FROM review_sessions WHERE status NOT IN "
+                "('LOCKED','EXPORTED','ARCHIVED') ORDER BY updated_at DESC LIMIT 50"
+            )
+        ]
+
     @app.get("/fragments/entry/{entry_id}", response_class=HTMLResponse)
     def entry_detail_fragment(entry_id: Annotated[int, ApiPath(ge=1)]):
         entry = reader.fetch_one(
@@ -699,6 +782,8 @@ def create_app(
                 entry=dict(entry),
                 artifacts=[dict(artifact) for artifact in artifacts],
                 has_run_page=runner is not None,
+                sessions=open_review_sessions(),
+                read_only=read_only,
             )
         )
 
@@ -783,13 +868,7 @@ def create_app(
             active_path="wizard",
             rules=RULES,
             read_only=read_only,
-            sessions=[
-                dict(row)
-                for row in reader.fetch_all(
-                    "SELECT id,name,status FROM review_sessions WHERE status NOT IN "
-                    "('LOCKED','EXPORTED','ARCHIVED') ORDER BY updated_at DESC LIMIT 50"
-                )
-            ],
+            sessions=open_review_sessions(),
         )
 
     @app.get("/fragments/wizard/preview", response_class=HTMLResponse)
@@ -872,8 +951,8 @@ def create_app(
         if sort not in order_by:
             raise HTTPException(422, "invalid duplicate sort")
         rows = reader.fetch_all(
-            f"""SELECT g.id,g.full_hash,g.member_count,g.size_bytes,
-                       g.size_bytes*(g.member_count-1) reclaimable_bytes,g.canonical_entry_id,
+            f"""SELECT g.id,g.full_hash,g.member_count,g.size_bytes,g.distinct_inode_count,
+                       g.size_bytes*(g.distinct_inode_count-1) reclaimable_bytes,g.canonical_entry_id,
                        (SELECT rg.id FROM current_exact_duplicate_members dm
                         JOIN entry_content_links ecl ON ecl.entry_id=dm.entry_id
                         JOIN current_relationship_group_members rgm ON rgm.content_object_id=ecl.content_object_id
@@ -1637,16 +1716,18 @@ def create_app(
             "ORDER BY relative_path LIMIT ?",
             (f"{escaped_prefix}%", f"{escaped_prefix}%", limit),
         )
-        body = (
-            f"<p>{thousands(len(rows))} matches for <strong>{escape(q)}</strong>. "
-            "Search is prefix-based and read-only.</p>"
-            + rows_table(
-                rows,
-                ["id", "name", "relative_path", "size_bytes", "modified_at"],
-                "No paths begin with that search. Try a shorter prefix.",
-            )
+        # Each result is inspectable via the shared drawer, and hitting the limit is stated plainly
+        # rather than silently dropping matches.
+        return template_page(
+            "Search",
+            "search.html",
+            q=q,
+            rows=[dict(row) for row in rows],
+            count=len(rows),
+            limit=limit,
+            truncated=len(rows) == limit,
+            active_path="search",
         )
-        return page("Search", body, active_path="search")
 
     @app.get("/api/overview")
     def api_overview():

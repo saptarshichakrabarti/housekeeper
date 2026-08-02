@@ -3,17 +3,16 @@
 import gzip
 import hashlib
 import json
-import time
-from collections.abc import Callable
+from collections.abc import Callable, Mapping
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
 from ..config import AppConfig, config_fingerprint, performance_profile
 from ..core import counters
+from ..core.identity import ensure_content_identity, stream_identity_candidates
 from ..core.worker_pool import bounded_map
 from ..database import Database
-from ..hashing import compute_identity
 from ..jobs import JobCancelled, JobPaused, check_cancelled, create_job, update_job
 from .archives import inspect_archive
 from .documents import extract_document
@@ -72,8 +71,6 @@ REGISTRY = (
 )
 
 
-#: Identity writes per transaction. Bounded so an interrupted run loses at most this much work.
-IDENTITY_BATCH_SIZE = 500
 #: Artifact writes per transaction — smaller, because each one cost a parser run.
 ARTIFACT_BATCH_SIZE = 50
 
@@ -169,29 +166,6 @@ def _work_plan(
     )
 
 
-#: Below this the elapsed time is dominated by pool startup rather than by the storage, so the
-#: quotient says nothing about the drive and is not recorded.
-THROUGHPUT_SAMPLE_MINIMUM_BYTES = 32 * 1024 * 1024
-
-
-def _record_identity_throughput(database: Database, hashed_bytes: int, seconds: float) -> None:
-    """Attribute this stage's hashing throughput to the source roots it read from.
-
-    Attributed per source root because that is what the observation is *about* — two drives in one
-    workspace have different speeds, and a single number for the workspace would average an SSD with
-    a network share into a profile that is wrong for both.
-    """
-    if hashed_bytes < THROUGHPUT_SAMPLE_MINIMUM_BYTES or seconds <= 0:
-        return
-    rate = hashed_bytes / seconds
-    for row in database.fetch_all(
-        """SELECT DISTINCT r.source_root_fingerprint AS fingerprint
-           FROM scan_runs r JOIN source_roots s ON s.source_fingerprint=r.source_root_fingerprint
-           WHERE s.latest_complete_scan_run_id=r.id"""
-    ):
-        database.record_hash_throughput(str(row["fingerprint"]), rate)
-
-
 def _count(reader, sql: str, params: tuple) -> int:
     row = reader.fetch_one(f"SELECT COUNT(*) AS n FROM ({sql})", params)
     return int(row["n"]) if row else 0
@@ -261,11 +235,19 @@ def _run_content_analysis(
         raise ValueError(f"unknown source id {scope.source_id}")
 
     entry_sql, entry_params = scope.entry_id_sql()
-    candidates = database.reader().iter_rows(
-        f"""SELECT e.id,e.scan_run_id,e.absolute_path,e.suffix FROM filesystem_entries e
+    # Ordered so inode-mates are adjacent: on a first full scan of a snapshot-style backup drive,
+    # this is what lets the identity service read a hard-linked file once instead of once per
+    # snapshot. Content-object id allocation order is not semantic (grouping orders by digest), so
+    # the change is invisible downstream.
+    # Keyset-paged so a multi-hour hashing stage never holds one read snapshot (which would pin the
+    # WAL against the identity writer's per-batch commits); the ordering that keeps inode-mates
+    # adjacent for hard-link reuse is the keyset's own order.
+    candidates = stream_identity_candidates(
+        database.reader(),
+        f"""SELECT e.id,e.scan_run_id,e.absolute_path,e.suffix,e.size_bytes,e.device_id,e.inode_or_file_id,e.nlink
+            FROM filesystem_entries e
             LEFT JOIN entry_content_links l ON l.entry_id=e.id
-            WHERE e.entry_type='file' AND l.entry_id IS NULL AND e.id IN ({entry_sql})
-            ORDER BY e.id""",
+            WHERE e.entry_type='file' AND l.entry_id IS NULL AND e.id IN ({entry_sql}){{keyset}}""",
         entry_params,
     )
     eligible = (
@@ -274,72 +256,49 @@ def _run_content_analysis(
         if analyser_name in (None, "all") or entry["suffix"] in suffixes
     )
 
-    hashing = config.section("hashing")
+    # A denominator for the identity phase so a multi-day hash stage shows a percentage rather than a
+    # bare climbing count. Counts unlinked files in scope: exact for an all-analyser pass (the common
+    # case), a slight over-estimate for a single narrow analyser whose suffix filter the service
+    # applies as it streams. The per-spec parse phase below revises the estimate to its own work.
+    if job_id:
+        identity_total = _count(
+            database.reader(),
+            f"""SELECT e.id FROM filesystem_entries e
+                LEFT JOIN entry_content_links l ON l.entry_id=e.id
+                WHERE e.entry_type='file' AND l.entry_id IS NULL AND e.id IN ({entry_sql})""",
+            entry_params,
+        )
+        update_job(database, job_id, total_estimate=identity_total, current_item="identity")
+    # Evict the page cache after hashing content the parse stage will never open — a file above the
+    # analysis size ceiling, or a suffix no analyser handles — so a long scan of large media does not
+    # push the database's own hot pages out of cache. Anything a parser *will* re-read is left cached.
+    parse_ceiling = int(config.section("scanner")["max_file_size_for_content_analysis"])
+    parseable_suffixes = set().union(*(spec.suffixes for spec in REGISTRY))
 
-    def hash_entry(entry: dict[str, Any]):
-        try:
-            # One pass over the file for both digests. Two calls here meant every newly identified
-            # file was read twice, and the quick digest's bytes are a subset of the full digest's.
-            full, quick = compute_identity(
-                Path(entry["absolute_path"]),
-                hashing["algorithm"],
-                hashing["full_hash_block_bytes"],
-                hashing["quick_hash_chunk_bytes"],
-                hashing["quick_hash_middle_samples"],
-            )
-            return entry, quick, full
-        except OSError:
-            return entry, None, None
+    def _drop_after_hash(entry: Mapping[str, Any]) -> bool:
+        size = entry.get("size_bytes")
+        if size is not None and int(size) > parse_ceiling:
+            return True
+        suffix = (entry.get("suffix") or "").lower()
+        return suffix not in parseable_suffixes
 
-    profile = performance_profile(config)
-    queue_size = min(
-        1_000, max(1, int(config.section("performance")["database_writer_queue_size"]))
+    # Identity — full+quick digest, content-object link, signature row — for every eligible file,
+    # hashed across `full_hash_workers` threads by the one shared service. It commits per batch (the
+    # per-spec sweep below reads the work plan on an independent read-only connection, so identity
+    # must be durable before it starts) and records this source's hashing throughput so
+    # `storage_profile: auto` can prefer a measurement over a path guess next run.
+    identity = ensure_content_identity(
+        database,
+        config,
+        eligible,
+        job_id,
+        workers=int(performance_profile(config)["full_hash_workers"]),
+        record_errors=False,
+        drop_cache=_drop_after_hash,
+        progress_phase="identity",
     )
-    # Throughput of this stage, recorded per source root so `storage_profile: auto` can prefer a
-    # measurement over a path guess on the next run. Wall clock is only meaningful over enough bytes
-    # to swamp process startup, so it is applied at the end and only if the sample is big enough.
-    identity_started = time.perf_counter()
-    hashed_bytes = 0
-    for entry, quick, hashed in bounded_map(
-        hash_entry, eligible, int(profile["full_hash_workers"]), queue_size
-    ):
-        if job_id:
-            check_cancelled(database, job_id)
-        try:
-            if hashed is None:
-                counts["errors"] += 1
-                continue
-            if not hashed.stable or not hashed.digest:
-                counts["errors"] += 1
-                continue
-            content_id = database.get_or_create_content_object(
-                config.section("hashing")["algorithm"],
-                hashed.digest,
-                hashed.size,
-                entry["scan_run_id"],
-            )
-            database.link_entry_content(entry["id"], content_id, "")
-            database.connect().execute(
-                "INSERT OR REPLACE INTO file_signatures(entry_id,quick_hash,full_hash,hash_algorithm,hash_status,full_hash_computed_at) VALUES(?,?,?,?,?,CURRENT_TIMESTAMP)",
-                (
-                    entry["id"],
-                    quick.digest if quick and quick.stable else None,
-                    hashed.digest,
-                    config.section("hashing")["algorithm"],
-                    "OK",
-                ),
-            )
-            counts["hashed"] += 1
-            hashed_bytes += int(hashed.size or 0)
-            # One commit per batch, not per file. The per-spec sweep below reads the work plan on
-            # an independent read-only connection, so identity must be committed before it starts —
-            # and the loop's own progress must survive an interruption.
-            if counts["hashed"] % IDENTITY_BATCH_SIZE == 0:
-                database.connect().commit()
-        except OSError:
-            counts["errors"] += 1
-    _record_identity_throughput(database, hashed_bytes, time.perf_counter() - identity_started)
-    database.connect().commit()
+    counts["hashed"] += identity["hashed"]
+    counts["errors"] += identity["errors"]
     # One pool for the whole stage. Workers persist across parses, so the 8–11 ms of process
     # creation that used to precede every single parse is paid once per worker instead.
     parsers = ParserPool(
@@ -348,6 +307,11 @@ def _run_content_analysis(
         int(config.section("performance")["parser_memory_limit_mb"]),
     )
     artifacts_since_commit = 0
+    # The parse phase's own progress denominator, accumulated as each spec is planned. Without this
+    # the job keeps the *identity* phase's total, and the bar reads nonsense ("100% 40/1") the moment
+    # the parse loop processes more objects than the identity phase had files left to hash. Mirrors
+    # the exact-duplicates precedent: a job with two phases revises its total at the phase boundary.
+    parse_planned = 0
     try:
         for spec in wanted:
             # Hoisted out of the per-row loop below, where it re-hashed the whole configuration once
@@ -375,6 +339,14 @@ def _run_content_analysis(
             counts["skipped"] += max(0, eligible_total - pending)
             counters.count("artifact_cache_hits", max(0, eligible_total - pending))
             counters.count("artifact_cache_misses", pending)
+            parse_planned += eligible_total
+            if job_id:
+                update_job(
+                    database,
+                    job_id,
+                    total_estimate=parse_planned,
+                    current_item=f"analysing {spec.name}",
+                )
             timeout = min(
                 spec.timeout_seconds,
                 int(config.section("performance")["parser_timeout_seconds"]),

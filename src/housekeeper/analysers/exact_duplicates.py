@@ -1,10 +1,11 @@
 """Exact duplicate analysis using a size → verified-content funnel without large lists."""
 
-from pathlib import Path
+from collections.abc import Iterable, Mapping
+from typing import Any, cast
 
 from ..config import AppConfig
+from ..core.identity import ensure_content_identity, stream_identity_candidates
 from ..database import Database
-from ..hashing import compute_full_hash
 from ..jobs import check_cancelled, checkpoint, update_job
 from ..relationships import invalidate_relationships, upsert_relationship
 from .scope import AnalyserScope, resolve_scope
@@ -45,53 +46,29 @@ def _ensure_candidate_links(
             total_estimate=int(total["n"]) if total else 0,
             current_item="hashing candidates",
         )
-    sizes = database.iter_rows(
-        "SELECT size_bytes FROM filesystem_entries WHERE entry_type='file' "
-        f"AND id IN ({entry_sql}) GROUP BY size_bytes HAVING COUNT(*)>1",
-        scope_params,
+    # The whole funnel as one stream, hashed by the shared parallel identity service rather than one
+    # file at a time on this thread — this used to run *before* content analysis, so on a first scan
+    # its serial loop did the bulk of the byte volume while the worker pool sat idle. Ordered so
+    # inode-mates are adjacent, which is what lets the service read a hard-linked backup copy once.
+    # Streamed on a read-only connection while the service writes on the writer connection.
+    stream = stream_identity_candidates(
+        database.reader(),
+        f"""SELECT e.id,e.scan_run_id,e.absolute_path,e.size_bytes,e.device_id,e.inode_or_file_id,e.nlink
+            {candidates} AND e.size_bytes IN
+              (SELECT size_bytes FROM filesystem_entries WHERE entry_type='file'
+               AND id IN ({entry_sql}) GROUP BY size_bytes HAVING COUNT(*)>1){{keyset}}""",
+        (*scope_params, *scope_params),
     )
-    processed = 0
-    for size_row in sizes:
-        for row in database.iter_rows(
-            f"""SELECT e.id,e.scan_run_id,e.absolute_path,e.size_bytes {candidates}
-                AND e.size_bytes=? ORDER BY e.id""",
-            (*scope_params, size_row["size_bytes"]),
-        ):
-            if job_id:
-                check_cancelled(database, job_id)
-            result = compute_full_hash(
-                Path(row["absolute_path"]),
-                config.section("hashing")["algorithm"],
-                config.section("hashing")["full_hash_block_bytes"],
-            )
-            database.connect().execute(
-                "INSERT OR REPLACE INTO file_signatures(entry_id,full_hash,hash_algorithm,hash_status,hash_error,full_hash_computed_at) VALUES(?,?,?,?,?,CURRENT_TIMESTAMP)",
-                (
-                    row["id"],
-                    result.digest,
-                    config.section("hashing")["algorithm"],
-                    "OK" if result.stable else "ERROR",
-                    result.error,
-                ),
-            )
-            if result.stable and result.digest:
-                content_id = database.get_or_create_content_object(
-                    config.section("hashing")["algorithm"],
-                    result.digest,
-                    result.size,
-                    row["scan_run_id"],
-                )
-                database.link_entry_content(row["id"], content_id, "")
-            processed += 1
-            if processed % 100 == 0:
-                checkpoint(
-                    database,
-                    job_id,
-                    processed_count=processed,
-                    current_item=f"hashing candidates · {row['absolute_path']}",
-                    state={"phase": "candidate-hashing", "last_entry_id": int(row["id"])},
-                )
-    database.connect().commit()
+    ensure_content_identity(
+        database,
+        config,
+        # sqlite3.Row is a mapping at runtime (the service reads it by key); typeshed does not model
+        # that, so the stream is cast to the documented contract rather than materialised to dicts.
+        cast("Iterable[Mapping[str, Any]]", stream),
+        job_id,
+        record_errors=True,
+        progress_phase="hashing candidates",
+    )
 
 
 def run_exact_duplicate_analysis(

@@ -300,6 +300,17 @@ nav a[aria-current="page"], .header-title a[aria-current="page"] { font-weight: 
 .metric-card:focus-visible, .hero-card:focus-visible { outline: 3px solid var(--hk-accent); outline-offset: 2px; }
 .card-link-hint { color: var(--hk-link); font-size: .78rem; }
 .card-description { color: var(--hk-text-muted); font-size: .72rem; line-height: 1.3; }
+.hint { color: var(--hk-text-muted); font-size: .82rem; }
+.stale-badge {
+  background: var(--hk-warn-bg);
+  color: var(--hk-warn);
+  border: var(--hk-border-w) solid var(--hk-warn);
+  border-radius: var(--hk-radius);
+  padding: .05rem .4rem;
+  font-size: .78rem;
+  font-weight: 600;
+  white-space: nowrap;
+}
 .hero-card { margin: 1rem 0; padding: 1rem 1.15rem; grid-template-columns: 1fr auto; align-items: end; }
 .hero-card b { font-size: clamp(1.8rem, 5vw, 3rem); }
 .hero-card span { grid-column: 1 / -1; color: var(--hk-text-muted); }
@@ -391,6 +402,13 @@ input, select {
 }
 
 .empty-state { color: var(--hk-text-muted); padding: 1.25rem; text-align: center; }
+.count-error { color: var(--hk-danger); font-weight: 600; }
+.reason-badge { display: inline-block; background: var(--hk-accent-bg); color: var(--hk-text); border-radius: 999px; padding: .05rem .45rem; margin: .1rem .15rem .1rem 0; font-size: .78rem; white-space: nowrap; }
+:root[data-theme="hybrid"] .reason-badge, :root[data-theme="brutal"] .reason-badge { border-radius: 0; }
+.search-form { display: flex; gap: .5rem; margin: 0 0 .8rem; }
+.search-form input[type="search"] { flex: 1 1 auto; min-width: 0; }
+.review-scope { display: flex; flex-wrap: wrap; gap: .5rem; align-items: baseline; color: var(--hk-text-muted); margin: .6rem 0; }
+.review-scope strong { color: var(--hk-text); }
 .filter-bar { background: var(--hk-surface); border: var(--hk-border-w) solid var(--hk-border); border-radius: var(--hk-radius); padding: .8rem; margin: 1rem 0 .6rem; }
 .filter-bar h2 { font-size: 1rem; margin: 0 0 .65rem; }
 .filter-grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(160px, 1fr)); gap: .65rem; align-items: end; }
@@ -420,15 +438,34 @@ kbd { background: var(--hk-surface); border: 1px solid var(--hk-border-strong); 
 .jobs-status--complete::before { content: "✓"; display: inline-grid; place-items: center; width: 1.4rem; height: 1.4rem; margin-bottom: .35rem; color: var(--hk-ok); border: 1px solid var(--hk-ok); border-radius: 50%; animation: hk-check .35s ease-out; }
 @keyframes hk-check { from { opacity: 0; transform: scale(.6); } to { opacity: 1; transform: scale(1); } }
 
-/* review detail drawer */
-#detail-drawer,
-aside#detail-drawer {
+/* review/duplicates detail drawer: a fixed side panel that overlays rather than reflowing the
+   table. It sits off-screen until content is swapped in (JS adds .is-open on htmx:afterSwap), so
+   opening a detail never shifts the rows underneath it. */
+.detail-backdrop {
+  position: fixed;
+  inset: 0;
+  background: rgba(0, 0, 0, .35);
+  z-index: 40;
+}
+.detail-panel {
+  position: fixed;
+  top: 0;
+  right: 0;
+  bottom: 0;
+  width: min(440px, 94vw);
   background: var(--hk-surface);
-  border: var(--hk-border-w) solid var(--hk-border);
-  border-radius: var(--hk-radius);
+  border-left: var(--hk-border-w) solid var(--hk-border);
   box-shadow: var(--hk-shadow-card);
-  padding: .6rem;
-  margin: 0 0 1rem;
+  padding: 1rem;
+  overflow-y: auto;
+  z-index: 50;
+  transform: translateX(100%);
+  transition: transform .2s ease;
+}
+.detail-panel.is-open { transform: translateX(0); }
+.detail-panel-head { display: flex; justify-content: flex-end; margin-bottom: .5rem; }
+@media (prefers-reduced-motion: reduce) {
+  .detail-panel { transition: none; }
 }
 
 /* graph explorer */

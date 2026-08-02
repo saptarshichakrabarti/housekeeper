@@ -242,7 +242,7 @@ def test_dashboard_is_local_query_only_and_escaped(tmp_path):
     assert "var htmx" in htmx.text
     assert client.get("/fragments/jobs").status_code == 200
     assert client.get("/fragments/entry/1").status_code == 200
-    assert "&lt;script&gt;" in client.get("/review").text
+    assert "&lt;script&gt;" in client.get("/review?show_all=true").text
     assert client.get("/api/graph/projection?projection_type=not-real").status_code == 422
     assert (
         client.post(

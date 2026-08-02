@@ -100,6 +100,6 @@ housekeeper validate-manifest workspace/manifests/april.jsonl
 housekeeper dashboard --no-open-browser
 ```
 
-Install the optional local dashboard with `pip install -e '.[dashboard]'`. It binds to loopback, serves local assets only, escapes filenames, enforces bounded pagination/graph requests, and requires CSRF tokens for state-changing decisions. It never exposes arbitrary SQL, paths, file contents, or movement endpoints. See `docs/architecture.md`, `docs/dashboard.md`, `docs/graph_model.md`, and `docs/performance.md`.
+Install the optional local dashboard with `pip install -e '.[dashboard]'`. It binds to loopback, serves local assets only, escapes filenames, enforces bounded pagination/graph requests, and requires CSRF tokens for state-changing decisions. It never exposes arbitrary SQL, paths, file contents, or movement endpoints. See `docs/architecture.md`, `docs/dashboard.md`, `docs/graph_model.md`, `docs/performance.md`, and — for pointing the tool at terabyte drives and multi-day scans — `docs/long_runs.md`.
 
 The dashboard graph is rendered solely with the vendored Cytoscape.js distribution at `/static/vendor/cytoscape.min.js`; no CDN or Node.js runtime is required. Local declarative fragment refreshes keep job tables current without exposing a remote dependency. The optional analysis extra enables conservative DOCX, XLSX, PPTX, PDF, image, and archive metadata/text extraction. Parser failures and unavailable optional parsers remain protected artifacts.

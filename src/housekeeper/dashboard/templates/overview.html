@@ -1,10 +1,10 @@
 <p>Local query and review surface. Database integrity: {{ model.integrity }}. File movement is CLI-only.</p>
-<p class="overview-refresh">Summary {% if model.refreshed_at %}refreshed {{ model.refreshed_at | relativetime }}{% else %}not yet computed{% endif %}.{% if can_refresh %}
+<p class="overview-refresh{% if model.stale %} overview-refresh--stale{% endif %}">Summary {% if model.refreshed_at %}refreshed {{ model.refreshed_at | relativetime }}{% else %}not yet computed{% endif %}.{% if model.stale %} <span class="stale-badge">Out of date — a scan or analysis has finished since.</span>{% endif %}{% if can_refresh %}
 <button hx-post="/refresh" hx-target="main" hx-swap="innerHTML">Refresh now</button>{% endif %}</p>
 <a class="hero-card card card--ok" href="/duplicates">
   <strong>Reclaimable space</strong>
   <b>{{ model.reclaimable_bytes | filesizeformat }}</b>
-  <span>Logical bytes minus unique bytes — review duplicate copies</span>
+  <span>Redundant duplicate copies, counting distinct inodes — hard links free nothing</span>
 </a>
 <div class="cards overview-metrics">
 {% for metric in model.metrics %}{% if metric.href %}<a class="card metric-card" href="{{ metric.href }}">{% else %}<section class="card">{% endif %}<strong>{{ metric.label }}</strong><b>{% if metric.kind == 'bytes' %}{{ metric.value | filesizeformat }}{% else %}{{ metric.value | thousands }}{% endif %}</b><span class="card-description">{{ metric.description }}</span>{% if metric.href %}<span class="card-link-hint">Explore <span aria-hidden="true">→</span></span></a>{% else %}</section>{% endif %}{% endfor %}

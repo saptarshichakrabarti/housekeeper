@@ -3,17 +3,27 @@
   <dl>
     <dt>Path</dt><dd>{{ entry.relative_path }}</dd>
     <dt>Size</dt><dd>{{ entry.size_bytes | filesizeformat }}</dd>
-    <dt>Classification</dt><dd>{{ entry.classification or '' }}</dd>
+    <dt>Classification</dt><dd>{% if entry.classification %}<span title="{{ entry.classification }}">{{ entry.classification | classification_label }}</span>{% endif %}</dd>
     <dt>Full hash</dt><dd><code>{{ entry.full_hash or '' }}</code></dd>
     <dt>Hash status</dt><dd>{{ entry.hash_status or '' }}</dd>
   </dl>
   <h3>Analysis artifacts</h3>
   <ul>{% for artifact in artifacts %}<li>{{ artifact.analyser_name }} {{ artifact.status }} — {{ artifact.completed_at | relativetime }}</li>{% else %}<li>No analysis artifacts yet{% if has_run_page %} — run an analyser from the <a href="/control">Run page</a>{% endif %}.</li>{% endfor %}</ul>
+  <h3>Record a decision</h3>
+  {% if read_only %}
+  <p class="empty-state">Dashboard is read-only; decisions are recorded from the CLI.</p>
+  {% elif not sessions %}
+  <p class="empty-state">No open review session to record against. Create one first:
+  <code>housekeeper review create &lt;name&gt;</code>.</p>
+  {% else %}
   <form data-review-decision-form hx-post="/fragments/review/decision" hx-target="#detail-drawer">
     <input type="hidden" name="entry_id" value="{{ entry.id }}">
-    <label>Session <input type="number" name="session_id" min="1" required></label>
+    <label>Session <select name="session_id" required>
+      {% for session in sessions %}<option value="{{ session.id }}">{{ session.name }} ({{ session.status }})</option>{% endfor %}
+    </select></label>
     <label>Decision <select name="decision"><option>DEFER</option><option>MARK_KEEP</option><option>MARK_PROTECTED</option><option>NEEDS_MORE_ANALYSIS</option><option>APPROVE_FOR_REVIEW</option><option>REJECT_RECOMMENDATION</option></select></label>
     <label>Note <input name="note" maxlength="2000"></label>
     <button type="submit">Record decision</button>
   </form>
+  {% endif %}
 </section>

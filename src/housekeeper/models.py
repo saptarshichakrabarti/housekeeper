@@ -29,6 +29,9 @@ class FileStatRecord:
     mode: int | None = None
     device_id: int | None = None
     inode_or_file_id: int | None = None
+    #: Hard-link count from ``stat``. > 1 is the filesystem's own assertion that this path shares
+    #: storage with another, which is what makes inode-based identity reuse safe to trust.
+    nlink: int | None = None
     read_error: str | None = None
 
 

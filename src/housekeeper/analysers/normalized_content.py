@@ -18,7 +18,6 @@ from __future__ import annotations
 import json
 from pathlib import Path
 
-from ..hashing import compute_full_hash
 from ..normalization.registry import (
     ALL_PROFILES,
     PROFILE_RELATIONSHIP,
@@ -174,31 +173,22 @@ def _ensure_content_objects(database, config, scope) -> None:
     otherwise only hashes exact-duplicate candidates, so format-equivalent (byte-different)
     files would have no content object to normalize.
     """
-    suffixes = supported_suffixes()
-    algorithm = config.section("hashing")["algorithm"]
-    block = config.section("hashing")["full_hash_block_bytes"]
+    from ..core.identity import ensure_content_identity, stream_identity_candidates
+
+    suffixes = [s.lower() for s in supported_suffixes()]
     entry_sql, params = scope.entry_id_sql()
-    for row in database.iter_rows(
-        f"""SELECT e.id,e.absolute_path,e.suffix FROM filesystem_entries e
-           LEFT JOIN entry_content_links l ON l.entry_id=e.id
-           WHERE e.entry_type='file' AND l.entry_id IS NULL AND e.id IN ({entry_sql})""",
-        params,
-    ):
-        if (row["suffix"] or "").lower() not in suffixes:
-            continue
-        path = Path(row["absolute_path"])
-        if not path.is_file() or path.is_symlink():
-            continue
-        result = compute_full_hash(path, algorithm, block)
-        if not result.stable or not result.digest:
-            continue
-        cid = database.get_or_create_content_object(algorithm, result.digest, result.size)
-        database.connect().execute(
-            "INSERT OR REPLACE INTO file_signatures(entry_id,full_hash,hash_algorithm,hash_status,full_hash_computed_at) VALUES(?,?,?, 'VERIFIED', CURRENT_TIMESTAMP)",
-            (int(row["id"]), result.digest, algorithm),
-        )
-        database.link_entry_content(int(row["id"]), cid, "", "VERIFIED")
-    database.connect().commit()
+    marks = ",".join("?" for _ in suffixes)
+    # The suffix filter is in SQL now, not a Python skip after fetching: the shared identity service
+    # consumes the stream directly, and there is no per-row work left to do here.
+    stream = stream_identity_candidates(
+        database.reader(),
+        f"""SELECT e.id,e.scan_run_id,e.absolute_path,e.device_id,e.inode_or_file_id,e.nlink
+           FROM filesystem_entries e LEFT JOIN entry_content_links l ON l.entry_id=e.id
+           WHERE e.entry_type='file' AND l.entry_id IS NULL AND e.id IN ({entry_sql})
+           AND lower(e.suffix) IN ({marks}){{keyset}}""",
+        (*params, *suffixes),
+    )
+    ensure_content_identity(database, config, stream, progress_phase="hashing for normalization")
 
 
 def run_normalized_content_analysis(database, config, scope=None, job_id=None) -> dict[str, int]:

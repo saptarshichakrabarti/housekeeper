@@ -4,37 +4,23 @@ from __future__ import annotations
 
 import json
 from collections import defaultdict
-from pathlib import Path
 
 from ..constants import ClusterType, CollectionValue
 
 
 def _ensure_all_hashed(database, config, scope) -> None:
     """Hash every unlinked file so uniqueness is measured over content, not just dup candidates."""
-    from ..hashing import compute_full_hash
+    from ..core.identity import ensure_content_identity, stream_identity_candidates
 
-    algorithm = config.section("hashing")["algorithm"]
-    block = config.section("hashing")["full_hash_block_bytes"]
     entry_sql, params = scope.entry_id_sql()
-    for row in database.iter_rows(
-        f"""SELECT e.id,e.absolute_path FROM filesystem_entries e
-           LEFT JOIN entry_content_links l ON l.entry_id=e.id
-           WHERE e.entry_type='file' AND l.entry_id IS NULL AND e.id IN ({entry_sql})""",
+    stream = stream_identity_candidates(
+        database.reader(),
+        f"""SELECT e.id,e.scan_run_id,e.absolute_path,e.device_id,e.inode_or_file_id,e.nlink
+           FROM filesystem_entries e LEFT JOIN entry_content_links l ON l.entry_id=e.id
+           WHERE e.entry_type='file' AND l.entry_id IS NULL AND e.id IN ({entry_sql}){{keyset}}""",
         params,
-    ):
-        path = Path(row["absolute_path"])
-        if not path.is_file() or path.is_symlink():
-            continue
-        result = compute_full_hash(path, algorithm, block)
-        if not result.stable or not result.digest:
-            continue
-        cid = database.get_or_create_content_object(algorithm, result.digest, result.size)
-        database.connect().execute(
-            "INSERT OR REPLACE INTO file_signatures(entry_id,full_hash,hash_algorithm,hash_status,full_hash_computed_at) VALUES(?,?,?, 'VERIFIED', CURRENT_TIMESTAMP)",
-            (int(row["id"]), result.digest, algorithm),
-        )
-        database.link_entry_content(int(row["id"]), cid, "", "VERIFIED")
-    database.connect().commit()
+    )
+    ensure_content_identity(database, config, stream, progress_phase="hashing for uniqueness")
 
 
 def _collection_membership(database, scope):

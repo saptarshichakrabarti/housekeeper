@@ -1,3 +1,4 @@
+import json
 from dataclasses import dataclass
 from datetime import UTC, datetime
 from html import escape
@@ -103,6 +104,88 @@ def relativetime(value: object, now: datetime | None = None) -> Markup:
     )
 
 
+# Small closed enums get curated labels; the codes themselves are storage/CLI contracts and stay
+# in tooltips so nothing is hidden. Anything unmapped falls back to the generic humaniser below.
+_CLASSIFICATION_LABELS = {
+    "KEEP": "Keep",
+    "KEEP_CANONICAL": "Keep (canonical)",
+    "REVIEW_SAFE": "Safe to review",
+    "REVIEW_PROBABLE": "Probable duplicate",
+    "REVIEW_VERSION_FAMILY": "Version family",
+    "REVIEW_BACKUP": "Backup copy",
+    "REVIEW_LARGE": "Large file",
+    "PROTECTED": "Protected",
+    "UNKNOWN": "Unclassified",
+    "ERROR": "Analysis error",
+}
+_DECISION_LABELS = {
+    "MARK_KEEP": "Keep",
+    "MARK_PROTECTED": "Protect",
+    "DEFER": "Defer",
+    "NEEDS_MORE_ANALYSIS": "Needs more analysis",
+    "APPROVE_FOR_REVIEW": "Approve for review",
+    "REJECT_RECOMMENDATION": "Reject recommendation",
+}
+# Reason codes are open-ended (the policy engine coins them), so they are humanised generically;
+# these overrides only cover codes whose generic Title Case would misread (acronyms, proper names).
+_REASON_OVERRIDES = {
+    "NODE_MODULES": "node_modules",
+    "PYTHON_BYTECODE_CACHE": "Python bytecode cache",
+    "PARSER_OR_FILESYSTEM_ERROR": "Parser or filesystem error",
+    "PROJECT_HAS_REPRODUCIBILITY": "Project is reproducible",
+    "INSTALLER_OR_IMAGE": "Installer or disk image",
+}
+
+
+def _humanize_code(code: str) -> str:
+    """SCREAMING_SNAKE_CASE -> readable, with overrides for codes that Title Case would mangle."""
+    text = str(code)
+    if text in _REASON_OVERRIDES:
+        return _REASON_OVERRIDES[text]
+    return text.replace("_", " ").capitalize()
+
+
+_JOB_TYPE_LABELS = {
+    "SCAN": "Scan",
+    "QUICKSTART": "Quick start",
+    "CONTENT_ANALYSIS": "Content identity",
+    "DATABASE_MAINTENANCE": "Database maintenance",
+    "PURGE": "Purge",
+}
+
+
+def job_type_label(value: object) -> str:
+    """A job type as a readable stage name, e.g. EXACT_DUPLICATE_ANALYSIS -> 'Exact duplicate analysis'."""
+    if value is None or value == "":
+        return ""
+    return _JOB_TYPE_LABELS.get(str(value), _humanize_code(str(value)))
+
+
+def classification_label(value: object) -> str:
+    if value is None or value == "":
+        return ""
+    return _CLASSIFICATION_LABELS.get(str(value), _humanize_code(str(value)))
+
+
+def decision_label(value: object) -> str:
+    if value is None or value == "":
+        return ""
+    return _DECISION_LABELS.get(str(value), _humanize_code(str(value)))
+
+
+def reason_labels(value: object) -> list[str]:
+    """A reason_codes JSON array -> a list of readable labels; malformed input yields no labels."""
+    if not value:
+        return []
+    try:
+        codes = json.loads(value) if isinstance(value, (str, bytes, bytearray)) else value
+    except (TypeError, ValueError):
+        return []
+    if not isinstance(codes, list):
+        return []
+    return [_humanize_code(code) for code in codes if code]
+
+
 @dataclass(frozen=True)
 class ReviewFilter:
     classification: str | None = None
@@ -121,10 +204,19 @@ class ReviewFilter:
     stale: bool | None = None
     protected: bool | None = None
     top_level_directory: str | None = None
+    # Restrict to the work that still needs doing: review candidates with no decision recorded yet.
+    # The review page sets this by default so an unfiltered visit lands on the queue, not the drive.
+    actionable: bool = False
 
     def where_clause(self) -> tuple[str, tuple[object, ...]]:
         clauses = ["e.entry_type='file'"]
         params: list[object] = []
+        if self.actionable:
+            clauses.append("c.classification LIKE 'REVIEW_%'")
+            clauses.append(
+                "NOT EXISTS(SELECT 1 FROM review_decisions d WHERE d.target_type='ENTRY' "
+                "AND d.target_id=e.id AND d.current=1)"
+            )
         if self.classification:
             clauses.append("c.classification=?")
             params.append(self.classification)

@@ -51,30 +51,17 @@ def _document_text(database, config, content_object_id: int) -> tuple[str, int] 
 
 def _ensure_document_objects(database, config) -> None:
     """Hash document-suffix files that aren't yet content objects (self-sufficient after a scan)."""
-    from ..hashing import compute_full_hash
+    from ..core.identity import ensure_content_identity, stream_identity_candidates
 
-    algorithm = config.section("hashing")["algorithm"]
-    block = config.section("hashing")["full_hash_block_bytes"]
     marks = ",".join("?" for _ in _DOC_SUFFIXES)
-    for row in database.iter_rows(
-        f"""SELECT e.id,e.absolute_path FROM filesystem_entries e
-            LEFT JOIN entry_content_links l ON l.entry_id=e.id
-            WHERE e.entry_type='file' AND l.entry_id IS NULL AND lower(e.suffix) IN ({marks})""",
+    stream = stream_identity_candidates(
+        database.reader(),
+        f"""SELECT e.id,e.scan_run_id,e.absolute_path,e.device_id,e.inode_or_file_id,e.nlink
+            FROM filesystem_entries e LEFT JOIN entry_content_links l ON l.entry_id=e.id
+            WHERE e.entry_type='file' AND l.entry_id IS NULL AND lower(e.suffix) IN ({marks}){{keyset}}""",
         tuple(_DOC_SUFFIXES),
-    ):
-        path = Path(row["absolute_path"])
-        if not path.is_file() or path.is_symlink():
-            continue
-        result = compute_full_hash(path, algorithm, block)
-        if not result.stable or not result.digest:
-            continue
-        cid = database.get_or_create_content_object(algorithm, result.digest, result.size)
-        database.connect().execute(
-            "INSERT OR REPLACE INTO file_signatures(entry_id,full_hash,hash_algorithm,hash_status,full_hash_computed_at) VALUES(?,?,?, 'VERIFIED', CURRENT_TIMESTAMP)",
-            (int(row["id"]), result.digest, algorithm),
-        )
-        database.link_entry_content(int(row["id"]), cid, "", "VERIFIED")
-    database.connect().commit()
+    )
+    ensure_content_identity(database, config, stream, progress_phase="hashing documents")
 
 
 def run_document_minhash_analysis(database, config, scope=None, job_id=None) -> dict[str, int]:

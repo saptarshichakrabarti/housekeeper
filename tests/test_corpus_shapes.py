@@ -267,6 +267,14 @@ def test_twentieth_rescan_issues_no_more_sql_than_the_second(config, database, t
     with counters.recording() as twentieth:
         scanner.scan(root)
 
+    # stat_calls must track the drive, not history: every rescan stats one snapshot's worth of
+    # entries once, so the 20th matches the 2nd. This is the soak guard for the traversal half —
+    # a per-entry cost that grew with rescans (or a reintroduced 4-stats-per-entry) trips it.
+    assert twentieth["stat_calls"] == second["stat_calls"], (
+        f"stat calls grew with history: {twentieth['stat_calls']} vs {second['stat_calls']}"
+    )
+    assert twentieth["stat_calls"] <= 40, "one stat per entry of a 34-entry tree, not four"
+
     assert _count(database, "SELECT COUNT(*) n FROM scan_runs") == 20
     history = _count(database, "SELECT COUNT(*) n FROM filesystem_entries")
     current = _count(database, "SELECT COUNT(*) n FROM current_entries")

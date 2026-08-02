@@ -137,6 +137,47 @@ def test_images_explorer_lists_groups(client):
     assert "/images/1" in response.text
 
 
+def _app_with(tmp_path, name, *, sessions=(), read_only=False):
+    from fastapi.testclient import TestClient
+
+    from housekeeper.dashboard.app import create_app
+
+    db = Database(tmp_path / name)
+    db.initialize()
+    _seed(db)
+    for session_name in sessions:
+        db.connect().execute(
+            "INSERT INTO review_sessions(name,status) VALUES(?, 'OPEN')", (session_name,)
+        )
+    db.connect().commit()
+    return TestClient(create_app(db, read_only=read_only))
+
+
+def test_entry_drawer_offers_a_session_picker_not_a_raw_id(tmp_path):
+    client = _app_with(tmp_path, "picker.sqlite", sessions=["Spring cleanup"])
+    body = client.get("/fragments/entry/3").text
+    # A dropdown of real sessions, never a bare numeric id a user has to look up and type.
+    assert '<select name="session_id"' in body
+    assert "Spring cleanup" in body
+    assert 'name="session_id" type="number"' not in body
+    assert 'type="number" name="session_id"' not in body
+
+
+def test_entry_drawer_without_a_session_prompts_to_create_one(tmp_path):
+    client = _app_with(tmp_path, "nosession.sqlite")
+    body = client.get("/fragments/entry/3").text
+    # No pickable session: no orphaned form control, just the honest next step.
+    assert 'name="session_id"' not in body
+    assert "housekeeper review create" in body
+
+
+def test_entry_drawer_is_read_only_when_the_dashboard_is(tmp_path):
+    client = _app_with(tmp_path, "rodrawer.sqlite", sessions=["Spring cleanup"], read_only=True)
+    body = client.get("/fragments/entry/3").text
+    assert 'name="session_id"' not in body
+    assert "read-only" in body.lower()
+
+
 def test_detail_pages_are_readable_in_read_only_mode(tmp_path, sheet_dir):
     from fastapi.testclient import TestClient
 

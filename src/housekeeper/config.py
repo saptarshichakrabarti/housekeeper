@@ -35,12 +35,26 @@ DEFAULTS: dict[str, Any] = {
         "max_file_size_for_content_analysis": 1073741824,
         "excluded_paths": [],
         "excluded_names": [],
+        # Park the scan (resumable) after this many consecutive unreadable entries — the signature of
+        # a drive that dropped off the bus mid-scan, which otherwise records millions of per-entry
+        # errors and keeps walking for hours. 0 disables the breaker.
+        "pause_after_consecutive_errors": 1000,
+        # Upper bound on the set of already-entered directory identities the cycle guard keeps in
+        # memory (~a tuple per directory). Beyond it new directories are descended unguarded — the
+        # safe direction — rather than growing memory without limit on a tree of millions of dirs.
+        "cycle_guard_max_directories": 10000000,
     },
     "hashing": {
         "algorithm": "sha256",
         "quick_hash_chunk_bytes": 1048576,
         "quick_hash_middle_samples": 2,
         "full_hash_block_bytes": 8388608,
+        # Hash one representative per (device, inode) group and copy the verified result to every
+        # other hard link to it, rather than reading the same physical bytes once per path. Gated on
+        # nlink > 1, so it can only ever affect files the filesystem itself reports as shared. On a
+        # snapshot-style backup drive this is the difference between reading the data once and once
+        # per retained snapshot; off, every path is hashed independently.
+        "hardlink_identity_reuse": True,
     },
     "archives": {
         # Nested archives are inventoried, never expanded (decompression-bomb safety), so there is
@@ -192,10 +206,19 @@ DEFAULTS: dict[str, Any] = {
         # Worker counts live here and nowhere else. Top-level duplicates of these keys used to
         # shadow the profile unconditionally, so selecting "ssd" still ran full_hash_workers=1;
         # an operator who wants to depart from the profile now says so in `overrides`.
+        # SHA-256 (with SHA-NI) sustains ~1.5–2 GB/s per core and hashlib releases the GIL, so hash
+        # threads scale on fast storage until the device saturates. The counts below are the plan's
+        # proposed defaults pending a per-machine `benchmark_hashing --workers` sweep (see
+        # docs/performance.md); an operator who has measured their drive sets `overrides`. A rotational
+        # disk stays at one worker — concurrent reads there are seeks, not throughput.
+        # traversal_workers offloads scandir+stat (which release the GIL) to a small pool so a walk
+        # of high-latency storage overlaps its I/O; 1 keeps the single-threaded walk exactly. A
+        # rotational disk stays at 1 — parallel directory reads there are competing seeks.
         "profiles": {
-            "hdd": {"full_hash_workers": 1, "parser_workers": 2},
-            "ssd": {"full_hash_workers": 4, "parser_workers": 4},
-            "network": {"full_hash_workers": 1, "parser_workers": 2},
+            "hdd": {"full_hash_workers": 1, "parser_workers": 2, "traversal_workers": 1},
+            "ssd": {"full_hash_workers": 8, "parser_workers": 4, "traversal_workers": 4},
+            "nvme": {"full_hash_workers": 16, "parser_workers": 6, "traversal_workers": 8},
+            "network": {"full_hash_workers": 1, "parser_workers": 2, "traversal_workers": 4},
         },
         "overrides": {},
         "batch_size": 1000,
@@ -286,7 +309,14 @@ def validate_config(config: dict) -> None:
                     and value < 0
                 ):
                     raise ValueError(f"negative limit: {key}")
-    if config["hashing"]["algorithm"].lower() not in {"sha256", "sha512", "blake2b"}:
+    allowed_algorithms = {"sha256", "sha512", "blake2b"}
+    # BLAKE3 is optional: allowed only where its wheel is installed, so a workspace can never be
+    # configured to hash with an algorithm this machine cannot compute.
+    from .hashing import blake3_available
+
+    if blake3_available():
+        allowed_algorithms.add("blake3")
+    if config["hashing"]["algorithm"].lower() not in allowed_algorithms:
         raise ValueError("unsupported hash algorithm")
     if (
         config["graph"]["default_max_nodes"] > config["graph"]["hard_max_nodes"]
@@ -322,13 +352,26 @@ def config_fingerprint(config: AppConfig) -> str:
 #: network shares do not reach this on a mixed corpus once seek time is included; an SSD clears it
 #: comfortably. Deliberately well clear of both, because the penalty for guessing wrong is real work.
 SSD_BYTES_PER_SECOND = 200_000_000
+#: And above which it is treated as NVMe, worth more hash threads still. Set where a real SSD tops out
+#: and a fast NVMe drive keeps going. Note the sample this compares against is measured with the
+#: *current* worker count, so a drive climbs hdd → ssd → nvme over successive runs rather than in one
+#: leap — which is the safe direction (never more threads than a measurement has justified).
+NVME_BYTES_PER_SECOND = 1_500_000_000
 
 
 def observed_profile(bytes_per_second: float | None) -> str | None:
-    """Which profile a measured hashing throughput implies, or None if it implies nothing."""
+    """Which profile a measured hashing throughput implies, or None if it implies nothing.
+
+    A ladder, not a single threshold: a measurement can only ever *promote* toward more concurrency,
+    and only as far as the throughput it actually observed warrants.
+    """
     if not bytes_per_second or bytes_per_second <= 0:
         return None
-    return "ssd" if bytes_per_second >= SSD_BYTES_PER_SECOND else None
+    if bytes_per_second >= NVME_BYTES_PER_SECOND:
+        return "nvme"
+    if bytes_per_second >= SSD_BYTES_PER_SECOND:
+        return "ssd"
+    return None
 
 
 def performance_profile(

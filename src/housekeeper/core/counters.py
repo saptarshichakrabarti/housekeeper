@@ -49,6 +49,28 @@ def count(name: str, amount: int = 1) -> None:
         _counts[name] += amount
 
 
+def is_recording() -> bool:
+    """Whether a :func:`recording` block is active.
+
+    Lets a caller skip the *measurement* — not just the ``count`` — when nothing will read it: a
+    counter value that costs a syscall to produce (a WAL file size, a peak-RSS probe) should not be
+    computed in production, where ``count`` would discard it anyway.
+    """
+    return _recording
+
+
+def record_max(name: str, value: int) -> None:
+    """Keep the largest ``value`` seen for ``name`` rather than a running sum.
+
+    ``count`` accumulates, which is the right unit for "bytes read" but the wrong one for "peak WAL
+    size": summing every stage's WAL bytes measures nothing. This keeps the maximum instead.
+    """
+    if not _recording:
+        return
+    with _lock:
+        _counts[name] = max(_counts[name], value)
+
+
 def _on_statement(sql: str) -> None:
     with _lock:
         _counts["sql_statements"] += 1
