@@ -24,7 +24,7 @@ CREATE TABLE IF NOT EXISTS exact_duplicate_groups(id INTEGER PRIMARY KEY, conten
 CREATE TABLE IF NOT EXISTS exact_duplicate_members(group_id INTEGER REFERENCES exact_duplicate_groups(id) ON DELETE CASCADE, entry_id INTEGER REFERENCES filesystem_entries(id) ON DELETE CASCADE, is_canonical INTEGER, readable INTEGER, PRIMARY KEY(group_id,entry_id));
 CREATE TABLE IF NOT EXISTS directory_summaries(entry_id INTEGER PRIMARY KEY REFERENCES filesystem_entries(id) ON DELETE CASCADE, recursive_file_count INTEGER, recursive_directory_count INTEGER, recursive_size_bytes INTEGER, unique_full_hash_count INTEGER, duplicate_file_count INTEGER, extension_distribution_json TEXT, earliest_modified_at REAL, latest_modified_at REAL, content_signature TEXT);
 CREATE TABLE IF NOT EXISTS move_transactions(id INTEGER PRIMARY KEY, transaction_run_id TEXT, source_entry_id INTEGER, source_path TEXT, destination_path TEXT, expected_size INTEGER, expected_hash TEXT, pre_move_hash TEXT, post_move_hash TEXT, status TEXT, started_at TEXT DEFAULT CURRENT_TIMESTAMP, completed_at TEXT, error TEXT, restored_at TEXT, restore_status TEXT);
-CREATE INDEX IF NOT EXISTS idx_entries_path ON filesystem_entries(relative_path); CREATE INDEX IF NOT EXISTS idx_entries_size ON filesystem_entries(size_bytes); CREATE INDEX IF NOT EXISTS idx_sig_full ON file_signatures(full_hash); CREATE INDEX IF NOT EXISTS idx_classification ON classifications(classification);
+CREATE INDEX IF NOT EXISTS idx_entries_path ON filesystem_entries(relative_path); CREATE INDEX IF NOT EXISTS idx_sig_full ON file_signatures(full_hash); CREATE INDEX IF NOT EXISTS idx_classification ON classifications(classification);
 CREATE TABLE IF NOT EXISTS source_roots(id INTEGER PRIMARY KEY, display_name TEXT NOT NULL, source_fingerprint TEXT NOT NULL UNIQUE, filesystem_uuid TEXT, volume_label TEXT, device_metadata_json TEXT NOT NULL DEFAULT '{}', first_seen_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP, last_seen_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP, last_mount_path TEXT NOT NULL, latest_complete_scan_run_id INTEGER REFERENCES scan_runs(id));
 CREATE TABLE IF NOT EXISTS content_objects(id INTEGER PRIMARY KEY, hash_algorithm TEXT NOT NULL, full_hash TEXT NOT NULL, size_bytes INTEGER NOT NULL, first_seen_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP, last_seen_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP, verification_status TEXT NOT NULL DEFAULT 'VERIFIED', readability_status TEXT NOT NULL DEFAULT 'UNKNOWN', content_kind TEXT, detected_mime TEXT, detected_type TEXT, analysis_state TEXT NOT NULL DEFAULT 'PENDING', created_by_scan_run_id INTEGER REFERENCES scan_runs(id), UNIQUE(hash_algorithm, full_hash, size_bytes));
 CREATE TABLE IF NOT EXISTS entry_content_links(entry_id INTEGER PRIMARY KEY REFERENCES filesystem_entries(id) ON DELETE CASCADE, content_object_id INTEGER NOT NULL REFERENCES content_objects(id), linked_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP, link_status TEXT NOT NULL, size_verified INTEGER NOT NULL DEFAULT 0, hash_verified INTEGER NOT NULL DEFAULT 0, entry_stat_fingerprint TEXT NOT NULL DEFAULT '');
@@ -199,10 +199,17 @@ class Database:
     def connect(self) -> sqlite3.Connection:
         if self.conn is None:
             self.path.parent.mkdir(parents=True, exist_ok=True)
+            # A larger page shallows the B-trees of a multi-hundred-GB inventory, so a lookup touches
+            # fewer pages. It can only be chosen while the database is empty (before any page is
+            # allocated) and before WAL is enabled — an existing file keeps its page size until a
+            # VACUUM. Checked before connect(), which itself creates the file.
+            fresh = not self.path.exists() or self.path.stat().st_size == 0
             self.conn = sqlite3.connect(
                 self.path, check_same_thread=False, factory=counters.Connection
             )
             self.conn.row_factory = sqlite3.Row
+            if fresh:
+                self.conn.execute("PRAGMA page_size=8192")
             self.conn.execute("PRAGMA foreign_keys=ON")
             self.conn.execute("PRAGMA journal_mode=WAL")
             self.conn.execute("PRAGMA busy_timeout=5000")
@@ -483,9 +490,16 @@ class Database:
         # quickstart stage a 58-hour operation.
         "CREATE INDEX IF NOT EXISTS idx_entries_run_parent_name ON filesystem_entries(scan_run_id,parent_entry_id,name)",
         # Rename detection looks up by (run, size); size alone matched across every historical scan.
+        # NOT partial: the rename queries join file_signatures rather than stating entry_type='file',
+        # so a partial predicate would make the planner ignore this index.
         "CREATE INDEX IF NOT EXISTS idx_entries_run_size ON filesystem_entries(scan_run_id,size_bytes)",
         # Reappearance-after-missing looks up a path within a source root.
         "CREATE INDEX IF NOT EXISTS idx_entries_source_path ON filesystem_entries(source_root_id,relative_path)",
+        # The exact-duplicate size funnel only ever groups files, and directory rows never enter it —
+        # so the bare-size index is partial on entry_type='file'. That skips the index write for every
+        # directory entry (a real fraction of a deep tree) and drops those rows from the index
+        # entirely. Every consumer states entry_type='file', which is what keeps the planner using it.
+        "CREATE INDEX IF NOT EXISTS idx_entries_size_file ON filesystem_entries(size_bytes) WHERE entry_type='file'",
     )
     # Byte-for-byte duplicates of a UNIQUE constraint's automatic index, or a redundant prefix of
     # one of the composites above: pure write amplification and ~365 MB on a real inventory.
@@ -501,6 +515,7 @@ class Database:
         "idx_entries_path",
         "idx_content_hash",  # == UNIQUE(hash_algorithm,full_hash,size_bytes)
         "idx_artifact_lookup",  # == UNIQUE(content_object_id,analyser_name,analyser_version,configuration_fingerprint)
+        "idx_entries_size",  # superseded by the partial idx_entries_size_file (files-only)
     )
 
     def _ensure_entry_indexes(self, c: sqlite3.Connection) -> None:
@@ -1133,13 +1148,18 @@ class Database:
         return (int(row[0]), int(row[1]), int(row[2]))
 
     def vacuum(self) -> None:
-        """Vacuum only when the filesystem has enough free room for a temporary copy."""
+        """Vacuum only when the filesystem has enough free room for a temporary copy.
+
+        Also the one moment an existing database can adopt the larger page size (a fresh database
+        takes it at creation): the pragma is set here so the rebuild VACUUM performs writes it.
+        """
         if (
             self.path.exists()
             and os.statvfs(self.path.parent).f_bavail * os.statvfs(self.path.parent).f_frsize
             < self.path.stat().st_size * 2
         ):
             raise OSError("insufficient free disk space for VACUUM")
+        self.connect().execute("PRAGMA page_size=8192")
         self.connect().execute("VACUUM")
 
     # The five overview charts, stored verbatim so the dashboard never re-runs these full-table
