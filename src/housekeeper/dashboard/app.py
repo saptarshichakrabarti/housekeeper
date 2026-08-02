@@ -33,7 +33,15 @@ def create_app(
 
     from ..graph.builder import build_projection
     from ..review.decisions import record_decision
-    from .filters import ReviewFilter, filesizeformat, relativetime, thousands
+    from .filters import (
+        ReviewFilter,
+        classification_label,
+        decision_label,
+        filesizeformat,
+        reason_labels,
+        relativetime,
+        thousands,
+    )
     from .services import DashboardService
 
     csrf_token = secrets.token_urlsafe(24)
@@ -56,6 +64,9 @@ def create_app(
         filesizeformat=filesizeformat,
         thousands=thousands,
         relativetime=relativetime,
+        classification_label=classification_label,
+        decision_label=decision_label,
+        reason_labels=reason_labels,
     )
     app = FastAPI(title="drive_housekeeper", docs_url=None, redoc_url=None)
     app.mount("/static", StaticFiles(directory=static_dir), name="static")

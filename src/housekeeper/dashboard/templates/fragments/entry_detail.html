@@ -3,7 +3,7 @@
   <dl>
     <dt>Path</dt><dd>{{ entry.relative_path }}</dd>
     <dt>Size</dt><dd>{{ entry.size_bytes | filesizeformat }}</dd>
-    <dt>Classification</dt><dd>{{ entry.classification or '' }}</dd>
+    <dt>Classification</dt><dd>{% if entry.classification %}<span title="{{ entry.classification }}">{{ entry.classification | classification_label }}</span>{% endif %}</dd>
     <dt>Full hash</dt><dd><code>{{ entry.full_hash or '' }}</code></dd>
     <dt>Hash status</dt><dd>{{ entry.hash_status or '' }}</dd>
   </dl>

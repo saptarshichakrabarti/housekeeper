@@ -4,7 +4,14 @@ from datetime import UTC, datetime
 
 import pytest
 
-from housekeeper.dashboard.filters import filesizeformat, relativetime, thousands
+from housekeeper.dashboard.filters import (
+    classification_label,
+    decision_label,
+    filesizeformat,
+    reason_labels,
+    relativetime,
+    thousands,
+)
 
 
 def test_human_readable_filters_keep_exact_values() -> None:
@@ -22,6 +29,25 @@ def test_human_readable_filters_keep_exact_values() -> None:
     )
     assert "2 h ago" in relative
     assert 'datetime="2026-07-22T10:00:00Z"' in relative
+
+
+def test_enum_values_render_as_readable_labels() -> None:
+    assert classification_label("REVIEW_SAFE") == "Safe to review"
+    assert classification_label("PROTECTED") == "Protected"
+    assert decision_label("NEEDS_MORE_ANALYSIS") == "Needs more analysis"
+    assert decision_label("MARK_KEEP") == "Keep"
+    # Unmapped codes still humanise generically rather than showing SCREAMING_SNAKE_CASE.
+    assert classification_label("REVIEW_BRAND_NEW") == "Review brand new"
+    assert classification_label("") == "" and decision_label(None) == ""
+
+
+def test_reason_codes_json_becomes_readable_labels() -> None:
+    assert reason_labels('["OLD_AND_DUPLICATED","REGENERABLE"]') == [
+        "Old and duplicated",
+        "Regenerable",
+    ]
+    assert reason_labels('["NODE_MODULES"]') == ["node_modules"]  # override, not "Node modules"
+    assert reason_labels("") == [] and reason_labels("not json") == []
 
 
 @pytest.fixture
@@ -120,8 +146,8 @@ def _review_client(database):
         "(12,1,'/drive','/drive/kept.bin','kept.bin','kept.bin','file',1000)"
     )
     conn.execute(
-        "INSERT INTO classifications(entry_id,classification,confidence) VALUES"
-        "(10,'REVIEW_DUPLICATE',0.9),(11,'REVIEW_DUPLICATE',0.9),(12,'KEEP',0.9)"
+        "INSERT INTO classifications(entry_id,classification,confidence,reason_codes_json) VALUES"
+        "(10,'REVIEW_SAFE',0.9,'[\"OLD_AND_DUPLICATED\"]'),(11,'REVIEW_SAFE',0.9,'[]'),(12,'KEEP',0.9,'[]')"
     )
     conn.execute("INSERT INTO review_sessions(id,name,status) VALUES(1,'S','OPEN')")
     conn.execute(
@@ -144,6 +170,11 @@ def test_review_defaults_to_the_actionable_queue(database) -> None:
     assert "/fragments/entry/12" not in default  # KEEP, not a review candidate
     assert "Items that need review" in default
     assert "Show all files" in default
+    # Enum/JSON columns render as readable labels, with the raw code kept in a tooltip.
+    assert "Safe to review" in default
+    assert 'title="REVIEW_SAFE"' in default
+    assert "Old and duplicated" in default
+    assert "REVIEW_SAFE</td>" not in default  # never the bare code as the cell's text
 
 
 def test_review_show_all_reveals_the_full_inventory(database) -> None:
