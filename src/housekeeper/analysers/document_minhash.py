@@ -51,14 +51,14 @@ def _document_text(database, config, content_object_id: int) -> tuple[str, int] 
 
 def _ensure_document_objects(database, config) -> None:
     """Hash document-suffix files that aren't yet content objects (self-sufficient after a scan)."""
-    from ..core.identity import ensure_content_identity
+    from ..core.identity import ensure_content_identity, stream_identity_candidates
 
     marks = ",".join("?" for _ in _DOC_SUFFIXES)
-    stream = database.reader().iter_rows(
+    stream = stream_identity_candidates(
+        database.reader(),
         f"""SELECT e.id,e.scan_run_id,e.absolute_path,e.device_id,e.inode_or_file_id,e.nlink
             FROM filesystem_entries e LEFT JOIN entry_content_links l ON l.entry_id=e.id
-            WHERE e.entry_type='file' AND l.entry_id IS NULL AND lower(e.suffix) IN ({marks})
-            ORDER BY e.device_id,e.inode_or_file_id,e.id""",
+            WHERE e.entry_type='file' AND l.entry_id IS NULL AND lower(e.suffix) IN ({marks}){{keyset}}""",
         tuple(_DOC_SUFFIXES),
     )
     ensure_content_identity(database, config, stream, progress_phase="hashing documents")

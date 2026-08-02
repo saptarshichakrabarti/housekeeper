@@ -82,6 +82,30 @@ def record_identity_throughput(database: Database, hashed_bytes: int, seconds: f
         database.record_hash_throughput(str(row["fingerprint"]), rate)
 
 
+# The identity-candidate ordering: inode-mates adjacent (for hard-link reuse), tail-broken on id.
+# COALESCE so NULL device/inode sort deterministically and the keyset row-value comparison is
+# well-defined — st_dev/st_ino are never negative, so -1 is a safe sentinel below every real value.
+_IDENTITY_KEY_EXPRS = ("COALESCE(e.device_id,-1)", "COALESCE(e.inode_or_file_id,-1)", "e.id")
+
+
+def _identity_boundary(row: Mapping[str, Any]) -> tuple[int, int, int]:
+    device = _field(row, "device_id")
+    inode = _field(row, "inode_or_file_id")
+    return (device if device is not None else -1, inode if inode is not None else -1, int(row["id"]))
+
+
+def stream_identity_candidates(reader, sql: str, params: tuple, batch_size: int = 5_000):
+    """Keyset-paged stream of identity candidates, ordered so inode-mates stay adjacent.
+
+    ``sql`` must SELECT ``e.id, e.device_id, e.inode_or_file_id`` (the ordering columns), carry no
+    ``ORDER BY``, and contain ``{keyset}`` in its ``WHERE``. Paging keeps a long hashing stage from
+    pinning the WAL while preserving the hard-link adjacency the reuse depends on.
+    """
+    return reader.iter_keyset(
+        sql, params, key_exprs=_IDENTITY_KEY_EXPRS, key_of=_identity_boundary, batch_size=batch_size
+    )
+
+
 def _inode_key(entry: Mapping[str, Any]) -> tuple[int, int] | None:
     """The ``(device, inode)`` identity of a file with more than one hard link, or ``None``.
 

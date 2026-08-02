@@ -20,17 +20,17 @@ EXPORT = {".pdf", ".html", ".htm"}
 
 
 def _ensure_hashed(database, config, scope) -> None:
-    from ..core.identity import ensure_content_identity
+    from ..core.identity import ensure_content_identity, stream_identity_candidates
 
     suffixes = EDITABLE | EXPORT
     marks = ",".join("?" for _ in suffixes)
     entry_sql, scope_params = scope.entry_id_sql()
-    stream = database.reader().iter_rows(
+    stream = stream_identity_candidates(
+        database.reader(),
         f"""SELECT e.id,e.scan_run_id,e.absolute_path,e.device_id,e.inode_or_file_id,e.nlink
             FROM filesystem_entries e LEFT JOIN entry_content_links l ON l.entry_id=e.id
             WHERE e.entry_type='file' AND l.entry_id IS NULL AND lower(e.suffix) IN ({marks})
-            AND e.id IN ({entry_sql})
-            ORDER BY e.device_id,e.inode_or_file_id,e.id""",
+            AND e.id IN ({entry_sql}){{keyset}}""",
         (*suffixes, *scope_params),
     )
     ensure_content_identity(database, config, stream, progress_phase="hashing derivations")

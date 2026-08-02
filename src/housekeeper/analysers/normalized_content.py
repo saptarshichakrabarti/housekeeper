@@ -173,19 +173,19 @@ def _ensure_content_objects(database, config, scope) -> None:
     otherwise only hashes exact-duplicate candidates, so format-equivalent (byte-different)
     files would have no content object to normalize.
     """
-    from ..core.identity import ensure_content_identity
+    from ..core.identity import ensure_content_identity, stream_identity_candidates
 
     suffixes = [s.lower() for s in supported_suffixes()]
     entry_sql, params = scope.entry_id_sql()
     marks = ",".join("?" for _ in suffixes)
     # The suffix filter is in SQL now, not a Python skip after fetching: the shared identity service
     # consumes the stream directly, and there is no per-row work left to do here.
-    stream = database.reader().iter_rows(
+    stream = stream_identity_candidates(
+        database.reader(),
         f"""SELECT e.id,e.scan_run_id,e.absolute_path,e.device_id,e.inode_or_file_id,e.nlink
            FROM filesystem_entries e LEFT JOIN entry_content_links l ON l.entry_id=e.id
            WHERE e.entry_type='file' AND l.entry_id IS NULL AND e.id IN ({entry_sql})
-           AND lower(e.suffix) IN ({marks})
-           ORDER BY e.device_id,e.inode_or_file_id,e.id""",
+           AND lower(e.suffix) IN ({marks}){{keyset}}""",
         (*params, *suffixes),
     )
     ensure_content_identity(database, config, stream, progress_phase="hashing for normalization")

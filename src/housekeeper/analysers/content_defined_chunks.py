@@ -32,15 +32,15 @@ def _representative_path(database, content_object_id: int) -> Path | None:
 
 
 def _ensure_hashed_large_files(database, config, minimum_file: int, scope) -> None:
-    from ..core.identity import ensure_content_identity
+    from ..core.identity import ensure_content_identity, stream_identity_candidates
 
     entry_sql, params = scope.entry_id_sql()
-    stream = database.reader().iter_rows(
+    stream = stream_identity_candidates(
+        database.reader(),
         f"""SELECT e.id,e.scan_run_id,e.absolute_path,e.size_bytes,e.device_id,e.inode_or_file_id,e.nlink
            FROM filesystem_entries e LEFT JOIN entry_content_links l ON l.entry_id=e.id
            WHERE e.entry_type='file' AND l.entry_id IS NULL AND e.size_bytes>=?
-           AND e.id IN ({entry_sql})
-           ORDER BY e.device_id,e.inode_or_file_id,e.id""",
+           AND e.id IN ({entry_sql}){{keyset}}""",
         (minimum_file, *params),
     )
     ensure_content_identity(database, config, stream, progress_phase="hashing large files")

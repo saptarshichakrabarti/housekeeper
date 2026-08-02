@@ -138,6 +138,43 @@ CREATE VIEW IF NOT EXISTS image_similarity_members AS
 """
 
 
+def _keyset_pages(execute, sql, params, key_exprs, key_of, batch_size):
+    """Stream ``sql`` in keyset pages, closing the cursor between pages.
+
+    A single ``execute``+``fetchmany`` loop holds one read snapshot for its whole lifetime, and in
+    WAL that snapshot pins the log: a checkpoint cannot reclaim any frame newer than it, so on a
+    days-long stage the WAL grows to the size of everything the writer commits meanwhile. Paging by
+    a keyset — fetch a bounded page, close the cursor (releasing the snapshot), re-open past the last
+    key — lets a checkpoint advance between pages, so the WAL stays bounded.
+
+    ``sql`` must contain the literal ``{keyset}`` in its ``WHERE`` and carry no ``ORDER BY``/``LIMIT``
+    of its own (both are appended here). ``key_exprs`` are the ordering/comparison expressions and
+    ``key_of(row)`` returns the matching boundary tuple. The comparison is a row-value ``>``, so the
+    ordering must be ascending on exactly ``key_exprs``. Each page sees a *fresh* snapshot; for the
+    anti-join candidate queries this only ever removes rows already processed, which is correct.
+    """
+    order = ",".join(key_exprs)
+    cols = "(" + ",".join(key_exprs) + ")"
+    marks = "(" + ",".join("?" for _ in key_exprs) + ")"
+    boundary = None
+    while True:
+        if boundary is None:
+            query = sql.format(keyset="") + f" ORDER BY {order} LIMIT ?"
+            page_params = (*params, batch_size)
+        else:
+            query = sql.format(keyset=f" AND {cols} > {marks}") + f" ORDER BY {order} LIMIT ?"
+            page_params = (*params, *boundary, batch_size)
+        cursor = execute(query, page_params)
+        rows = cursor.fetchall()
+        cursor.close()
+        if not rows:
+            return
+        yield from rows
+        if len(rows) < batch_size:
+            return
+        boundary = key_of(rows[-1])
+
+
 class Database:
     # The insert path ran on SQLite's 2 MB default page cache while writing a multi-GB inventory,
     # so every B-tree descent above that went back to the OS. Cache is allocated lazily, so a
@@ -1313,6 +1350,12 @@ class Database:
                 on_window()
             start = end + 1
 
+    def iter_keyset(self, sql, params, *, key_exprs, key_of, batch_size: int = 5_000):
+        """Stream ``sql`` in keyset pages on the writer connection. See :func:`_keyset_pages`."""
+        if batch_size < 1:
+            raise ValueError("batch_size must be positive")
+        yield from _keyset_pages(self.connect().execute, sql, params, key_exprs, key_of, batch_size)
+
     def execute(self, sql: str, params: tuple | dict = ()) -> sqlite3.Cursor:
         return self.connect().execute(sql, params)
 
@@ -1405,3 +1448,16 @@ class _ReadDB:
         cursor = self._db._read_conn().execute(sql, params)
         while batch := cursor.fetchmany(batch_size):
             yield from batch
+
+    def iter_keyset(self, sql, params, *, key_exprs, key_of, batch_size: int = 5_000):
+        """Stream ``sql`` in keyset pages on the thread's read connection. See :func:`_keyset_pages`.
+
+        The read connection is reused, but each page is a fresh statement, so no snapshot is held
+        across pages — which is the whole point: a long identity or artifact stage no longer pins the
+        WAL while the writer commits behind it.
+        """
+        if batch_size < 1:
+            raise ValueError("batch_size must be positive")
+        yield from _keyset_pages(
+            self._db._read_conn().execute, sql, params, key_exprs, key_of, batch_size
+        )

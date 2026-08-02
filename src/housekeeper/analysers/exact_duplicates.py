@@ -4,7 +4,7 @@ from collections.abc import Iterable, Mapping
 from typing import Any, cast
 
 from ..config import AppConfig
-from ..core.identity import ensure_content_identity
+from ..core.identity import ensure_content_identity, stream_identity_candidates
 from ..database import Database
 from ..jobs import check_cancelled, checkpoint, update_job
 from ..relationships import invalidate_relationships, upsert_relationship
@@ -51,12 +51,12 @@ def _ensure_candidate_links(
     # its serial loop did the bulk of the byte volume while the worker pool sat idle. Ordered so
     # inode-mates are adjacent, which is what lets the service read a hard-linked backup copy once.
     # Streamed on a read-only connection while the service writes on the writer connection.
-    stream = database.reader().iter_rows(
+    stream = stream_identity_candidates(
+        database.reader(),
         f"""SELECT e.id,e.scan_run_id,e.absolute_path,e.size_bytes,e.device_id,e.inode_or_file_id,e.nlink
             {candidates} AND e.size_bytes IN
               (SELECT size_bytes FROM filesystem_entries WHERE entry_type='file'
-               AND id IN ({entry_sql}) GROUP BY size_bytes HAVING COUNT(*)>1)
-            ORDER BY e.device_id,e.inode_or_file_id,e.id""",
+               AND id IN ({entry_sql}) GROUP BY size_bytes HAVING COUNT(*)>1){{keyset}}""",
         (*scope_params, *scope_params),
     )
     ensure_content_identity(

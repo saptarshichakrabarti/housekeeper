@@ -10,7 +10,7 @@ from typing import Any
 
 from ..config import AppConfig, config_fingerprint, performance_profile
 from ..core import counters
-from ..core.identity import ensure_content_identity
+from ..core.identity import ensure_content_identity, stream_identity_candidates
 from ..core.worker_pool import bounded_map
 from ..database import Database
 from ..jobs import JobCancelled, JobPaused, check_cancelled, create_job, update_job
@@ -239,12 +239,15 @@ def _run_content_analysis(
     # this is what lets the identity service read a hard-linked file once instead of once per
     # snapshot. Content-object id allocation order is not semantic (grouping orders by digest), so
     # the change is invisible downstream.
-    candidates = database.reader().iter_rows(
+    # Keyset-paged so a multi-hour hashing stage never holds one read snapshot (which would pin the
+    # WAL against the identity writer's per-batch commits); the ordering that keeps inode-mates
+    # adjacent for hard-link reuse is the keyset's own order.
+    candidates = stream_identity_candidates(
+        database.reader(),
         f"""SELECT e.id,e.scan_run_id,e.absolute_path,e.suffix,e.size_bytes,e.device_id,e.inode_or_file_id,e.nlink
             FROM filesystem_entries e
             LEFT JOIN entry_content_links l ON l.entry_id=e.id
-            WHERE e.entry_type='file' AND l.entry_id IS NULL AND e.id IN ({entry_sql})
-            ORDER BY e.device_id,e.inode_or_file_id,e.id""",
+            WHERE e.entry_type='file' AND l.entry_id IS NULL AND e.id IN ({entry_sql}){{keyset}}""",
         entry_params,
     )
     eligible = (
