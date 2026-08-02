@@ -135,6 +135,11 @@ def test_format_status_line_is_determinate_indeterminate_or_pipeline_prefixed():
     prefixed = format_status_line(determinate, stage_ref={"stage": 4, "total": 11})
     assert prefixed.startswith("Stage 4/11 · ")
 
+    # A multi-phase job reuses the bar with a new denominator; the phase label is what keeps that
+    # from reading as the stage running twice.
+    phased = format_status_line({**determinate, "current_item": "grouping duplicates"})
+    assert "grouping duplicates" in phased
+
 
 @pytest.fixture
 def dashboard_client(tmp_path):

@@ -37,7 +37,14 @@ def _ensure_candidate_links(
                  AND id IN ({entry_sql}) GROUP BY size_bytes HAVING COUNT(*)>1)""",
             (*scope_params, *scope_params),
         )
-        update_job(database, job_id, total_estimate=int(total["n"]) if total else 0)
+        # Named, because this job runs two phases with two denominators and the progress counter
+        # restarts between them — without the label that reads as the stage running twice.
+        update_job(
+            database,
+            job_id,
+            total_estimate=int(total["n"]) if total else 0,
+            current_item="hashing candidates",
+        )
     sizes = database.iter_rows(
         "SELECT size_bytes FROM filesystem_entries WHERE entry_type='file' "
         f"AND id IN ({entry_sql}) GROUP BY size_bytes HAVING COUNT(*)>1",
@@ -81,7 +88,7 @@ def _ensure_candidate_links(
                     database,
                     job_id,
                     processed_count=processed,
-                    current_item=str(row["absolute_path"]),
+                    current_item=f"hashing candidates · {row['absolute_path']}",
                     state={"phase": "candidate-hashing", "last_entry_id": int(row["id"])},
                 )
     database.connect().commit()
@@ -127,7 +134,13 @@ def run_exact_duplicate_analysis(
                  GROUP BY co.id,co.full_hash,co.size_bytes HAVING COUNT(*)>1)""",
             scope_params,
         )
-        update_job(database, job_id, total_estimate=int(group_total["n"]) if group_total else 0)
+        update_job(
+            database,
+            job_id,
+            processed_count=0,
+            total_estimate=int(group_total["n"]) if group_total else 0,
+            current_item="grouping duplicates",
+        )
     # Two copies means two copies *in the same snapshot*. Counting across scans made a re-scanned
     # unique file a duplicate of its own previous self — the G2 violation this scoping exists for.
     #

@@ -31,12 +31,16 @@ def format_status_line(row: Any, stage_ref: dict[str, Any] | None = None) -> str
     processed = row["processed_count"] or 0
     total = row["total_estimate"]
     rate = throughput(processed, seconds_since(row["started_at"]))
+    current = f" · {row['current_item']}" if row["current_item"] else ""
     if total:
         pct = min(100, int(processed * 100 / total))
         eta = eta_seconds(processed, total, rate)
         eta_text = f"  ETA {format_duration(eta)}" if eta is not None else ""
-        return f"{prefix}[{job_type}] {pct}%  {processed:,}/{total:,}  {rate:,.1f}/s{eta_text}"
-    current = f" · {row['current_item']}" if row["current_item"] else ""
+        # Determinate lines carry ``current_item`` too: a job with more than one phase reuses the
+        # bar with a new denominator, and the label is what distinguishes that from a re-run.
+        return (
+            f"{prefix}[{job_type}] {pct}%  {processed:,}/{total:,}  {rate:,.1f}/s{eta_text}{current}"
+        )
     elapsed = format_duration(seconds_since(row["started_at"]))
     return f"{prefix}[{job_type}] {processed:,} processed · {rate:,.1f}/s · {elapsed}{current}"
 
