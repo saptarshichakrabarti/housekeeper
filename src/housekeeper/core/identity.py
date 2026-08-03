@@ -146,6 +146,11 @@ def ensure_content_identity(
     algorithm = workspace_hash_algorithm(database, hashing["algorithm"])
     if workers is None:
         workers = int(performance_profile(config)["full_hash_workers"])
+    # Bound the native core's per-file BLAKE3 threads so file-level workers and intra-file threads
+    # together stay near the core count; core processes are spawned by the workers below.
+    from ..hashing import bound_native_parallelism
+
+    bound_native_parallelism(workers)
     queue_size = min(
         1_000, max(1, int(config.section("performance")["database_writer_queue_size"]))
     )

@@ -100,6 +100,61 @@ fn unchanged(before: &std::fs::Metadata, after: &std::fs::Metadata) -> bool {
     before.len() == after.len() && before.modified().ok() == after.modified().ok()
 }
 
+/// Files at or above this size take the memory-mapped multithreaded BLAKE3 path when parallelism
+/// is available; below it the sequential read loop wins (mmap setup and thread hand-off dominate).
+const MMAP_MIN_BYTES: u64 = 2 * 1024 * 1024;
+
+/// Whether the multithreaded BLAKE3 path should be used for a file of `size` bytes under `algorithm`.
+///
+/// Only BLAKE3 parallelises (the SHA crates do not), only for large files, and only when there is
+/// more than one thread to use. The thread count comes from `RAYON_NUM_THREADS`, which the Python
+/// caller sets so that file-level workers times intra-file threads stays near the core count — so a
+/// scan already saturating the cores with one file per core runs this path single-threaded (i.e.
+/// takes the sequential branch) instead of oversubscribing.
+fn use_parallel_blake3(algorithm: &str, size: u64) -> bool {
+    if size < MMAP_MIN_BYTES || !algorithm.eq_ignore_ascii_case("blake3") {
+        return false;
+    }
+    match std::env::var("RAYON_NUM_THREADS") {
+        // A set value is authoritative: 1 means the caller wants file-level parallelism only.
+        Ok(value) => value.trim().parse::<usize>().map(|n| n > 1).unwrap_or(true),
+        // Unset: rayon would use every core. The only concurrent hashing (the identity stage) always
+        // sets the cap, so an unset value means a lone caller that should use all cores.
+        Err(_) => true,
+    }
+}
+
+/// Multithreaded BLAKE3 over a memory-mapped file. Byte-identical to the sequential digest — BLAKE3
+/// is a tree hash, so threading changes only speed. mmap can fault (SIGBUS) if the file is truncated
+/// mid-hash; on a static source that does not happen, and if it did the core would die and the
+/// Python caller falls back to its reference implementation.
+fn blake3_mmap_rayon(path: &Path) -> Result<String, String> {
+    let mut hasher = blake3::Hasher::new();
+    hasher.update_mmap_rayon(path).map_err(|e| e.to_string())?;
+    Ok(hex(hasher.finalize().as_bytes()))
+}
+
+/// Sampled quick digest by seeking to each offset — used by the mmap identity path, which computes
+/// the full digest separately. Identical bytes to the streaming capture: `read` at `offset` returns
+/// `[offset, min(offset+chunk, size))`, exactly the range the streaming path accumulates.
+fn quick_from_offsets(
+    path: &Path,
+    algorithm: &str,
+    offsets: &[u64],
+    quick_chunk: usize,
+) -> Result<String, String> {
+    let mut hasher = Hasher::new(algorithm)?;
+    let mut file = File::open(path).map_err(|e| e.to_string())?;
+    let mut buf = vec![0u8; quick_chunk];
+    for &offset in offsets {
+        file.seek(io::SeekFrom::Start(offset))
+            .map_err(|e| e.to_string())?;
+        let n = read_up_to(&mut file, &mut buf, quick_chunk)?;
+        hasher.update(&buf[..n]);
+    }
+    Ok(hasher.finish())
+}
+
 fn hash_whole_file(file: &mut File, algorithm: &str, block_size: usize) -> Result<String, String> {
     let mut hasher = Hasher::new(algorithm)?;
     let mut buf = vec![0u8; block_size.max(1)];
@@ -120,8 +175,12 @@ fn full_hash(
     block_size: usize,
 ) -> Result<(String, u64, bool), String> {
     let before = std::fs::metadata(path).map_err(|e| e.to_string())?;
-    let mut file = File::open(path).map_err(|e| e.to_string())?;
-    let digest = hash_whole_file(&mut file, algorithm, block_size)?;
+    let digest = if use_parallel_blake3(algorithm, before.len()) {
+        blake3_mmap_rayon(path)?
+    } else {
+        let mut file = File::open(path).map_err(|e| e.to_string())?;
+        hash_whole_file(&mut file, algorithm, block_size)?
+    };
     let after = std::fs::metadata(path).map_err(|e| e.to_string())?;
     Ok((digest, after.len(), unchanged(&before, &after)))
 }
@@ -172,6 +231,23 @@ fn identity_hash(
     } else {
         quick_offsets(size, quick_chunk as u64, samples as u64)
     };
+    // Large-file BLAKE3: hash the whole file in parallel off the mmap, then take the samples from
+    // their offsets. Same two digests as the streaming path, one of them multithreaded.
+    if use_parallel_blake3(algorithm, size) {
+        let full_digest = blake3_mmap_rayon(path)?;
+        let quick_digest = if offsets.is_empty() {
+            full_digest.clone()
+        } else {
+            quick_from_offsets(path, algorithm, &offsets, quick_chunk)?
+        };
+        let after = std::fs::metadata(path).map_err(|e| e.to_string())?;
+        return Ok((
+            full_digest,
+            quick_digest,
+            after.len(),
+            unchanged(&before, &after),
+        ));
+    }
     let mut captured: Vec<Vec<u8>> = offsets
         .iter()
         .map(|_| Vec::with_capacity(quick_chunk))

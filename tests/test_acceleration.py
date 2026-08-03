@@ -181,6 +181,36 @@ def test_native_chunker_is_byte_identical_to_python(tmp_path, size):
     assert native_chunks == python_chunks
 
 
+def test_native_mmap_blake3_is_byte_identical_to_python(tmp_path, monkeypatch):
+    """The multithreaded memory-mapped BLAKE3 path must match the sequential Python digest.
+
+    Above the 2 MiB threshold and with more than one rayon thread, the core hashes off an mmap in
+    parallel. BLAKE3 is a tree hash, so the result must equal the byte-by-byte digest exactly — for
+    the full hash and for the identity operation's separately-sampled quick hash.
+    """
+    binary = Path(__file__).resolve().parents[1] / "rust" / "target" / "release" / "housekeeper-core"
+    if not binary.is_file():
+        pytest.skip("native backend not built (make rust)")
+    monkeypatch.setenv("RAYON_NUM_THREADS", "4")  # force the parallel path (subprocess inherits env)
+    size = 2 * 1024 * 1024 + 4096  # just over the mmap threshold
+    path = tmp_path / "big.bin"
+    path.write_bytes(bytes((index * 131 + 7) % 251 for index in range(size)))
+    native = SubprocessBackend([str(binary)])
+    try:
+        assert native.capabilities()["backend"] == "rust"
+        native_full = native.full_hash(str(path), "blake3", 8_388_608)
+        native_identity = native.identity_hash(str(path), "blake3", 8_388_608, 1_048_576, 2)
+    finally:
+        native.close()
+    python_full = PythonBackend().full_hash(str(path), "blake3", 8_388_608)
+    python_identity = PythonBackend().identity_hash(str(path), "blake3", 8_388_608, 1_048_576, 2)
+    assert native_full["full_hash"] == python_full["full_hash"]
+    assert native_identity["full_hash"] == python_identity["full_hash"]
+    assert native_identity["quick_hash"] == python_identity["quick_hash"]
+    # The full digest must also equal the identity op's full digest (same bytes, two code paths).
+    assert native_full["full_hash"] == native_identity["full_hash"]
+
+
 def test_manifest_verification_equivalence(tmp_path):
     import hashlib
 
