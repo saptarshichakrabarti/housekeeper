@@ -56,11 +56,12 @@ class DashboardService:
         overview, refreshed_at = self._summary("overview")
         classifications, _ = self._summary("classifications")
         charts_data, _ = self._summary("charts")
-        # Active-job count stays live: it is volatile and cheap (indexed, tiny jobs table), and a
+        # Active-run count stays live: it is volatile and cheap (indexed, tiny jobs table), and a
         # materialized value would lie about a job started seconds ago.
-        active_jobs = int(
+        active_runs = int(
             self.database.fetch_one(
-                "SELECT COUNT(*) n FROM jobs WHERE status IN ('PENDING','RUNNING','PAUSED','PAUSING','CANCELLING')"
+                "SELECT COUNT(*) n FROM jobs WHERE parent_job_id IS NULL "
+                "AND status IN ('PENDING','RUNNING','PAUSING','CANCELLING')"
             )["n"]
         )
         logical_bytes = int(overview.get("logical_bytes", 0))
@@ -145,10 +146,10 @@ class DashboardService:
                 description="Stored analysis results",
             ),
             Metric(
-                "Active jobs",
-                active_jobs,
-                href="/jobs",
-                description="Queued or in progress",
+                "Active runs",
+                active_runs,
+                href="/jobs?view=runs",
+                description="Top-level operations queued or in progress",
             ),
         )
         charts = tuple(

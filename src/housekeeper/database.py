@@ -1265,12 +1265,21 @@ class Database:
                 for r in c.execute("SELECT status,COUNT(*) FROM review_sessions GROUP BY status")
             },
         }
-        for key, value in values.items():
-            c.execute(
-                "INSERT INTO materialized_summaries(summary_key,value_json,source_scan_run_id,refreshed_at) VALUES(?,?,?,CURRENT_TIMESTAMP) ON CONFLICT(summary_key) DO UPDATE SET value_json=excluded.value_json,source_scan_run_id=excluded.source_scan_run_id,refreshed_at=CURRENT_TIMESTAMP",
-                (key, json.dumps(value, sort_keys=True), scan_run_id),
-            )
-        c.commit()
+        # Rolled back on failure. This upsert contends
+        # with whatever the background worker is writing, so it is the statement most likely in the
+        # whole codebase to raise SQLITE_BUSY. Python has already emitted its implicit BEGIN by then,
+        # and an exception escaping here left this connection — which every dashboard request thread
+        # shares — inside an open transaction for the life of the process. Its subsequent reads then
+        # pinned a WAL snapshot instead of running in autocommit, so the *next* refresh failed as a
+        # stale-snapshot upgrade (SQLITE_BUSY_SNAPSHOT): same "database is locked" text, raised
+        # instantly, with busy_timeout never consulted. One timeout became every refresh failing
+        # until the process restarted.
+        with self.transaction() as writer:
+            for key, value in values.items():
+                writer.execute(
+                    "INSERT INTO materialized_summaries(summary_key,value_json,source_scan_run_id,refreshed_at) VALUES(?,?,?,CURRENT_TIMESTAMP) ON CONFLICT(summary_key) DO UPDATE SET value_json=excluded.value_json,source_scan_run_id=excluded.source_scan_run_id,refreshed_at=CURRENT_TIMESTAMP",
+                    (key, json.dumps(value, sort_keys=True), scan_run_id),
+                )
         return {key: len(value) if isinstance(value, dict) else 0 for key, value in values.items()}
 
     def database_stats(self, check_integrity: bool = True) -> dict[str, int | str]:

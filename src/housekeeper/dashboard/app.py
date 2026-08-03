@@ -3,9 +3,10 @@
 import hashlib
 import json
 import secrets
+import sqlite3
 from html import escape
 from pathlib import Path
-from typing import Annotated
+from typing import Annotated, Any
 from urllib.parse import urlencode
 
 from ..config import DEFAULTS, AppConfig
@@ -332,8 +333,16 @@ def create_app(
             return _resume_button(job_id)
         return ""
 
+    def _runner_busy() -> bool:
+        return runner is not None and runner.status()["state"] == "running"
+
     def _is_resumable(row) -> bool:
         if runner is None or row["status"] not in RESUMABLE_STATES or row["parent_job_id"]:
+            return False
+        # A resume is a re-submission onto the single worker, so while an operation is running there
+        # is nothing a second Resume can do but be rejected as busy. The old row stays PAUSED by
+        # design, so without this its button survives the resume and every further click 409s.
+        if _runner_busy():
             return False
         from .runner import RESUMABLE
 
@@ -383,9 +392,6 @@ def create_app(
             by_type.setdefault(str(row["job_type"]), []).append(int(row["seconds"]))
         return {name: median(values) for name, values in by_type.items() if any(values)}
 
-    def _stages_row_id(job_id: int) -> str:
-        return f"job-stages-{job_id}"
-
     def results_cell(row) -> str:
         """Outcome counts, showing only the non-zero parts so a clean run isn't three zero columns.
 
@@ -402,77 +408,140 @@ def create_app(
             )
         return " · ".join(parts)
 
-    def jobs_table(rows, medians: dict[str, float] | None = None, roots: set[int] | None = None) -> str:
-        headings = [
-            "id",
-            "job_type",
-            "status",
-            "progress",
-            "duration",
-            "results",
-            "updated_at",
-        ]
+    def stage_name(row) -> str:
+        """A readable stage name, with its pipeline-specific label when that adds information."""
+        kind = str(job_type_label(row["job_type"]))
+        label = stage_label(row)
+        if not label or label.casefold() == kind.casefold():
+            return escape(kind)
+        return f"{escape(kind)} <small class='job-scope'>{escape(label)}</small>"
+
+    def run_progress_cell(row, stages) -> str:
+        """Pipeline progress is stage progress; standalone runs keep their unit progress.
+
+        Stage durations vary too much for a percentage over child count to mean elapsed work. A
+        pipeline therefore reports the factual completed/planned stage count. Its current stage has
+        its own honest item progress in the Stages view.
+        """
+        if not stages:
+            return progress_cell(row)
+        completed = sum(
+            stage["status"] in {"COMPLETED", "COMPLETED_WITH_ERRORS"} for stage in stages
+        )
+        planned = int(row["total_estimate"] or 0)
+        total = max(len(stages), planned)
+        noun = "stage" if total == 1 else "stages"
+        return f"{completed}/{total} {noun} complete"
+
+    def jobs_table(
+        rows,
+        *,
+        view: str = "runs",
+        medians: dict[str, float] | None = None,
+        stages_by_run: dict[int, list] | None = None,
+        parents: dict[int, Any] | None = None,
+        show_controls: bool | None = None,
+    ) -> str:
+        if view == "runs":
+            headings = [
+                "id",
+                "job_type",
+                "status",
+                "current_stage",
+                "progress",
+                "duration",
+                "results",
+                "updated_at",
+            ]
+        else:
+            headings = [
+                "id",
+                "parent_job_id",
+                "job_type",
+                "status",
+                "progress",
+                "duration",
+                "results",
+                "updated_at",
+            ]
+        controls_enabled = view == "runs" and not read_only if show_controls is None else show_controls
+        actions_column = view == "runs" or controls_enabled
+        stages_by_run = stages_by_run or {}
+        parents = parents or {}
         # Readable column headers, and one "results" column in place of three near-always-zero
         # success/skip/error columns — those now collapse into a single cell showing only what is
         # non-zero (see results_cell), so a clean run reads as "1,204 ok" rather than three columns.
         heading_labels = {
             "id": "ID",
-            "job_type": "Stage",
+            "parent_job_id": "Run",
+            "job_type": "Run" if view == "runs" else "Stage",
             "status": "Status",
+            "current_stage": "Current stage",
             "progress": "Progress",
             "duration": "Duration",
             "results": "Results",
             "updated_at": "Updated",
             "controls": "",
         }
+        rendered_headings = [*headings, "controls"] if actions_column else headings
         header = "".join(
             f"<th>{escape(heading_labels.get(heading, heading))}</th>"
-            for heading in [*headings, "controls"]
+            for heading in rendered_headings
         )
         body = ""
         for row in rows:
-            parent = row["parent_job_id"]
-            expandable = not parent and int(row["id"]) in (roots or set())
+            job_id = int(row["id"])
+            stages = stages_by_run.get(job_id, [])
             cells = ""
             for heading in headings:
                 if heading == "progress":
-                    cells += f"<td>{progress_cell(row)}</td>"
+                    progress = run_progress_cell(row, stages) if view == "runs" else progress_cell(row)
+                    cells += f"<td>{progress}</td>"
                 elif heading == "duration":
                     cells += f"<td>{duration_cell(row, medians)}</td>"
                 elif heading == "results":
                     cells += f"<td>{results_cell(row)}</td>"
-                elif heading == "job_type" and expandable:
-                    # A pipeline root: its stages are one click away, from data already on the rows.
-                    # The click replaces this row's own empty stages row (below) rather than
-                    # inserting a new one, so clicking twice refreshes the table instead of
-                    # stacking a second copy of it.
-                    cells += (
-                        f"<td title='{escape(str(row[heading]))}'>"
-                        f"{escape(job_type_label(row[heading]))} "
-                        f"<button hx-get='/fragments/jobs/{int(row['id'])}/stages' "
-                        f"hx-target='#{_stages_row_id(int(row['id']))}' "
-                        f"hx-swap='outerHTML'>stages</button></td>"
+                elif heading == "current_stage":
+                    current = next(
+                        (
+                            stage
+                            for stage in stages
+                            if stage["status"] in {*ACTIVE_JOB_STATES, "PAUSED"}
+                        ),
+                        None,
                     )
-                elif heading == "job_type" and parent:
-                    # A stage of a pipeline run: mark it so the hierarchy is visible, and make
-                    # clear that its controls act on the whole run (job control requests
-                    # escalate to the pipeline root).
+                    cells += f"<td>{stage_name(current) if current else ''}</td>"
+                elif heading == "parent_job_id":
+                    parent_id = int(row["parent_job_id"])
+                    parent = parents.get(parent_id)
+                    parent_type = (
+                        f" {escape(str(job_type_label(parent['job_type'])))}" if parent else ""
+                    )
                     cells += (
-                        f"<td title='stage of job #{int(parent)}; controls act on the whole run'>"
-                        f"↳ {escape(job_type_label(row[heading]))}</td>"
+                        f"<td><a href='/jobs?view=runs&amp;run_id={parent_id}#run-{parent_id}'>"
+                        f"#{parent_id}{parent_type}</a></td>"
                     )
                 elif heading == "job_type":
-                    # A standalone job: readable stage name, raw code kept in a tooltip.
                     cells += (
                         f"<td title='{escape(str(row[heading]))}'>"
-                        f"{escape(job_type_label(row[heading]))}</td>"
+                        f"{stage_name(row) if view == 'stages' else escape(str(job_type_label(row[heading])))}"
+                        "</td>"
                     )
                 else:
                     cells += f"<td>{display_cell(heading, row[heading])}</td>"
-            controls = job_controls(row)
-            body += f"<tr>{cells}<td>{controls}</td></tr>"
-            if expandable:
-                body += f"<tr id='{_stages_row_id(int(row['id']))}' class='stages-row' hidden></tr>"
+            if actions_column:
+                controls = job_controls(row) if controls_enabled else ""
+                if view == "runs" and stages:
+                    count = len(stages)
+                    noun = "stage" if count == 1 else "stages"
+                    stages_link = (
+                        f"<a class='table-action' href='/jobs?view=stages&amp;run_id={job_id}'>"
+                        f"View {count} {noun}</a>"
+                    )
+                    controls = f"{controls} {stages_link}".strip()
+                cells += f"<td>{controls}</td>"
+            row_kind = "run" if view == "runs" else "stage"
+            body += f"<tr id='{row_kind}-{job_id}'>{cells}</tr>"
         running = any(row["status"] in {"PENDING", "RUNNING", "PAUSING", "CANCELLING"} for row in rows)
         completed_count = next(
             (
@@ -482,11 +551,14 @@ def create_app(
             ),
             0,
         )
-        empty_message = (
-            'No jobs yet — start a scan or analysis from the <a href="/control">Run page</a>.'
-            if runner is not None
-            else "No jobs have been recorded yet."
-        )
+        if view == "stages":
+            empty_message = "No pipeline stages match these filters."
+        else:
+            empty_message = (
+                'No runs yet — start a scan or analysis from the <a href="/control">Run page</a>.'
+                if runner is not None
+                else "No runs have been recorded yet."
+            )
         empty = f'<tr><td class="empty-state" colspan="99">{empty_message}</td></tr>'
         return (
             f'<div class="jobs-status" data-running="{str(running).lower()}" '
@@ -587,8 +659,17 @@ def create_app(
         # Recompute the materialized summaries on demand (the only path that runs the full-table
         # aggregates during a session). Non-read-only and CSRF-guarded via `guard`.
         guard(x_csrf_token)
-        database.refresh_materialized_summaries()
-        service.invalidate_overview()
+        # Both branches below render the page regardless, because the summaries on screen are only
+        # stale, never wrong. Raising here returned a 500, and htmx does not swap on one, so the
+        # button appeared to do nothing at all.
+        if not _runner_busy():
+            try:
+                database.refresh_materialized_summaries()
+            except sqlite3.OperationalError:
+                # The write lock is held by something other than our own runner (a CLI run against
+                # the same workspace). Recomputing is optional work; the drive has not changed.
+                pass
+            service.invalidate_overview()
         body = templates.get_template("overview.html").render(
             model=service.overview(), can_refresh=True, has_run_page=runner is not None
         )
@@ -1284,8 +1365,29 @@ def create_app(
             limit,
         )
 
+    def validated_run_id(value: str | None) -> int | None:
+        """HTML forms submit an empty number input as ``run_id=``; treat that as no filter."""
+        if value in {None, ""}:
+            return None
+        try:
+            run_id = int(value)
+        except ValueError as exc:
+            raise HTTPException(422, "run_id must be a positive integer") from exc
+        if run_id < 1:
+            raise HTTPException(422, "run_id must be a positive integer")
+        return run_id
+
     @app.get("/jobs", response_class=HTMLResponse)
-    def jobs(limit: int = Query(page_size, ge=1, le=maximum_page_size)):
+    def jobs(
+        limit: int = Query(page_size, ge=1, le=maximum_page_size),
+        view: str = "runs",
+        job_type: str | None = None,
+        status: str | None = None,
+        run_id: str | None = None,
+    ):
+        selected_run_id = validated_run_id(run_id)
+        if view not in {"runs", "stages"}:
+            raise HTTPException(422, "view must be runs or stages")
         # When the runner is active (gui/app, not the read-only viewer) let users start work right
         # here: reuse the Run page's control panel (`#control-panel` + /fragments/control) above the
         # list. It shares the /control/* endpoints, so starting a job also fires HX-Trigger:
@@ -1301,14 +1403,22 @@ def create_app(
                 # it mid-browse.
                 "<div id='folder-browser' class='folder-browser' hidden>"
                 "<div class='folder-browser__panel'><div id='folder-browser-body'>Loading…</div></div></div>"
-                "<h2>Jobs</h2>"
+                "<h2>Activity</h2>"
             )
             folder_picker_version = (static_dir / "folder-picker.js").stat().st_mtime_ns
             scripts = f"<script defer src='/static/folder-picker.js?v={folder_picker_version}'></script>"
+        query: dict[str, str | int] = {"limit": limit, "view": view}
+        if job_type:
+            query["job_type"] = job_type
+        if status:
+            query["status"] = status
+        if selected_run_id is not None:
+            query["run_id"] = selected_run_id
+        fragment_url = f"/fragments/jobs?{escape(urlencode(query), quote=True)}"
         # Only a one-shot load: the fragment itself decides whether to keep polling (see below).
         return page(
             "Jobs",
-            f"{launcher}<section hx-get='/fragments/jobs?limit={limit}' hx-trigger='load'>Loading…</section>",
+            f"{launcher}<section hx-get='{fragment_url}' hx-trigger='load'>Loading…</section>",
             scripts=scripts,
             active_path="jobs",
         )
@@ -1330,40 +1440,84 @@ def create_app(
         return _with_stop_requests([row])[0] if row else None
 
     def _with_stop_requests(rows):
-        """Show a stop request the worker has not written to the row yet.
+        """Show a stop request the row itself does not carry yet.
 
-        A pause/cancel that could not take SQLite's write lock lives in a file until the worker
-        settles it (see ``jobs.pending_control``). Without this the row a click returns still reads
-        RUNNING, so a request that *was* accepted looks like a button that did nothing.
+        Two ways that happens, and this covers both because it asks about the job's whole lineage:
+
+        * the request could not take SQLite's write lock, so it lives in a file until the worker
+          settles the row (see ``jobs.pending_control``);
+        * the request escalated to the pipeline root, so the *stage* row still reads RUNNING while
+          the run it belongs to is already PAUSING.
+
+        Without this, a request that *was* accepted looks like a button that did nothing — and the
+        row comes back still offering Pause, so the next click lands on an already-pausing run and is
+        silently discarded.
         """
-        from ..jobs import pending_control
+        from ..jobs import stop_requested
 
         out = []
         for row in rows:
             pending = (
-                pending_control(database, int(row["id"]))
+                stop_requested(database, int(row["id"]))
                 if row["status"] in {"PENDING", "RUNNING"}
                 else ""
             )
             out.append({**row, "status": pending} if pending else row)
         return out
 
-    def _pipeline_roots(rows) -> set[int]:
-        """Which of these rows have stages, in one query rather than one per row."""
+    def _stages_by_run(rows) -> dict[int, list]:
+        """All stages for the visible runs, fetched once rather than once per row."""
         ids = [int(row["id"]) for row in rows if not row["parent_job_id"]]
         if not ids:
-            return set()
+            return {}
+        placeholders = ",".join("?" for _ in ids)
+        stages = _with_stop_requests(
+            reader.fetch_all(
+                f"SELECT {_JOB_COLUMNS} FROM jobs "
+                f"WHERE parent_job_id IN ({placeholders}) ORDER BY id",
+                tuple(ids),
+            )
+        )
+        grouped: dict[int, list] = {}
+        for stage in stages:
+            grouped.setdefault(int(stage["parent_job_id"]), []).append(stage)
+        return grouped
+
+    def _parent_rows(rows) -> dict[int, Any]:
+        """The parent run labels needed by a flat page of stages."""
+        ids = sorted({int(row["parent_job_id"]) for row in rows if row["parent_job_id"]})
+        if not ids:
+            return {}
         placeholders = ",".join("?" for _ in ids)
         return {
-            int(row["parent_job_id"])
+            int(row["id"]): row
             for row in reader.fetch_all(
-                f"SELECT DISTINCT parent_job_id FROM jobs WHERE parent_job_id IN ({placeholders})",
-                tuple(ids),
+                f"SELECT id,job_type,status FROM jobs WHERE id IN ({placeholders})", tuple(ids)
             )
         }
 
+    def jobs_tabs(view: str) -> str:
+        def tab(name: str, label: str) -> str:
+            current = " aria-current='page'" if view == name else ""
+            return f"<a href='/jobs?view={name}'{current}>{label}</a>"
+
+        description = (
+            "One row per operation. Pipeline details are available in Stages."
+            if view == "runs"
+            else "Individual work within pipeline runs. Pause, cancel, and resume from Runs."
+        )
+        return (
+            "<nav class='jobs-tabs' aria-label='Job views'>"
+            f"{tab('runs', 'Runs')}{tab('stages', 'Stages')}</nav>"
+            f"<p class='jobs-view-description'>{escape(description)}</p>"
+        )
+
     def jobs_filter_form(query: dict[str, str | int]) -> str:
-        types = reader.fetch_all("SELECT DISTINCT job_type FROM jobs ORDER BY job_type")
+        view = str(query["view"])
+        relationship = "parent_job_id IS NULL" if view == "runs" else "parent_job_id IS NOT NULL"
+        types = reader.fetch_all(
+            f"SELECT DISTINCT job_type FROM jobs WHERE {relationship} ORDER BY job_type"
+        )
         from ..jobs import JOB_STATES
 
         def options(name: str, values, selected) -> str:
@@ -1371,43 +1525,56 @@ def create_app(
             out = f"<option value=''{' selected' if not chosen else ''}>any {name}</option>"
             for value in values:
                 mark = " selected" if str(value) == chosen else ""
-                out += f"<option value='{escape(str(value))}'{mark}>{escape(str(value))}</option>"
+                label = job_type_label(value) if name in {"run type", "stage type"} else value
+                out += f"<option value='{escape(str(value))}'{mark}>{escape(str(label))}</option>"
             return out
 
-        checked = " checked" if query.get("pipelines_only") else ""
+        type_label = "run type" if view == "runs" else "stage type"
+        run_value = escape(str(query.get("run_id", "")), quote=True)
         return (
-            "<form class='jobs-filter' hx-get='/fragments/jobs' hx-target='#jobs-fragment' "
-            "hx-swap='outerHTML'>"
+            "<form class='jobs-filter' action='/jobs' method='get'>"
+            f"<input type='hidden' name='view' value='{view}'>"
             f"<input type='hidden' name='limit' value='{int(query['limit'])}'>"
-            "<label>Type <select name='job_type'>"
-            + options("type", [row["job_type"] for row in types], query.get("job_type"))
+            f"<label>Run ID <input type='number' name='run_id' min='1' value='{run_value}' "
+            "inputmode='numeric'></label> "
+            f"<label>{'Run' if view == 'runs' else 'Stage'} type <select name='job_type'>"
+            + options(type_label, [row["job_type"] for row in types], query.get("job_type"))
             + "</select></label> <label>Status <select name='status'>"
             + options("status", sorted(JOB_STATES), query.get("status"))
-            + "</select></label> "
-            f"<label><input type='checkbox' name='pipelines_only' value='1'{checked}> "
-            "pipelines only</label> <button type='submit'>Filter</button></form>"
+            + "</select></label> <button type='submit'>Filter</button> "
+            f"<a href='/jobs?view={view}'>Clear</a></form>"
         )
 
     @app.get("/fragments/jobs", response_class=HTMLResponse)
     def jobs_fragment(
         limit: int = Query(page_size, ge=1, le=maximum_page_size),
+        view: str = "runs",
         job_type: str | None = None,
         status: str | None = None,
+        run_id: str | None = None,
         pipelines_only: bool = False,
     ):
+        selected_run_id = validated_run_id(run_id)
+        # `pipelines_only` is accepted for old bookmarks; Runs is now the explicit/default view.
+        if pipelines_only:
+            view = "runs"
+        if view not in {"runs", "stages"}:
+            raise HTTPException(422, "view must be runs or stages")
         # The jobs fragment is polled by both the Jobs page and the overview, so it is the natural
         # heartbeat for reaping orphans: within one poll interval a dead worker's row turns honest.
         maybe_reconcile()
-        clauses, params = [], []
+        clauses = ["parent_job_id IS NULL" if view == "runs" else "parent_job_id IS NOT NULL"]
+        params: list[object] = []
         if job_type:
             clauses.append("job_type=?")
             params.append(job_type)
         if status:
             clauses.append("status=?")
             params.append(status)
-        if pipelines_only:
-            clauses.append("parent_job_id IS NULL")
-        where = f"WHERE {' AND '.join(clauses)}" if clauses else ""
+        if selected_run_id is not None:
+            clauses.append("id=?" if view == "runs" else "parent_job_id=?")
+            params.append(selected_run_id)
+        where = f"WHERE {' AND '.join(clauses)}"
         rows = _with_stop_requests(
             reader.fetch_all(
                 f"SELECT {_JOB_COLUMNS} FROM jobs {where} ORDER BY id DESC LIMIT ?",
@@ -1417,57 +1584,35 @@ def create_app(
         # Self-suspending poll: keep the 3s cadence only while a job is actually active. When idle
         # the fragment re-arms on the `job-started` event alone (dispatched by the control endpoints
         # when an operation begins) so an idle dashboard issues no repeating job queries at all.
-        active = any(row["status"] in ACTIVE_JOB_STATES for row in rows)
+        #
+        # The runner counts as active even with no active row yet. `submit` returns as soon as the
+        # operation is queued onto the worker thread, and the job row is created *on* that thread, so
+        # the refresh `job-started` triggers can arrive first. Judging by rows alone, that refresh saw
+        # nothing running, disarmed the poll, and the run stayed invisible until a manual reload.
+        active = any(row["status"] in ACTIVE_JOB_STATES for row in rows) or _runner_busy()
         trigger = "every 3s" if active else "job-started from:body"
-        query: dict[str, str | int] = {"limit": limit}
+        query: dict[str, str | int] = {"limit": limit, "view": view}
         if job_type:
             query["job_type"] = job_type
         if status:
             query["status"] = status
-        if pipelines_only:
-            query["pipelines_only"] = 1
+        if selected_run_id is not None:
+            query["run_id"] = selected_run_id
         # The poll keeps the filter: a refresh that silently widened the list would be a lie.
-        table = jobs_table(rows, stage_medians() if active else None, _pipeline_roots(rows))
+        table = jobs_table(
+            rows,
+            view=view,
+            medians=stage_medians() if active else None,
+            stages_by_run=_stages_by_run(rows) if view == "runs" else None,
+            parents=_parent_rows(rows) if view == "stages" else None,
+        )
         wrapper = (
-            f"<div id='jobs-fragment' hx-get='/fragments/jobs?{urlencode(query)}' "
+            f"<div id='jobs-fragment' "
+            f"hx-get='/fragments/jobs?{escape(urlencode(query), quote=True)}' "
             f"hx-trigger='{trigger}' hx-swap='outerHTML'>"
-            f"{jobs_filter_form(query)}{table}</div>"
+            f"{jobs_tabs(view)}{jobs_filter_form(query)}{table}</div>"
         )
         return HTMLResponse(wrapper)
-
-    @app.get("/fragments/jobs/{job_id}/stages", response_class=HTMLResponse)
-    def job_stages_fragment(job_id: Annotated[int, ApiPath(ge=1)], expanded: bool = True):
-        """The stages of one pipeline run, as the run's own expandable row. Same columns, no new data.
-
-        Always the row identified by ``_stages_row_id``, so every click — expand, refresh, or the
-        collapse below — replaces the previous state of it in place.
-        """
-        row_id = _stages_row_id(job_id)
-        if not expanded:
-            return HTMLResponse(f"<tr id='{row_id}' class='stages-row' hidden></tr>")
-        hide = (
-            f"<button hx-get='/fragments/jobs/{job_id}/stages?expanded=0' "
-            f"hx-target='#{row_id}' hx-swap='outerHTML'>hide stages</button>"
-        )
-        rows = reader.fetch_all(
-            f"SELECT {_JOB_COLUMNS} FROM jobs WHERE parent_job_id=? ORDER BY id", (job_id,)
-        )
-        if not rows:
-            return HTMLResponse(
-                f"<tr id='{row_id}' class='stages-row'><td colspan='99'><span class='empty-state'>No stages recorded "
-                f"for this run.</span> {hide}</td></tr>"
-            )
-        body = "".join(
-            f"<tr><td>{int(row['id'])}</td><td>{escape(str(row['job_type']))}</td>"
-            f"<td>{escape(stage_label(row) or '—')}</td><td>{escape(str(row['status']))}</td>"
-            f"<td>{duration_cell(row)}</td></tr>"
-            for row in rows
-        )
-        return HTMLResponse(
-            f"<tr id='{row_id}' class='stages-row'><td colspan='99'>{hide}"
-            "<table><thead><tr><th>id</th><th>job_type</th><th>stage</th>"
-            f"<th>status</th><th>duration</th></tr></thead><tbody>{body}</tbody></table></td></tr>"
-        )
 
     @app.post("/fragments/jobs/{job_id}/control", response_class=HTMLResponse)
     def job_control_fragment(
@@ -1480,6 +1625,19 @@ def create_app(
             raise HTTPException(422, "invalid job control")
         from ..jobs import request_cancel, request_pause
 
+        def rendered_row(row) -> str:
+            row_view = "stages" if row["parent_job_id"] else "runs"
+            table = jobs_table(
+                [row],
+                view=row_view,
+                stages_by_run=_stages_by_run([row]) if row_view == "runs" else None,
+                parents=_parent_rows([row]) if row_view == "stages" else None,
+                # Direct control URLs remain backwards compatible. The Stages tab itself never
+                # renders these controls; all ordinary control actions live in Runs.
+                show_controls=True,
+            )
+            return table.split("<tbody>", 1)[1].split("</tbody>", 1)[0]
+
         if action == "resume":
             if runner is None:
                 raise HTTPException(422, "this dashboard cannot start operations")
@@ -1490,9 +1648,8 @@ def create_app(
             if accepted == "busy":
                 raise HTTPException(409, "an operation is already running")
             row = _job_row(job_id)
-            table = jobs_table([row], roots=_pipeline_roots([row]))
             return HTMLResponse(
-                table.split("<tbody>", 1)[1].split("</tbody>", 1)[0],
+                rendered_row(row),
                 headers={"HX-Trigger": "job-started"},
             )
         try:
@@ -1510,8 +1667,7 @@ def create_app(
         row = _job_row(job_id)
         if not row:
             raise HTTPException(404, "job not found")
-        table = jobs_table([row], roots=_pipeline_roots([row]))
-        return HTMLResponse(table.split("<tbody>", 1)[1].split("</tbody>", 1)[0])
+        return HTMLResponse(rendered_row(row))
 
     if runner is not None:
         from urllib.parse import quote
@@ -1740,7 +1896,8 @@ def create_app(
                     "SELECT COUNT(*) n FROM current_content_objects"
                 ).fetchone()["n"],
                 "jobs": conn.execute(
-                    "SELECT COUNT(*) n FROM jobs WHERE status IN ('PENDING','RUNNING','PAUSED','CANCELLING')"
+                    "SELECT COUNT(*) n FROM jobs WHERE parent_job_id IS NULL "
+                    "AND status IN ('PENDING','RUNNING','PAUSING','CANCELLING')"
                 ).fetchone()["n"],
             }
 

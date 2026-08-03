@@ -53,7 +53,7 @@ def test_results_column_collapses_zero_counts_and_flags_errors(client, database)
     # The three separate zero-prone columns are gone from the header.
     header = client.get("/fragments/jobs").text
     assert "success_count" not in header and "skip_count" not in header
-    assert "<th>Results</th>" in header and "<th>Stage</th>" in header
+    assert "<th>Results</th>" in header and "<th>Run</th>" in header
 
 
 def test_running_job_shows_live_bar_and_rate(client, database):
@@ -130,6 +130,33 @@ def test_pause_on_stage_row_pauses_the_whole_run(client, database):
     assert root_status == "PAUSING"
 
 
+def test_pause_on_stage_row_shows_that_row_as_stopping(client, database):
+    # The request escalates to the root, but the row the click replaces is the stage's own. It read
+    # RUNNING and came back still offering Pause, so the click looked dead — and the next one landed
+    # on an already-pausing run and was silently discarded.
+    _parent, child = _pipeline(database)
+    resp = client.post(
+        f"/fragments/jobs/{child}/control?action=pause",
+        headers={"X-CSRF-Token": _csrf(client)},
+    )
+    assert "stopping…" in resp.text
+    assert f"/fragments/jobs/{child}/control?action=pause" not in resp.text
+    assert f"/fragments/jobs/{child}/control?action=cancel" in resp.text  # still stoppable for good
+
+
+def test_busy_runner_keeps_the_poll_armed_and_withdraws_resume(client, database, monkeypatch):
+    # A resume returns before its job row exists (it is created on the worker thread), so a refresh
+    # judging by rows alone saw nothing active, disarmed the poll, and left the run invisible — with
+    # the old row still offering a Resume that could now only be rejected as busy.
+    from housekeeper.dashboard.runner import OperationRunner
+
+    _paused_quickstart(database)
+    monkeypatch.setattr(OperationRunner, "status", lambda self: {"state": "running"})
+    html = client.get("/fragments/jobs").text
+    assert "every 3s" in html
+    assert "action=resume" not in html
+
+
 def test_stop_controls_replace_the_row_they_target(client, database):
     # The endpoint answers with a whole <tr>. htmx's default innerHTML nested that inside the row it
     # was meant to replace, leaving the row's own status text on screen — the click looked dead.
@@ -154,11 +181,27 @@ def test_row_shows_stopping_while_the_request_is_still_out_of_band(client, datab
     assert f"/fragments/jobs/{job_id}/control?action=pause" not in body  # already stopping
 
 
-def test_stage_rows_are_marked_as_part_of_their_run(client, database):
-    parent, _child = _pipeline(database)
-    html = client.get("/fragments/jobs").text
-    assert f"stage of job #{parent}" in html
-    assert "↳" in html
+def test_default_runs_view_does_not_repeat_stage_rows(client, database):
+    parent, child = _pipeline(database)
+    html = client.get("/fragments/jobs").text.split("<tbody>", 1)[1]
+    assert f"id='run-{parent}'" in html
+    assert f"id='stage-{child}'" not in html
+    assert f"/jobs?view=stages&amp;run_id={parent}" in html
+
+
+def test_pipeline_run_shows_current_stage_and_stage_count_progress(client, database):
+    parent, child = _pipeline(database)
+    update_job(database, parent, total_estimate=5)
+    update_job(database, child, processed_count=42, total_estimate=100)
+    database.connect().commit()  # progress telemetry is published at batch boundaries
+
+    runs = client.get("/fragments/jobs").text
+    assert "<th>Current stage</th>" in runs
+    assert "Scan" in runs
+    assert "0/5 stages complete" in runs
+
+    stages = client.get(f"/fragments/jobs?view=stages&run_id={parent}").text
+    assert "42% 42/100" in stages
 
 
 def test_control_pause_on_finished_job_is_harmless(client, database):
@@ -360,26 +403,46 @@ def test_durations_are_shown_for_finished_and_running_jobs(client, database):
     assert "elapsed" in client.get("/fragments/jobs").text
 
 
-def test_pipeline_root_expands_to_its_stages(client, database):
+def test_stages_view_is_flat_and_links_back_to_its_run(client, database):
     parent, child = _pipeline(database)
-    assert f"/fragments/jobs/{parent}/stages" in client.get("/fragments/jobs").text
-    stages = client.get(f"/fragments/jobs/{parent}/stages").text
-    assert f"<td>{child}</td>" in stages and "SCAN" in stages
-    # A job with no children says so rather than rendering an empty table.
-    assert "No stages recorded" in client.get(f"/fragments/jobs/{child}/stages").text
+    stages = client.get(f"/fragments/jobs?view=stages&run_id={parent}").text
+    rows = stages.split("<tbody>", 1)[1]
+    assert f"id='stage-{child}'" in rows
+    assert f"id='run-{parent}'" not in rows
+    assert f"/jobs?view=runs&amp;run_id={parent}#run-{parent}" in rows
+    assert "Scan" in rows
+    assert "action=pause" not in rows and "action=cancel" not in rows
 
 
-def test_stages_expand_in_place_and_collapse(client, database):
-    # The button used to insert a row after the pipeline's own (hx-swap=afterend), so every click
-    # appended another copy of the same table. It now replaces one row identified by the run.
+def test_jobs_tabs_and_filters_are_url_backed(client, database):
     parent, _child = _pipeline(database)
-    table = client.get("/fragments/jobs").text
-    assert f"hx-target='#job-stages-{parent}' hx-swap='outerHTML'" in table
-    assert f"<tr id='job-stages-{parent}' class='stages-row' hidden></tr>" in table  # the row the click replaces
+    page = client.get(f"/jobs?view=stages&run_id={parent}").text
+    assert "hx-get='/fragments/jobs?" in page
+    assert "view%3Dstages" not in page  # query pairs, not one encoded opaque value
+    assert "view=stages" in page and f"run_id={parent}" in page
 
-    stages = client.get(f"/fragments/jobs/{parent}/stages").text
-    assert stages.startswith(f"<tr id='job-stages-{parent}' class='stages-row'>")  # same row, so it cannot stack
-    assert f"/fragments/jobs/{parent}/stages?expanded=0" in stages  # and it can be collapsed again
-    assert client.get(f"/fragments/jobs/{parent}/stages?expanded=0").text == (
-        f"<tr id='job-stages-{parent}' class='stages-row' hidden></tr>"
-    )
+    fragment = client.get(f"/fragments/jobs?view=stages&run_id={parent}").text
+    assert "<a href='/jobs?view=stages' aria-current='page'>Stages</a>" in fragment
+    assert "<form class='jobs-filter' action='/jobs' method='get'>" in fragment
+    assert "name='view' value='stages'" in fragment
+    assert f"name='run_id' min='1' value='{parent}'" in fragment
+
+    # Browsers submit an untouched number input as an empty value; that means "no filter".
+    assert client.get("/jobs?view=runs&run_id=").status_code == 200
+    assert client.get("/jobs?view=runs&run_id=not-a-number").status_code == 422
+
+
+def test_stages_view_excludes_standalone_runs(client, database):
+    standalone = create_job(database, "SCAN")
+    update_job(database, standalone, "RUNNING")
+    _parent, child = _pipeline(database)
+    rows = client.get("/fragments/jobs?view=stages").text.split("<tbody>", 1)[1]
+    assert f"id='stage-{child}'" in rows
+    assert f"id='stage-{standalone}'" not in rows
+
+
+def test_api_overview_counts_active_runs_not_active_stage_rows(client, database):
+    _root, _stage = _pipeline(database)
+    paused = create_job(database, "ANALYSE_ALL")
+    update_job(database, paused, "PAUSED")
+    assert client.get("/api/overview").json()["jobs"] == 1

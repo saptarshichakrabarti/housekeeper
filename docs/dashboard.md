@@ -51,14 +51,24 @@ All three respect read-only mode (they are read-only by construction) and the st
 
 ## Jobs
 
-The Jobs page filters by type and status (and "pipelines only"), shows each job's duration —
-elapsed while running, with the median of completed jobs of that type as advisory context — and
-expands a pipeline row into its stages. Each pipeline owns one `job-stages-<id>` row, empty until
-expanded: **stages** replaces that row and **hide stages** empties it again, so clicking twice
-refreshes the table rather than stacking a second copy of it. A stopped pipeline (`PAUSED`, `CANCELLED`, `FAILED`,
+The Jobs page separates two levels of activity instead of listing the same work twice:
+
+- **Runs** is the default and contains top-level operations only (`parent_job_id IS NULL`). A Quick
+  start is one row, its progress is reported as completed/planned stages, and its current stage is
+  named separately. Pipeline rows link to **View N stages**; standalone runs have ordinary item
+  progress and no stages link.
+- **Stages** is a flat, read-only history of the child work inside pipelines
+  (`parent_job_id IS NOT NULL`). Each row carries full progress, results, duration, and a link back
+  to its run. A run link opens this tab with `run_id` in the URL, so refresh, browser history, and
+  bookmarks preserve the selection.
+
+Both tabs filter by run id, their own type, and status. Pause, Cancel, and Resume live only on Runs:
+stage control requests have always escalated to their pipeline root, so presenting them as stage
+actions would misstate their scope. A stopped pipeline (`PAUSED`, `CANCELLED`, `FAILED`,
 `INTERRUPTED`) offers **Resume**, which submits the same operation again. The old row stays terminal
 and the new pipeline records `{"resumes": <old id>}` in its scope. A viewer dashboard (no runner)
-never shows the button.
+never shows the button. The overview's **Active runs** metric likewise counts top-level operations
+only and excludes paused runs.
 
 **Pause and Cancel** are cooperative, and the request travels out-of-band: SQLite has one writer, so
 a stage that is mid-transaction owns the lock and a request written only to the `jobs` row would wait

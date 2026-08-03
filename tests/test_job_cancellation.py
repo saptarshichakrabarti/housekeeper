@@ -241,6 +241,33 @@ def test_new_job_does_not_inherit_a_stop_request_from_a_reused_id(database):
     assert jobs_module.pending_control(database, job_id + 1) == ""
 
 
+def test_pause_request_does_not_outlive_the_pause_it_caused(database):
+    # PAUSED is honoured but not terminal, and the request file used to be cleared only on a terminal
+    # state. Resuming the same row therefore re-paused it at the very first checkpoint.
+    from housekeeper.jobs import request_pause, resume_job
+
+    job_id = create_job(database, "SCAN")
+    update_job(database, job_id, "RUNNING")
+    request_pause(database, job_id)
+    update_job(database, job_id, "PAUSED")
+    assert jobs_module.pending_control(database, job_id) == ""
+    resume_job(database, job_id)
+    assert not jobs_module.pause_requested(database, job_id)
+
+
+def test_stop_requested_reports_a_pause_the_run_is_under(database):
+    # A stage carries neither the status nor the file: the request escalated to the root.
+    root = create_job(database, "QUICKSTART")
+    update_job(database, root, "RUNNING")
+    stage = create_job(database, "SCAN", parent_job_id=root)
+    update_job(database, stage, "RUNNING")
+    assert jobs_module.stop_requested(database, stage) == ""
+    jobs_module.request_pause(database, stage)
+    assert jobs_module.stop_requested(database, stage) == "PAUSING"
+    jobs_module.request_cancel(database, stage)
+    assert jobs_module.stop_requested(database, stage) == "CANCELLING"  # cancel wins over pause
+
+
 def test_poll_throttle_survives_interleaved_jobs(database):
     # A pipeline interleaves a stage's per-entry checkpoints with the root's own checks. With a
     # single throttle slot that flip made every call poll; each job now keeps its own timestamp,

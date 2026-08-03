@@ -5,6 +5,7 @@ import json
 import pytest
 
 from housekeeper.dashboard.services import DashboardService
+from housekeeper.jobs import create_job, update_job
 from housekeeper.scanner import DriveScanner
 
 # Tables whose presence in an overview query means we are scanning the inventory live.
@@ -81,6 +82,20 @@ def test_overview_metrics_match_live_counts(database, config, fixture_root):
             "SELECT COUNT(*) n FROM current_classifications WHERE classification LIKE 'REVIEW_%'"
         )["n"]
     )
+
+
+def test_active_runs_counts_a_pipeline_once_and_excludes_paused_runs(database):
+    root = create_job(database, "QUICKSTART")
+    update_job(database, root, "RUNNING")
+    stage = create_job(database, "SCAN", parent_job_id=root)
+    update_job(database, stage, "RUNNING")
+    paused = create_job(database, "ANALYSE_ALL")
+    update_job(database, paused, "PAUSED")
+
+    metrics = {metric.label: metric for metric in DashboardService(database.reader()).overview().metrics}
+    assert "Active jobs" not in metrics
+    assert metrics["Active runs"].value == 1
+    assert metrics["Active runs"].href == "/jobs?view=runs"
 
 
 def test_overview_view_model_is_ttl_cached(database, config, fixture_root):
@@ -172,3 +187,40 @@ def test_refresh_blocked_on_read_only_dashboard(database):
     ro = TestClient(create_app(database, read_only=True))
     token = ro.get("/api/csrf").json()["token"]
     assert ro.post("/refresh", headers={"X-CSRF-Token": token}).status_code == 403
+
+
+def test_a_locked_refresh_rolls_back_instead_of_poisoning_the_connection(database, config, fixture_root):
+    """One SQLITE_BUSY must not turn into every later refresh failing instantly.
+
+    ``Database.connect()`` is one connection shared by every dashboard request thread. Python emits
+    an implicit BEGIN before the summaries upsert, so an exception escaping it used to leave that
+    connection in an open transaction: its later reads pinned a WAL snapshot rather than running in
+    autocommit, and the next refresh failed as a stale-snapshot upgrade (SQLITE_BUSY_SNAPSHOT) —
+    the same "database is locked", raised in microseconds, with busy_timeout never consulted.
+    """
+    import sqlite3
+
+    from housekeeper.database import Database
+
+    _scan(database, config, fixture_root)
+    # A second connection to the same file, holding the single WAL write lock like a running stage.
+    worker = Database(database.path)
+    worker.connect().execute("PRAGMA busy_timeout=100")
+    worker.connect().execute(
+        "INSERT INTO materialized_summaries(summary_key,value_json) VALUES('probe','{}')"
+    )
+    database.connect().execute("PRAGMA busy_timeout=100")
+    try:
+        with pytest.raises(sqlite3.OperationalError):
+            database.refresh_materialized_summaries()
+        # The failure must not have left the shared connection mid-transaction.
+        assert not database.connect().in_transaction
+    finally:
+        database.connect().execute("PRAGMA busy_timeout=5000")
+        worker.connect().rollback()
+        worker.close()
+    # ...so once the lock is free the very next refresh succeeds, rather than failing forever.
+    database.refresh_materialized_summaries()
+    assert database.fetch_one(
+        "SELECT COUNT(*) n FROM materialized_summaries WHERE summary_key='overview'"
+    )["n"] == 1

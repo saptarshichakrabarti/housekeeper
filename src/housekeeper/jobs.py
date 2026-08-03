@@ -88,7 +88,12 @@ def _request_control(database: Database, job_id: int, status: str) -> None:
     except sqlite3.OperationalError:
         # A worker is mid-transaction. It will see the file and settle the row itself; the UI reads
         # the same file, so the job still shows as stopping in the meantime.
-        pass
+        #
+        # Rolled back, not merely swallowed: Python emitted an implicit BEGIN before that UPDATE, so
+        # without this the dashboard's shared connection stays in an open transaction and every later
+        # read on it serves a pinned snapshot — a resume would then re-read the pre-pause status and
+        # refuse the job as unresumable.
+        connection.rollback()
     finally:
         connection.execute("PRAGMA busy_timeout=5000")
 
@@ -169,7 +174,11 @@ def update_job(
     # which is what turned a million-entry stage into a million fsync-bounded transactions.
     if status is not None:
         database.connect().commit()
-    if status in TERMINAL_STATES:
+    if status in TERMINAL_STATES or status == "PAUSED":
+        # PAUSED is honoured-but-not-terminal, and its request must still be cleared: the file
+        # outlived the pause, so resuming the same row (``resume_job``) re-paused it at the first
+        # checkpoint. Only this job's own request is dropped — a pipeline root keeps its file until
+        # it settles too, so stages still in flight go on observing the pause.
         _clear_control(database, job_id)  # the request has been honoured
 
 
@@ -275,6 +284,22 @@ def _lineage_statuses(database: Database, job_id: int) -> set[str]:
         statuses.add(str(row["status"]))
         statuses.add(pending_control(database, int(row["id"])))
     return statuses - {""}
+
+
+def stop_requested(database: Database, job_id: int) -> str:
+    """The stop this job is under, its own or an ancestor's: ``CANCELLING``, ``PAUSING`` or ``""``.
+
+    Control requests escalate to the pipeline root (see ``request_pause``), so a stage's own row and
+    file say nothing about a pause the whole run is under. This is what lets the UI show a stage as
+    stopping the moment the run is asked to stop, instead of leaving its buttons looking untouched.
+    Cancel wins over pause, as it does at the checkpoint.
+    """
+    statuses = _lineage_statuses(database, job_id)
+    if statuses & {"CANCELLING", "CANCELLED"}:
+        return "CANCELLING"
+    if statuses & {"PAUSING", "PAUSED"}:
+        return "PAUSING"
+    return ""
 
 
 def cancellation_requested(database: Database, job_id: int) -> bool:
