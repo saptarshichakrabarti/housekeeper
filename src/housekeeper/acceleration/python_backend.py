@@ -12,7 +12,33 @@ from ..hashing import (
 
 class PythonBackend:
     def capabilities(self):
-        return {"backend": "python", "protocol_version": "1", "operations": ["capabilities", "scan", "quick_hash", "full_hash", "identity_hash", "aggregate_directories", "verify_manifest", "copy_and_verify"]}
+        return {"backend": "python", "protocol_version": "1", "operations": ["capabilities", "scan", "quick_hash", "full_hash", "identity_hash", "chunk_file", "aggregate_directories", "verify_manifest", "copy_and_verify"]}
+
+    def chunk_file(
+        self,
+        path: str,
+        minimum_chunk_size: int = 16_384,
+        average_chunk_size: int = 65_536,
+        maximum_chunk_size: int = 262_144,
+        hash_algorithm: str = "sha256",
+    ) -> dict[str, Any]:
+        """Content-defined chunks for a file — the reference the Rust core must match byte for byte."""
+        from ..chunking.model import ChunkProfile
+        from ..chunking.python_backend import chunk_file as _chunk
+
+        profile = ChunkProfile(
+            "_", "fastcdc_gear", "1", minimum_chunk_size, average_chunk_size, maximum_chunk_size, hash_algorithm
+        )
+        chunks = [
+            {
+                "sequence_index": record.sequence_index,
+                "byte_offset": record.byte_offset,
+                "size_bytes": record.size_bytes,
+                "chunk_hash": record.chunk_hash,
+            }
+            for record in _chunk(Path(path), profile)
+        ]
+        return {"status": "ok", "count": len(chunks), "chunks": chunks}
 
     def full_hash(self, path: str, algorithm: str = "sha256", block_size: int = 8_388_608):
         result = _compute_full_hash_python(Path(path), algorithm, block_size)

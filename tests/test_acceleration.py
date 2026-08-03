@@ -130,6 +130,57 @@ def test_native_backend_is_byte_identical_to_python(tmp_path, size, algorithm):
         native.close()
 
 
+def test_chunk_file_python_contract(tmp_path):
+    """The in-process reference produces a sane chunk sequence with full, gapless coverage."""
+    path = tmp_path / "data.bin"
+    path.write_bytes(bytes((index * 131 + 7) % 251 for index in range(200_003)))
+    reply = PythonBackend().chunk_file(str(path), 1024, 4096, 16384)
+    assert reply["status"] == "ok"
+    chunks = reply["chunks"]
+    assert reply["count"] == len(chunks) >= 2
+    assert chunks[0]["byte_offset"] == 0
+    # Contiguous, gapless, and covering every byte exactly once.
+    running = 0
+    for index, chunk in enumerate(chunks):
+        assert chunk["sequence_index"] == index
+        assert chunk["byte_offset"] == running
+        running += chunk["size_bytes"]
+    assert running == 200_003
+
+
+def test_subprocess_chunk_file_matches_python_backend(tmp_path):
+    """The JSONL subprocess backend must chunk identically to the in-process backend."""
+    path = tmp_path / "data.bin"
+    path.write_bytes(bytes((index * 97 + 3) % 253 for index in range(150_000)))
+    reference = PythonBackend().chunk_file(str(path), 1024, 4096, 16384)
+    remote = SubprocessBackend(_SERVER).chunk_file(str(path), 1024, 4096, 16384)
+    assert remote["chunks"] == reference["chunks"]
+
+
+@pytest.mark.parametrize("size", [0, 1, 1023, 1024, 5000, 16384, 16385, 60000, 200003])
+def test_native_chunker_is_byte_identical_to_python(tmp_path, size):
+    """The native CDC chunker must reproduce the reference boundaries and SHA-256 digests exactly.
+
+    A "faster" chunker that cut even one boundary differently would fabricate a different chunk
+    index and silently break every partial-overlap relationship built on it — the same failure the
+    hash parity test guards against, at the chunk layer.
+    """
+    binary = Path(__file__).resolve().parents[1] / "rust" / "target" / "release" / "housekeeper-core"
+    if not binary.is_file():
+        pytest.skip("native backend not built (make rust)")
+    path = tmp_path / "data.bin"
+    path.write_bytes(bytes((index * 131 + 7) % 251 for index in range(size)))
+    native = SubprocessBackend([str(binary)])
+    try:
+        assert native.capabilities()["backend"] == "rust"
+        assert "chunk_file" in native.capabilities()["operations"]
+        native_chunks = native.chunk_file(str(path), 1024, 4096, 16384)["chunks"]
+    finally:
+        native.close()
+    python_chunks = PythonBackend().chunk_file(str(path), 1024, 4096, 16384)["chunks"]
+    assert native_chunks == python_chunks
+
+
 def test_manifest_verification_equivalence(tmp_path):
     import hashlib
 

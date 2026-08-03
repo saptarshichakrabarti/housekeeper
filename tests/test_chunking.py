@@ -1,6 +1,9 @@
 """Content-defined chunking + partial-overlap tests (Tier-4)."""
 
 import random
+from pathlib import Path
+
+import pytest
 
 from housekeeper.analysers.content_defined_chunks import (
     run_chunk_analysis,
@@ -106,6 +109,54 @@ def test_occurrence_counts_and_index_bytes_are_exact_and_stable(config, database
     run_chunk_analysis(database, config)
     assert occurrence_snapshot() == stored
     assert occurrence_snapshot() == true_counts()
+
+
+def test_native_backend_produces_identical_chunk_index(config, database, tmp_path, monkeypatch):
+    """Driving the analyser through the native core must store exactly the Python reference's chunks.
+
+    The dispatcher prefers ``housekeeper-core`` when present; this points it at the built binary and
+    asserts the persisted chunk hashes and sizes are identical to a Python-only run of the same bytes.
+    """
+    binary = Path(__file__).resolve().parents[1] / "rust" / "target" / "release" / "housekeeper-core"
+    if not binary.is_file():
+        pytest.skip("native backend not built (make rust)")
+    import housekeeper.hashing as hashing_module
+
+    _small_chunks(config)
+    root = tmp_path / "src"
+    root.mkdir()
+    (root / "a.bin").write_bytes(bytes(random.Random(21).getrandbits(8) for _ in range(180_000)))
+    DriveScanner(database, config).scan(root, incremental=False)
+
+    def native_chunks():
+        # Fresh per-thread backend detection against the real binary.
+        hashing_module._native_backends.__dict__.pop("backend", None)
+        monkeypatch.setenv("HOUSEKEEPER_CORE", str(binary))
+        try:
+            run_chunk_analysis(database, config)
+        finally:
+            monkeypatch.delenv("HOUSEKEEPER_CORE", raising=False)
+            hashing_module._native_backends.__dict__.pop("backend", None)
+        return [
+            (r["chunk_hash"], int(r["size_bytes"]))
+            for r in database.fetch_all(
+                "SELECT c.chunk_hash,o.size_bytes FROM chunk_occurrences o "
+                "JOIN content_chunks c ON c.id=o.chunk_id ORDER BY o.sequence_index"
+            )
+        ]
+
+    native = native_chunks()
+    assert native  # the file really was chunked
+    clear_chunk_index(database, None, dry_run=False)
+    run_chunk_analysis(database, config)  # Python path (no HOUSEKEEPER_CORE)
+    python = [
+        (r["chunk_hash"], int(r["size_bytes"]))
+        for r in database.fetch_all(
+            "SELECT c.chunk_hash,o.size_bytes FROM chunk_occurrences o "
+            "JOIN content_chunks c ON c.id=o.chunk_id ORDER BY o.sequence_index"
+        )
+    ]
+    assert native == python
 
 
 def test_estimate_and_clear_are_derived_only(config, database, tmp_path):

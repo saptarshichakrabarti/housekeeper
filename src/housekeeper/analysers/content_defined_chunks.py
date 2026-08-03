@@ -9,10 +9,10 @@ from __future__ import annotations
 
 from pathlib import Path
 
+from ..chunking.backend import chunk_file
 from ..chunking.index import store_chunks
 from ..chunking.overlap import compute_overlap, generate_overlap_candidates
 from ..chunking.profiles import get_or_create_chunk_profile_id, profile_from_config
-from ..chunking.python_backend import chunk_file
 from ..relationships import upsert_content_relationship
 
 ALGORITHM = "fastcdc_gear"
