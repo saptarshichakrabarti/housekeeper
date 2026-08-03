@@ -1,4 +1,4 @@
-// drive_housekeeper dashboard theme switcher.
+// housekeeper dashboard theme switcher.
 // External file (CSP is script-src 'self'; inline scripts are blocked).
 // Persists the choice locally; no network, no telemetry.
 (function () {

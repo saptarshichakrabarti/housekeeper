@@ -1,16 +1,16 @@
 """The shared content-identity service: one place, byte-identical to what the six loops wrote.
 
-Every assertion here is on a property the callers depended on — the digest is the real SHA-256, the
+Every assertion here is on a property the callers depended on — the digest is the real digest of the
+configured algorithm (BLAKE3 by default, SHA-256 on a workspace that already used it), the
 quick digest is a free by-product (never a second read), the result does not depend on how many
 worker threads hashed it, and an unreadable file is recorded or skipped exactly as each caller asked.
 """
 
 from __future__ import annotations
 
-import hashlib
-
 from housekeeper.core import counters
 from housekeeper.core.identity import ensure_content_identity
+from housekeeper.hashing import new_hasher, workspace_hash_algorithm
 from housekeeper.scanner import DriveScanner
 
 
@@ -41,7 +41,11 @@ def test_service_writes_real_digests_links_and_signatures(config, database, tmp_
     assert result["errors"] == 0
 
     for name, body in bodies.items():
-        digest = hashlib.sha256(body.encode()).hexdigest()
+        hasher = new_hasher(
+            workspace_hash_algorithm(database, config.section("hashing")["algorithm"])
+        )
+        hasher.update(body.encode())
+        digest = hasher.hexdigest()
         row = database.fetch_one(
             """SELECT s.full_hash,s.quick_hash,s.hash_status,co.full_hash AS co_hash
                FROM filesystem_entries e

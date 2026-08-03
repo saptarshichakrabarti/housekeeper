@@ -9,7 +9,7 @@ scanner:
   max_file_size_for_content_analysis: 1073741824
   excluded_paths: []
   excluded_names: []
-hashing: {algorithm: sha256, quick_hash_chunk_bytes: 1048576, quick_hash_middle_samples: 2, full_hash_block_bytes: 8388608}
+hashing: {algorithm: auto, quick_hash_chunk_bytes: 1048576, quick_hash_middle_samples: 2, full_hash_block_bytes: 8388608}
 archives: {max_members: 100000, max_declared_uncompressed_bytes: 536870912000}
 documents: {max_text_characters: 2000000, store_normalized_text: true}
 images: {enable_perceptual_hashing: true, max_pixels: 200000000, create_contact_sheets: true, contact_sheet_columns: 4, contact_sheet_cell_pixels: 160, contact_sheet_max_members: 36}
@@ -24,14 +24,30 @@ incremental: {detect_renames: true, reuse_unchanged_stages: true}
 content_store: {store_normalized_text: true, compress_text: true, store_image_thumbnails: true, thumbnail_max_dimension: 512}
 dashboard: {enabled: true, host: 127.0.0.1, port: 8765, open_browser: true, read_only: false, page_size: 100, maximum_page_size: 500, allow_non_loopback: false}
 graph: {enabled: true, default_max_nodes: 500, hard_max_nodes: 5000, default_max_edges: 2000, hard_max_edges: 20000, minimum_edge_confidence: 0.70}
+document_similarity:
+  enabled: true
+  shingle_type: word
+  shingle_size: 5
+  minhash_permutations: 128
+  lsh_threshold: 0.75
+  verification_threshold: 0.80
+  minimum_tokens: 20
+  maximum_quickstart_documents: 50000
+  maximum_quickstart_tokens: 2000000
+normalization:
+  office: {enabled: true}
+  pdf: {enabled: true}
+  images: {decoded_pixel_hash: true, orientation_normalized_hash: true}
+  archives: {enabled: true, max_content_bytes: 268435456}
 performance:
-  # "auto" classifies from the path (network mounts) and is otherwise conservative. Set this
-  # explicitly to ssd on solid-state storage — nothing measures the drive for you any more.
+  # "auto" uses read-only OS mount/device metadata on the first run, then prefers measured hash
+  # throughput from the previous run. Unknown devices retain the conservative HDD profile.
   storage_profile: auto
   profiles:
-    hdd: {full_hash_workers: 1, parser_workers: 2}
-    ssd: {full_hash_workers: 4, parser_workers: 4}
-    network: {full_hash_workers: 1, parser_workers: 2}
+    hdd: {full_hash_workers: 1, parser_workers: 2, traversal_workers: 1}
+    ssd: {full_hash_workers: 8, parser_workers: 4, traversal_workers: 4}
+    nvme: {full_hash_workers: 16, parser_workers: 6, traversal_workers: 8}
+    network: {full_hash_workers: 1, parser_workers: 2, traversal_workers: 4}
   # Depart from the selected profile here, by name. Anything else is rejected at load.
   overrides: {}
   batch_size: 1000

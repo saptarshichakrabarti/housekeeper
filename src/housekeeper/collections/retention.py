@@ -1,8 +1,7 @@
 """Advisory personal retention policies applied to record series.
 
-These are personal organizational guidelines, not legal retention determinations. Application is
-advisory: it summarizes what a series' policy would preserve vs. review; it never changes a
-protective classification or moves anything. Protection always takes precedence.
+Personal guidelines, not legal determinations. Summarizes preserve vs review; never moves
+files or weakens protection.
 """
 
 from __future__ import annotations

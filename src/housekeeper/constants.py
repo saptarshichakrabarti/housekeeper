@@ -133,6 +133,9 @@ class CollectionValue(StrEnum):
     UNRESOLVED = "UNRESOLVED"
 
 
+#: What a digest recorded before its algorithm was written down was computed with. Manifests and
+#: transaction records that predate ``expected_hash_algorithm`` were always SHA-256.
+LEGACY_HASH_ALGORITHM = "sha256"
 SCHEMA_VERSION = 9
 PROTECTED_SUFFIXES = {
     ".pem",

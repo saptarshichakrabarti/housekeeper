@@ -1,13 +1,8 @@
-"""Lazy, folder-by-folder graph exploration over the current inventory.
+"""Lazy folder-by-folder graph over the current inventory.
 
-The explorer serves the dashboard's Obsidian-style graph view: the initial payload is only the
-scanned source roots (collapsed), and every subsequent request returns the immediate children of
-one node the user clicked. Nothing is ever expanded server-side beyond a single level, so the
-response size is bounded by ``limit`` regardless of inventory size.
-
-Node identity reuses the relationship-store conventions (``SOURCE_ROOT:<id>``, ``ENTRY:<id>``) so
-a node found here can be handed to the existing relationship projections unchanged. Requests are
-validated against a strict pattern — this endpoint never accepts paths or free-form SQL inputs.
+One level per request (source roots first); response bounded by ``limit``. Node ids match
+relationship-store conventions so projections can reuse them. Inputs are pattern-validated —
+no free-form paths or SQL.
 """
 
 from __future__ import annotations
@@ -123,13 +118,11 @@ _RECLAIM_JOINS = """
 def _subtree_reclaim(database, directory_ids: list[int]) -> dict[int, dict[str, int]]:
     """Recursive size and reclaimable bytes under each directory, in one grouped query.
 
-    A range over ``relative_path`` rather than ``LIKE``, so the descendant sweep uses the index (see
-    ``path_utils.descendant_path_range``).
+    Range over ``relative_path`` (not ``LIKE``) so the descendant sweep uses the index
+    (see ``path_utils.descendant_path_range``).
 
-    ponytail: one pass over the expanded folder's subtree per request — which is precisely the
-    question being asked, and bounded by the folder. If a treemap of a million-entry root ever needs
-    to be instant, roll these two sums into ``directory_summaries`` where the stage already walks
-    every subtree once.
+    One pass over the expanded folder's subtree per request — bounded by the folder. If a
+    treemap of a million-entry root must be instant, roll these sums into ``directory_summaries``.
     """
     if not directory_ids:
         return {}

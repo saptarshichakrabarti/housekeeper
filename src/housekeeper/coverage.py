@@ -1,16 +1,8 @@
-"""Is this drive's content present somewhere else? — the question asked before retiring a backup.
+"""Cross-source coverage: is this source's content verified on another current source?
 
-For every file of one source, does its content object also hang off a *current* entry of another
-source? Content identity is global in this database, so the answer is a join rather than a new
-analysis. Three buckets, and the third is the safety-critical one:
-
-* **verified elsewhere** — same content, verified by hash, on at least one other source;
-* **only copy here** — verified identity, and no other current source has it;
-* **unknown** — no verified hash at all, so *nothing* is claimed. An unhashed file is never counted
-  as covered.
-
-The wording is deliberate: "verified present elsewhere", never "safe to delete". This module reads;
-moving files remains the separate, explicit, manifest-verified flow.
+Buckets: verified elsewhere / only copy here / unknown (no verified hash — never treated as
+covered). Wording is "verified present elsewhere", never "safe to delete". Read-only; movement
+stays on the explicit manifest path.
 """
 
 from __future__ import annotations

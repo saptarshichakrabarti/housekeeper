@@ -1,9 +1,7 @@
 """Source-code / research project detection and regenerable-content accounting.
 
-Detects project roots from marker files, then attributes each project's recursive bytes to
-source, generated (regenerable), and environment buckets so the review workflow can surface
-high-confidence regenerable directories without ever moving a directory wholesale.  ``.git``
-is always treated as protected project state, never as clutter.
+Detects roots from marker files; buckets recursive bytes as source / generated / environment.
+``.git`` is always protected project state, never clutter.
 """
 
 from __future__ import annotations

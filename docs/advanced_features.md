@@ -22,7 +22,9 @@ deletes or auto-moves a file; the strongest action remains manifest-approved mov
 - **Does not prove:** anything on its own — MinHash only generates candidates; a relationship
   requires exact verification ≥ `verification_threshold`. Shared boilerplate/templates are
   rejected by verification, never merged into a version family.
-- **Cost:** dependency-free; one signature per document content object.
+- **Cost:** dependency-free; one signature per document content object. Quickstart bounds both
+  document count (`maximum_quickstart_documents`) and retained tokens
+  (`maximum_quickstart_tokens`); the explicit analyser command remains available for larger corpora.
 - **Full reference:** `docs/document_similarity.md`.
 
 ## Format equivalence — `analyse normalized-content`  (Tiers 2–3)

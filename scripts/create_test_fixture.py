@@ -1,8 +1,7 @@
 """Create a deterministic synthetic drive tree for testing.
 
-The generator never touches anything outside the explicitly provided ``--output`` path and
-never requires the analysis extras: fixtures that need optional parsers (docx/pdf/images) are
-produced only when those libraries are importable, otherwise they are skipped.
+Writes only under ``--output``. Optional-parser fixtures (docx/pdf/images) are produced
+when those libraries import; otherwise skipped.
 """
 
 import argparse

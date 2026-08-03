@@ -27,8 +27,9 @@ operational-facing — see [long_runs.md](long_runs.md) — and rests on these m
   error-storm breaker (`scanner.pause_after_consecutive_errors`) that parks a scan of a dead drive.
 * **Frontier resume.** `scan_runs.frontier_json` records the pending-directory stack at batch
   cadence, so a resume is O(remaining), not O(tree).
-* **Opt-in parallel traversal.** `traversal_workers` offloads scandir+stat (which release the GIL)
-  to a pool while every mutation stays on one thread; 1 keeps the serial walk exactly.
+* **Device-aware parallel traversal.** `traversal_workers` offloads scandir+stat (which release the
+  GIL) to a pool while every mutation stays on one thread. First-run Linux/macOS device metadata
+  selects SSD/NVMe profiles; unknown and rotational devices retain one serial walker.
 * **Windowed scan epilogue.** `execute_windowed` runs parent-linking, change classification,
   signature copy-forward and missing detection in 250k-row committed windows behind a
   `UNIQUE(scan_run_id, entry_id)` index, so the diff is interruptible, WAL-bounded, and idempotent on
@@ -37,9 +38,9 @@ operational-facing — see [long_runs.md](long_runs.md) — and rests on these m
   pins the WAL across a whole stage; the composite `(device, inode, id)` key preserves hard-link
   adjacency.
 * **A partial files-only size index** and an **8 KiB page size** for new databases.
-* **Optional BLAKE3** (`new_hasher`, allowed only where the wheel is installed) plus a
-  `stage_ms:hash_cpu`/`stage_ms:hash_io` split, so the "is a faster hash worth it" question is
-  re-derived by measurement rather than argued.
+* **BLAKE3 as the default hash** (`new_hasher`; the wheel is a required dependency and the Rust core
+  implements it too) plus a `stage_ms:hash_cpu`/`stage_ms:hash_io` split, so the ongoing "is a faster
+  hash worth it" question stays re-derivable by measurement rather than argued.
 
 ### Decisions deferred by measurement, not built
 
@@ -57,7 +58,7 @@ built, with the reason:
 ### Reserved for a measured gate
 
 Path interning (a v11 `paths` table to shrink per-snapshot bytes ~5–10×), a Rust parallel *walker*,
-io_uring, and switching the default hash to BLAKE3 are all left for a decision driven by the
+and io_uring are all left for a decision driven by the
 100M-row `generate_metadata_database.py --profile-only` shape and the `soak_rescan.py` cost curve —
 the instruments are shipped; the structural changes are not, because at the measured small-file
 scale they are not yet justified.
@@ -163,12 +164,20 @@ gate is a measurement — a full quickstart still spending >50% of wall-clock in
 These were measured and closed. Each records the number that decided it, so reopening one means
 re-deriving that number rather than re-arguing the design.
 
-**Native acceleration is not wired into hashing.** SHA-256 is **5%** of the identity stage on real
-files (median 692 bytes); open+read is 95%. A hasher that took zero time would save 4%, while the IPC
-round trip to a persistent backend costs 0.57 ms per file against 0.243 ms to hash it in-process — so
-wiring it in measured **2.3× slower**. The Rust core and its client are maintained and tested for
-byte-exact agreement with Python anyway, because an accelerator that is wrong is worse than one that
-is slow. Reopen only for a corpus of *large* files, and re-derive the 5% first. See
+**Native hashing is selected when available.** Platform wheels bundle the Rust core, including a
+one-read identity operation that produces full and sampled digests together. A missing,
+incompatible, or failed subprocess falls back to Python. The reference Python implementation
+remains in use for cache-dropping and instrumented identity runs because those semantics are not
+yet represented by the Rust protocol.
+Wheel CI builds and exercises the core for each supported CPython/platform target. If no matching
+wheel exists, the source distribution remains installable without Cargo and uses Python; installing
+from source with Cargo available includes the core.
+The earlier small-file measurement still applies: SHA-256 was **5%** of identity time (median 692
+bytes), so re-measure the end-to-end effect on a large-file corpus before treating this as a
+performance win. The default is now BLAKE3, which caps that 5% lower still, but on a small-file
+corpus the win is bounded by the same 5% — the reason to default to it is that large-file corpora
+are where identity actually hurts, not that it changes the measured small-file number. Existing
+workspaces keep the algorithm they were inventoried with (`workspace_hash_algorithm`). See
 `docs/rust_boundary.md`.
 
 **There is no materialised `directory_content` relation.** It would cost ~364 MB (36.4 bytes/row

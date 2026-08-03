@@ -1,4 +1,4 @@
-# drive_housekeeper — common workflows.
+# housekeeper — common workflows.
 # Run `make` or `make help` to list targets. Override variables like:
 #   make quickstart SOURCE=/path/to/drive
 #   make install PY=python3.11
@@ -23,22 +23,22 @@ $(BIN)/python: ## (internal) create the virtualenv
 	$(BIN)/python -m pip install --upgrade pip
 
 .PHONY: install
-install: $(BIN)/python rust ## Install the tool with all optional features
-	$(BIN)/pip install -e '.[analysis,dashboard]'
+install: $(BIN)/python ## Install the tool, bundled Rust core, and dashboard
+	$(BIN)/pip install -e '.[dashboard]'
 
 .PHONY: rust
-rust: ## Build the optional Rust hashing accelerator into $(VENV)/bin (skipped if cargo is missing)
+rust: ## Rebuild the bundled Rust hashing core into $(VENV)/bin
 	@if command -v cargo >/dev/null 2>&1; then \
 		cd rust && cargo build --release && \
 		install -m 755 target/release/housekeeper-core ../$(BIN)/housekeeper-core && \
 		echo "housekeeper-core installed to $(BIN)/housekeeper-core"; \
 	else \
-		echo "cargo not found — skipping Rust accelerator; falling back to the pure-Python backend" >&2; \
+		echo "cargo not found — cannot build housekeeper-core; installed wheels already bundle it" >&2; \
 	fi
 
 .PHONY: install-dev
 install-dev: $(BIN)/python ## Install everything plus the test/lint toolchain
-	$(BIN)/pip install -e '.[analysis,dashboard,dev]'
+	$(BIN)/pip install -e '.[dashboard,dev]'
 
 .PHONY: quickstart
 quickstart: ## One command: scan+analyse+classify+report a drive (read-only). Needs SOURCE=<path>

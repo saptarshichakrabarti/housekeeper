@@ -7,12 +7,12 @@ member content is streamed. Unique members are always enumerable before an archi
 
 from __future__ import annotations
 
-import hashlib
 import tarfile
 import zipfile
 from collections import defaultdict
 from pathlib import Path
 
+from ..hashing import new_hasher, workspace_hash_algorithm
 from ..relationships import upsert_content_relationship
 from .archives import detect_archive_kind
 
@@ -28,7 +28,13 @@ _SIGNATURE_TYPE = "ARCHIVE_MEMBER_DIGESTS"
 _SIGNATURE_VERSION = "1"
 
 
-def _member_hashes(path: Path, max_members: int) -> set[str] | None:
+def _member_hashes(path: Path, max_members: int, algorithm: str) -> set[str] | None:
+    """Member digests, computed with the workspace's algorithm.
+
+    These are intersected with ``file_signatures.full_hash`` to decide whether an archive contains
+    a directory. Digesting members with a different function than the inventory used would make
+    every intersection empty — which reads as "this archive contains nothing", not as an error.
+    """
     kind = detect_archive_kind(path)
     hashes: set[str] = set()
     try:
@@ -40,7 +46,7 @@ def _member_hashes(path: Path, max_members: int) -> set[str] | None:
                 for info in infos:
                     if info.is_dir():
                         continue
-                    digest = hashlib.sha256()
+                    digest = new_hasher(algorithm)
                     with archive.open(info) as stream:
                         for chunk in iter(lambda: stream.read(1 << 20), b""):
                             digest.update(chunk)
@@ -56,7 +62,7 @@ def _member_hashes(path: Path, max_members: int) -> set[str] | None:
                     handle = archive.extractfile(member)
                     if handle is None:
                         continue
-                    digest = hashlib.sha256()
+                    digest = new_hasher(algorithm)
                     # Walrus rather than iter(lambda: handle.read(...)): the lambda closed over the
                     # loop variable, so it read whichever member the loop had reached rather than
                     # the one being digested. Correct only because it was consumed immediately.
@@ -70,11 +76,13 @@ def _member_hashes(path: Path, max_members: int) -> set[str] | None:
     return hashes
 
 
-def _cached_member_hashes(database, content_object_id, path: Path, max_members: int):
+def _cached_member_hashes(database, content_object_id, path: Path, max_members: int, algorithm: str):
     """``_member_hashes`` memoised on content identity. ``None`` means "out of bounds, skipped"."""
     if content_object_id is None:
-        return _member_hashes(path, max_members)
-    key = (int(content_object_id), _SIGNATURE_TYPE, _SIGNATURE_VERSION, str(max_members))
+        return _member_hashes(path, max_members, algorithm)
+    # The algorithm is part of the cache key: a signature computed under SHA-256 is not an answer
+    # to the same question once the workspace hashes with BLAKE3.
+    key = (int(content_object_id), _SIGNATURE_TYPE, _SIGNATURE_VERSION, f"{max_members}:{algorithm}")
     row = database.fetch_one(
         """SELECT signature_blob,status FROM similarity_signatures
            WHERE content_object_id=? AND signature_type=? AND signature_version=?
@@ -86,7 +94,7 @@ def _cached_member_hashes(database, content_object_id, path: Path, max_members: 
             return None
         blob = row["signature_blob"] or ""
         return set(blob.split("\n")) if blob else set()
-    hashes = _member_hashes(path, max_members)
+    hashes = _member_hashes(path, max_members, algorithm)
     # The skip is cached too: deciding an archive is out of bounds costs a full member scan on tar.
     database.connect().execute(
         """INSERT OR IGNORE INTO similarity_signatures(content_object_id,signature_type,
@@ -135,6 +143,7 @@ def run_archive_directory_analysis(database, config, scope=None, job_id=None) ->
     entry_sql, scope_params = scope.entry_id_sql()
     _ensure_all_hashed(database, config, scope)
     max_members = config.section("archives")["max_members"]
+    algorithm = workspace_hash_algorithm(database, config.section("hashing")["algorithm"])
     dir_hashes, dir_entry_ids = _top_level_directory_hashes(database, scope)
     counts = {"relationships": 0}
     for index, archive in enumerate(
@@ -153,6 +162,7 @@ def run_archive_directory_analysis(database, config, scope=None, job_id=None) ->
             archive["content_object_id"],
             Path(archive["absolute_path"]),
             max_members,
+            algorithm,
         )
         if not members:
             continue

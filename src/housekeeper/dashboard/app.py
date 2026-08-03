@@ -10,6 +10,7 @@ from typing import Annotated, Any
 from urllib.parse import urlencode
 
 from ..config import DEFAULTS, AppConfig
+from ..constants import LEGACY_HASH_ALGORITHM
 from ..core.progress import eta_seconds, format_duration, seconds_since, throughput
 from ..review.wizard import MAX_GROUPS_PER_REQUEST
 
@@ -27,7 +28,7 @@ def create_app(
         from fastapi.staticfiles import StaticFiles
     except ImportError as exc:
         raise RuntimeError(
-            "Install the dashboard extra: pip install 'drive-housekeeper[dashboard]'"
+            "Install the dashboard extra: pip install 'housekeeper[dashboard]'"
         ) from exc
     from jinja2 import Environment, FileSystemLoader, select_autoescape
     from markupsafe import Markup
@@ -70,7 +71,7 @@ def create_app(
         decision_label=decision_label,
         reason_labels=reason_labels,
     )
-    app = FastAPI(title="drive_housekeeper", docs_url=None, redoc_url=None)
+    app = FastAPI(title="housekeeper", docs_url=None, redoc_url=None)
     app.mount("/static", StaticFiles(directory=static_dir), name="static")
     # Every read-only surface (the service and all GET endpoints) goes through the per-thread
     # read-only connection pool; only the writer connection (`database`) records decisions, runs
@@ -261,14 +262,11 @@ def create_app(
     DANGER_STATES = {"FAILED", "CANCELLED", "INTERRUPTED"}
 
     def progress_cell(row) -> str:
-        """Render a job row's progress honestly for its status.
+        """Render progress honestly for the job's status.
 
-        Only a job with a live worker (RUNNING/PAUSING/CANCELLING) shows a moving rate, an ETA, or
-        an animated indeterminate bar. Anything stopped — completed, cancelled, interrupted, failed,
-        paused, or still queued — renders as static text (and a static, valued bar when a total is
-        known), so a job the worker abandoned can never masquerade as still churning. The previous
-        version emitted a live ``<progress>`` and a ``started_at``-derived rate for every row, which
-        is why long-cancelled jobs kept animating with a decaying throughput in the UI.
+        Only RUNNING/PAUSING/CANCELLING show a live rate, ETA, or animated bar. Stopped jobs
+        are static text (and a static valued bar when a total is known) so abandoned work never
+        looks like it is still churning.
         """
         status = row["status"]
         processed = row["processed_count"] or 0
@@ -300,16 +298,12 @@ def create_app(
     RESUMABLE_STATES = {"PAUSED", "CANCELLED", "FAILED", "INTERRUPTED"}
 
     def job_controls(row) -> str:
-        """The control buttons a job's *current* status actually supports.
+        """Control buttons actually supported by the job's current status.
 
-        Pause is only meaningful while a worker is running; Cancel stays available right through the
-        stopping states (PAUSING/PAUSED) so a user is never left with a job they cannot stop.
-        Transitional CANCELLING offers nothing — a live worker settles it, and the reaper settles an
-        orphan, so an extra button would be a lie about what the click does.
-
-        Resume appears on a *stopped pipeline root* only, and only where a runner can act on it: a
-        viewer dashboard has nothing to start, a stage is resumed through its run, and a completed
-        run has nothing left to do."""
+        Pause only while a worker is running; Cancel through PAUSING/PAUSED so a job is never
+        unstoppable. CANCELLING offers nothing — the worker or reaper settles it. Resume only
+        on a stopped pipeline root when a runner can act.
+        """
         job_id, status = int(row["id"]), row["status"]
         # outerHTML, not the default innerHTML: the endpoint answers with a whole <tr>, which
         # innerHTML nested *inside* the row it was supposed to replace — the click then left the
@@ -359,11 +353,10 @@ def create_app(
         return str(scope.get("quickstart") or scope.get("gui") or "")
 
     def duration_cell(row, medians: dict[str, float] | None = None) -> str:
-        """How long the job took, or has been going. Never a guess about how long is left.
+        """Elapsed or completed duration. Never guesses remaining time.
 
-        ``completed_at - started_at`` is already on every row. For a job still running the same
-        subtraction is elapsed time, labelled as such, plus — where enough completed jobs of the type
-        exist to say so — the median of those as advisory context.
+        Running jobs show elapsed plus an advisory median of completed jobs of that type when
+        enough history exists.
         """
         seconds = row["duration_seconds"]
         if row["started_at"] is None or seconds is None:
@@ -377,8 +370,8 @@ def create_app(
     def stage_medians() -> dict[str, float]:
         """Median completed duration per job type, for the advisory note on a running job.
 
-        ponytail: computed from the jobs table on render rather than materialized at pipeline
-        completion — the table is a row per stage, and a median of it is not a query worth caching.
+        Computed from the jobs table on render rather than materialized at pipeline completion —
+        one row per stage; a median of it is not worth caching.
         """
         from statistics import median
 
@@ -393,10 +386,7 @@ def create_app(
         return {name: median(values) for name, values in by_type.items() if any(values)}
 
     def results_cell(row) -> str:
-        """Outcome counts, showing only the non-zero parts so a clean run isn't three zero columns.
-
-        Errors are called out; a job with nothing to report yet (or a pure zero row) renders empty.
-        """
+        """Outcome counts; only non-zero parts so a clean run is not three zero columns."""
         parts = []
         if int(row["success_count"] or 0):
             parts.append(f"{escape(thousands(row['success_count']))} ok")
@@ -569,7 +559,7 @@ def create_app(
 
     def decision_manifest_records(session_id: int) -> list[dict[str, object]]:
         rows = reader.fetch_all(
-            """SELECT e.id,e.absolute_path,e.relative_path,e.size_bytes,c.classification,c.confidence,c.reason_codes_json,c.explanation,s.full_hash,d.decision,d.stale
+            """SELECT e.id,e.absolute_path,e.relative_path,e.size_bytes,c.classification,c.confidence,c.reason_codes_json,c.explanation,s.full_hash,s.hash_algorithm,d.decision,d.stale
                FROM review_decisions d JOIN current_entries e ON d.target_type='ENTRY' AND d.target_id=e.id
                LEFT JOIN current_classifications c ON c.entry_id=e.id LEFT JOIN file_signatures s ON s.entry_id=e.id
                WHERE d.review_session_id=? AND d.current=1 ORDER BY e.relative_path""",
@@ -582,7 +572,8 @@ def create_app(
                 "source_path": row["absolute_path"],
                 "relative_path": row["relative_path"],
                 "size_bytes": row["size_bytes"],
-                "expected_sha256": row["full_hash"] or "",
+                "expected_hash": row["full_hash"] or "",
+                "expected_hash_algorithm": row["hash_algorithm"] or LEGACY_HASH_ALGORITHM,
                 "classification": row["classification"] or "UNKNOWN",
                 "confidence": row["confidence"] or 0,
                 "reason_codes": json.loads(row["reason_codes_json"] or "[]"),
@@ -1421,18 +1412,11 @@ def create_app(
         return _with_stop_requests([row])[0] if row else None
 
     def _with_stop_requests(rows):
-        """Show a stop request the row itself does not carry yet.
+        """Overlay a stop request the row does not carry yet.
 
-        Two ways that happens, and this covers both because it asks about the job's whole lineage:
-
-        * the request could not take SQLite's write lock, so it lives in a file until the worker
-          settles the row (see ``jobs.pending_control``);
-        * the request escalated to the pipeline root, so the *stage* row still reads RUNNING while
-          the run it belongs to is already PAUSING.
-
-        Without this, a request that *was* accepted looks like a button that did nothing — and the
-        row comes back still offering Pause, so the next click lands on an already-pausing run and is
-        silently discarded.
+        Covers file-backed requests (SQLite write lock busy) and escalation to the pipeline root
+        (stage still RUNNING while the run is PAUSING). Without this, accepted stops look like
+        dead buttons and a second click is discarded.
         """
         from ..jobs import stop_requested
 
@@ -1696,9 +1680,9 @@ def create_app(
             breadcrumb = crumbs[0] + (" " + " / ".join(crumbs[1:]) if len(crumbs) > 1 else "")
             items = ""
             if current.parent != current:
-                items += f"<li class='folder-list__up'>{nav(current.parent, '⬆ parent folder')}</li>"
+                items += f"<li class='folder-list__up'>{nav(current.parent, 'parent folder')}</li>"
             for directory in subdirs:
-                items += f"<li>{nav(directory, '📁 ' + directory.name)}</li>"
+                items += f"<li>{nav(directory, directory.name)}</li>"
             if not subdirs and not error:
                 items += "<li class='empty-state'>No subfolders here.</li>"
             if error:

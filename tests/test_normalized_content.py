@@ -7,7 +7,12 @@ import pytest
 from housekeeper.analysers.normalized_content import run_normalized_content_analysis
 from housekeeper.normalization.archives import normalize_archive_content
 from housekeeper.normalization.office_xml import normalize_office
-from housekeeper.normalization.registry import IMAGE_PIXEL_PROFILE, get_or_create_profile_id
+from housekeeper.normalization.pdf import normalize_pdf
+from housekeeper.normalization.registry import (
+    IMAGE_PIXEL_PROFILE,
+    PDF_TEXT_PROFILE,
+    get_or_create_profile_id,
+)
 from housekeeper.scanner import DriveScanner
 
 
@@ -139,6 +144,45 @@ def test_oversized_archive_reports_unsupported(config, tmp_path):
         archive.writestr("a.txt", "x")
     config.data["normalization"]["archives"]["max_content_bytes"] = 0
     assert normalize_archive_content(path, config).status == "UNSUPPORTED"
+
+
+def _make_pdf(
+    path, text="This PDF contains enough text for deterministic normalization.", producer="one"
+):
+    fitz = pytest.importorskip("fitz")
+    document = fitz.open()
+    page = document.new_page()
+    page.insert_text((72, 72), text)
+    document.set_metadata({"producer": producer})
+    document.save(path)
+    document.close()
+
+
+def test_pdf_normalization_is_enabled_by_default(config, tmp_path):
+    assert config.section("normalization")["pdf"]["enabled"] is True
+    path = tmp_path / "enabled.pdf"
+    _make_pdf(path)
+    assert normalize_pdf(path, config).status == "OK"
+
+
+def test_pdf_normalization_can_be_disabled(config, database, tmp_path):
+    root = tmp_path / "src"
+    root.mkdir()
+    _make_pdf(root / "one.pdf", producer="first encoder")
+    _make_pdf(root / "two.pdf", producer="second encoder")
+    DriveScanner(database, config).scan(root, incremental=False)
+    run_normalized_content_analysis(database, config)
+    profile_id = get_or_create_profile_id(database, PDF_TEXT_PROFILE)
+    assert database.fetch_one(
+        "SELECT COUNT(*) AS n FROM normalized_content_artifacts WHERE normalization_profile_id=?",
+        (profile_id,),
+    )["n"] == 2
+    assert len(_relationships(database, "PDF_TEXT_EQUIVALENT")) == 1
+
+    config.section("normalization")["pdf"]["enabled"] = False
+    assert normalize_pdf(root / "one.pdf", config).error_code == "disabled"
+    run_normalized_content_analysis(database, config)
+    assert _relationships(database, "PDF_TEXT_EQUIVALENT") == []
 
 
 # --- Determinism / provenance -----------------------------------------------------------

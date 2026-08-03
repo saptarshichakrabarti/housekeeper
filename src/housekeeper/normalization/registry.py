@@ -42,6 +42,27 @@ ALL_PROFILES = (
     TABULAR_PROFILE,
 )
 
+_ENABLE_SETTING = {
+    OFFICE_PACKAGE_PROFILE.name: "office",
+    ARCHIVE_CONTENT_PROFILE.name: "archives",
+    PDF_TEXT_PROFILE.name: "pdf",
+}
+
+
+def enabled_profiles(config) -> tuple[NormalizationProfile, ...]:
+    """Profiles enabled by operator-facing normalization switches.
+
+    Profiles without a top-level enable switch remain active. Keeping this decision in the
+    registry ensures hashing, normalization, and relationship emission use the same profile set.
+    """
+    section = config.section("normalization")
+    return tuple(
+        profile
+        for profile in ALL_PROFILES
+        if (setting := _ENABLE_SETTING.get(profile.name)) is None
+        or bool(section[setting].get("enabled", True))
+    )
+
 
 #: Which suffixes each profile claims. Replaces the old suffix -> profiles lookup, which forced the
 #: caller to iterate objects; profile -> suffixes lets it ask "which objects does this profile still
@@ -69,15 +90,9 @@ def normalizer_for(profile: NormalizationProfile) -> Normalizer:
     return _NORMALIZER_OF[profile.name]
 
 
-def supported_suffixes() -> set[str]:
-    return (
-        _IMAGE_SUFFIXES
-        | _OFFICE_SUFFIXES
-        | _ARCHIVE_SUFFIXES
-        | _PDF_SUFFIXES
-        | _AUDIO_SUFFIXES
-        | _TABULAR_SUFFIXES
-    )
+def supported_suffixes(config=None) -> set[str]:
+    profiles = ALL_PROFILES if config is None else enabled_profiles(config)
+    return set().union(*(PROFILE_SUFFIXES[profile.name] for profile in profiles))
 
 
 def get_or_create_profile_id(database, profile: NormalizationProfile) -> int:

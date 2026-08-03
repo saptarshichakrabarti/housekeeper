@@ -1,16 +1,7 @@
-"""Format-aware normalized-equivalence analyser.
+"""Format-aware normalized equivalence (tiered ``content_relationships``).
 
-For each unique content object it computes deterministic, versioned normalized fingerprints
-(one parse per content object, with representative-path fallback), stores them, and emits
-*tiered* ``content_relationships``:
-
-* two content objects with the same decoded pixels but different bytes -> ``PIXEL_IDENTICAL``
-  (Tier 2), and ``ORIENTATION_VARIANT`` (Tier 3) when only the EXIF-oriented pixels match;
-* two Office packages with the same member content multiset -> ``OFFICE_PACKAGE_EQUIVALENT``;
-* two archives with the same member-content multiset -> ``ARCHIVE_REPACKAGING_VARIANT``.
-
-None of these is ever a byte-identical exact duplicate: distinct content objects have distinct
-raw SHA-256 by construction, so a normalized match is always strictly weaker than Tier 1.
+Same normalized fingerprint yields ``PIXEL_IDENTICAL`` / ``ORIENTATION_VARIANT`` / Office or
+archive equivalence — always weaker than byte-identical Tier 1. One parse per content object.
 """
 
 from __future__ import annotations
@@ -22,11 +13,16 @@ from ..normalization.registry import (
     ALL_PROFILES,
     PROFILE_RELATIONSHIP,
     PROFILE_SUFFIXES,
+    enabled_profiles,
     get_or_create_profile_id,
     normalizer_for,
     supported_suffixes,
 )
-from ..relationships import invalidate_content_relationships, upsert_content_relationship
+from ..relationships import (
+    deactivate_content_relationships,
+    invalidate_content_relationships,
+    upsert_content_relationship,
+)
 
 ANALYSER_NAME = "normalized_content"
 ANALYSER_VERSION = "1"
@@ -136,11 +132,11 @@ def _pending_objects(database, scope, profile, profile_id):
     )
 
 
-def _normalize_objects(database, config, scope, job_id, counts) -> None:
+def _normalize_objects(database, config, scope, job_id, counts, profiles) -> None:
     from ..jobs import checkpoint
 
     processed = 0
-    for profile in ALL_PROFILES:
+    for profile in profiles:
         profile_id = get_or_create_profile_id(database, profile)
         normalizer = normalizer_for(profile)
         for row in _pending_objects(database, scope, profile, profile_id):
@@ -175,7 +171,9 @@ def _ensure_content_objects(database, config, scope) -> None:
     """
     from ..core.identity import ensure_content_identity, stream_identity_candidates
 
-    suffixes = [s.lower() for s in supported_suffixes()]
+    suffixes = [s.lower() for s in supported_suffixes(config)]
+    if not suffixes:
+        return
     entry_sql, params = scope.entry_id_sql()
     marks = ",".join("?" for _ in suffixes)
     # The suffix filter is in SQL now, not a Python skip after fetching: the shared identity service
@@ -195,20 +193,24 @@ def run_normalized_content_analysis(database, config, scope=None, job_id=None) -
     from .scope import resolve_scope
 
     scope = resolve_scope(database, scope)
+    profiles = enabled_profiles(config)
     _ensure_content_objects(database, config, scope)
-    for profile in ALL_PROFILES:  # supersede any relationships from an older version/config
-        invalidate_content_relationships(
-            database, profile.algorithm, profile.algorithm_version, profile.fingerprint()
-        )
+    for profile in ALL_PROFILES:
+        if profile in profiles:  # supersede relationships from an older version/config
+            invalidate_content_relationships(
+                database, profile.algorithm, profile.algorithm_version, profile.fingerprint()
+            )
+        else:
+            deactivate_content_relationships(database, profile.algorithm)
     counts = {"normalized": 0, "errors": 0, "unsupported": 0, "relationships": 0}
-    _normalize_objects(database, config, scope, job_id, counts)
+    _normalize_objects(database, config, scope, job_id, counts, profiles)
 
     # Group emission is scoped too. It used to read *every* normalized artifact per profile to
     # re-derive equivalence groups — no file I/O, but O(corpus) per run regardless of how little
     # changed, and it related content objects reachable only from snapshots nobody asked about. One
     # `content_object_id IN (scope)` makes the stage proportional to the drive.
     content_sql, content_params = scope.content_object_id_sql()
-    for profile in ALL_PROFILES:
+    for profile in profiles:
         relationship_type, tier = PROFILE_RELATIONSHIP[profile.name]
         profile_id = get_or_create_profile_id(database, profile)
         groups: dict[str, list[int]] = {}

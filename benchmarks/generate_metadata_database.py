@@ -1,15 +1,8 @@
-"""Create a synthetic SQLite metadata corpus without creating a million filesystem files.
+"""Synthetic SQLite metadata corpus at plan-quality scale (no real filesystem files).
 
-The point is to reach *plan-quality* scale — the size at which SQLite's query planner and B-tree
-depths behave as they will in production — without paying for that many real files on disk. At the
-top end (``--entries 100000000``) this writes a multi-tens-of-GB database; that is the corpus the
-scale probes below need, and it is why ``--profile-only`` exists to read one back without rebuilding.
-
-``--snapshots N`` writes the same logical tree as N complete scan runs, deduplicating content across
-them exactly as the scanner would, so the set-based rescan diff can be measured against it
-(``benchmarks/soak_rescan.py``). ``--profile-only`` prints per-table and per-index byte usage from
-the ``dbstat`` virtual table, which is what decides the page-size and partial-index questions the
-performance plan leaves open — measured, not argued.
+Reaches B-tree / planner depths of production without paying for disk files. ``--snapshots N``
+writes N complete scan runs with shared content objects for rescan-diff measurement.
+``--profile-only`` prints ``dbstat`` byte usage without rebuilding.
 """
 
 import argparse

@@ -1511,11 +1511,11 @@ def _dispatch(args, c, d) -> int:
             import webview
         except ImportError:
             raise SystemExit(
-                "the desktop app needs pywebview; install it with: pip install 'drive-housekeeper[desktop]'"
+                "the desktop app needs pywebview; install it with: pip install 'housekeeper[desktop]'"
             )
 
         api = Api()
-        window = webview.create_window("drive_housekeeper", f"http://{host}:{port}", js_api=api)
+        window = webview.create_window("housekeeper", f"http://{host}:{port}", js_api=api)
         api.window = window
         webview.start()
         return 0

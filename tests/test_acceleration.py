@@ -27,6 +27,17 @@ def test_capability_detection_falls_back_safely(monkeypatch):
     assert detect_backend().capabilities()["backend"] == "python"
 
 
+def test_bundled_core_is_discovered_beside_python_without_path(monkeypatch, tmp_path):
+    from housekeeper.acceleration import capability_detection
+
+    executable = tmp_path / ("housekeeper-core.exe" if sys.platform == "win32" else "housekeeper-core")
+    executable.write_bytes(b"present")
+    monkeypatch.delenv("HOUSEKEEPER_CORE", raising=False)
+    monkeypatch.setattr(capability_detection.sys, "executable", str(tmp_path / "python"))
+    monkeypatch.setattr(capability_detection.shutil, "which", lambda _name: None)
+    assert capability_detection._installed_core() == str(executable)
+
+
 def test_subprocess_backend_matches_python_backend(tmp_path):
     """Equivalence contract: the JSONL subprocess backend must match the in-process backend."""
     path = tmp_path / "data.bin"
@@ -39,6 +50,9 @@ def test_subprocess_backend_matches_python_backend(tmp_path):
     quick_ref = PythonBackend().quick_hash(str(path), "sha256", 1024, 2)
     quick_remote = SubprocessBackend(_SERVER).quick_hash(str(path), "sha256", 1024, 2)
     assert quick_remote["quick_hash"] == quick_ref["quick_hash"]
+    identity = SubprocessBackend(_SERVER).identity_hash(str(path), "sha256", 4096, 1024, 2)
+    assert identity["full_hash"] == reference["full_hash"]
+    assert identity["quick_hash"] == quick_ref["quick_hash"]
 
 
 def test_subprocess_capabilities_and_errors():
@@ -81,8 +95,9 @@ def test_a_wedged_backend_times_out_rather_than_hanging(tmp_path):
         backend.close()
 
 
+@pytest.mark.parametrize("algorithm", ["blake3", "sha256"])
 @pytest.mark.parametrize("size", [0, 1, 100, 4095, 4096, 12288, 16384, 16385, 40960, 100_003])
-def test_native_backend_is_byte_identical_to_python(tmp_path, size):
+def test_native_backend_is_byte_identical_to_python(tmp_path, size, algorithm):
     """The equivalence claim, at every size where the two implementations could disagree.
 
     4096 is the sample chunk used here and 16384 = (samples + 2) * chunk is the threshold below
@@ -101,12 +116,16 @@ def test_native_backend_is_byte_identical_to_python(tmp_path, size):
     native = SubprocessBackend([str(binary)])
     try:
         assert native.capabilities()["backend"] == "rust"
-        assert payload(native.full_hash(str(path), "sha256", 4096), "full_hash") == payload(
-            PythonBackend().full_hash(str(path), "sha256", 4096), "full_hash"
+        assert payload(native.full_hash(str(path), algorithm, 4096), "full_hash") == payload(
+            PythonBackend().full_hash(str(path), algorithm, 4096), "full_hash"
         )
-        assert payload(native.quick_hash(str(path), "sha256", 4096, 2), "quick_hash") == payload(
-            PythonBackend().quick_hash(str(path), "sha256", 4096, 2), "quick_hash"
+        assert payload(native.quick_hash(str(path), algorithm, 4096, 2), "quick_hash") == payload(
+            PythonBackend().quick_hash(str(path), algorithm, 4096, 2), "quick_hash"
         )
+        native_identity = native.identity_hash(str(path), algorithm, 4096, 4096, 2)
+        python_identity = PythonBackend().identity_hash(str(path), algorithm, 4096, 4096, 2)
+        assert payload(native_identity, "full_hash") == payload(python_identity, "full_hash")
+        assert payload(native_identity, "quick_hash") == payload(python_identity, "quick_hash")
     finally:
         native.close()
 

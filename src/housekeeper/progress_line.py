@@ -1,8 +1,7 @@
 """Live CLI progress for long-running synchronous commands (``quickstart``, ``scan``).
 
-Polls the same ``jobs`` rows the dashboard's ``/fragments/jobs`` renders, through the database's
-own read-only connection (WAL makes this safe alongside the command's own writer), so the CLI and
-GUI can never disagree about a job's progress.
+Polls the same ``jobs`` rows as the dashboard, via the DB's read-only connection (WAL-safe
+beside the command's writer), so CLI and GUI cannot disagree.
 """
 
 from __future__ import annotations

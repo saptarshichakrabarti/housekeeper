@@ -1,8 +1,7 @@
 """Optional binary fuzzy-hash capability layer (TLSH / ssdeep).
 
-These are optional native dependencies; the core install must not require them. This module
-reports availability and, when a backend is present, produces digests and distances. Binary
-fuzzy hashes are candidate generators only — they never authorize an exact classification.
+Core install must not require them. Digests/distances when available; candidates only —
+never an exact classification.
 """
 
 from __future__ import annotations

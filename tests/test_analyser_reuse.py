@@ -57,9 +57,9 @@ def test_archive_members_are_streamed_once_per_content_object(config, database, 
     streamed: list[str] = []
     original = archive_equivalence._member_hashes
 
-    def counting(path, max_members):
+    def counting(path, max_members, algorithm):
         streamed.append(str(path))
-        return original(path, max_members)
+        return original(path, max_members, algorithm)
 
     monkeypatch.setattr(archive_equivalence, "_member_hashes", counting)
 

@@ -1,10 +1,7 @@
-"""Filesystem traversal and incremental diffing.
+"""Filesystem traversal and incremental set-based diffing.
 
-The unit of work is a **batch**, not an entry. Traversal stages rows into ``filesystem_entries`` a
-few thousand at a time, and everything that used to be decided per entry with its own queries —
-what changed, which signatures and content links can be reused, what went missing, what looks
-renamed — is decided afterwards with a handful of set-based statements. The correct idiom was
-already here: the missing-entry epilogue at the bottom of the old loop worked exactly this way.
+Stage entries in batches; decide changes, signature reuse, missing entries, and renames with
+set-based SQL after the walk — not per-entry queries during traversal.
 """
 
 import hashlib
@@ -20,7 +17,7 @@ from .constants import EntryType
 from .core import counters
 from .core.scan_identity import discover_source_identity
 from .database import Database
-from .hashing import compute_quick_hash
+from .hashing import compute_quick_hash, workspace_hash_algorithm
 from .jobs import JobCancelled, JobPaused, check_cancelled, create_job, update_job
 from .models import FileStatRecord
 from .path_utils import is_hidden_path, normalize_absolute_path, safe_relative_path
@@ -531,6 +528,10 @@ class DriveScanner:
         except OSError as exc:
             return [], False, str(exc)
         listing: list[tuple[FileStatRecord, str, bool, Path]] = []
+        error_limit = int(
+            self.config.section("scanner").get("pause_after_consecutive_errors", 0) or 0
+        )
+        consecutive_errors = 0
         for dent in entries:
             counters.count("entries_enumerated")
             relative = f"{rel_dir}/{dent.name}" if rel_dir else dent.name
@@ -538,7 +539,14 @@ class DriveScanner:
                 continue
             path = Path(dent.path)
             hidden = dir_hidden or dent.name.startswith(".")
-            listing.append((self.inspect_entry(path, root, dent, relative, hidden), relative, hidden, path))
+            record = self.inspect_entry(path, root, dent, relative, hidden)
+            listing.append((record, relative, hidden, path))
+            consecutive_errors = consecutive_errors + 1 if record.read_error else 0
+            # The main thread owns the global breaker and persists the pause. Bound this worker's
+            # read-ahead too, otherwise a wide directory can be inspected in full before the main
+            # thread sees the first result and a fast parallel profile defeats the safety limit.
+            if error_limit and consecutive_errors >= error_limit:
+                break
         return listing, overflow, None
 
     def _traverse_parallel(
@@ -986,6 +994,10 @@ class DriveScanner:
         *any* previous-run file of the same size, whatever that size's population.
         """
         section = self.config.section("hashing")
+        # These quick hashes are compared against ones the *previous* scan recorded, so they must be
+        # computed with that scan's algorithm — a changed default would otherwise turn every rename
+        # into a new file rather than into an error.
+        algorithm = workspace_hash_algorithm(self.db, section["algorithm"])
         conn = self.db.connect()
         candidates = self.db.fetch_all(
             """SELECT fresh.entry_id,cur.absolute_path,cur.size_bytes
@@ -1001,7 +1013,7 @@ class DriveScanner:
                 Path(candidate["absolute_path"]),
                 section["quick_hash_chunk_bytes"],
                 section["quick_hash_middle_samples"],
-                section["algorithm"],
+                algorithm,
             )
             if not quick.stable or not quick.digest:
                 continue
@@ -1016,7 +1028,7 @@ class DriveScanner:
             conn.execute(
                 "INSERT INTO file_signatures(entry_id,quick_hash,hash_algorithm,hash_status) VALUES(?,?,?,'QUICK_MATCH') "
                 "ON CONFLICT(entry_id) DO UPDATE SET quick_hash=excluded.quick_hash,hash_algorithm=excluded.hash_algorithm",
-                (candidate["entry_id"], quick.digest, section["algorithm"]),
+                (candidate["entry_id"], quick.digest, algorithm),
             )
             conn.execute(
                 """UPDATE scan_entry_changes SET change_status='MOVED_OR_RENAMED_CANDIDATE',

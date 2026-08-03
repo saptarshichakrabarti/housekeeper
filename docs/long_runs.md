@@ -7,8 +7,10 @@ pausable, and resumable — but a few settings and expectations are worth knowin
 ## Pick a storage profile (or let it measure)
 
 Hashing and traversal concurrency come from the storage profile
-(`performance.storage_profile`). The default is `auto`, which starts conservative (one hash worker,
-one traversal worker) and then *promotes* a source after it has measured that source's real
+(`performance.storage_profile`). The default is `auto`, which uses read-only OS mount/device
+metadata on Linux/macOS for the first run—including common network filesystem types—and starts
+conservatively when the device cannot be classified (one hash worker, one traversal worker), then
+*promotes* a source after it has measured that source's real
 throughput — `hdd → ssd → nvme` over successive runs, never more concurrency than a measurement has
 justified. If you already know the drive, set it explicitly to skip the ramp:
 

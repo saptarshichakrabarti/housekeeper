@@ -81,3 +81,37 @@ def test_verify_transaction_detects_tampered_or_missing_copy(tmp_path):
     assert verify_transaction(manifest)[0]["verify_status"] == "HASH_MISMATCH"
     review.unlink()
     assert verify_transaction(manifest)[0]["verify_status"] == "MISSING_DESTINATION"
+
+
+def test_legacy_transaction_without_an_algorithm_is_verified_as_sha256(tmp_path):
+    """A transaction written before the field existed used SHA-256; re-hashing it must too.
+
+    Verifying it under the new default would report an intact review copy as HASH_MISMATCH —
+    a false alarm on exactly the files restore exists to rescue.
+    """
+    manifest, _original, _review = _transaction(tmp_path)
+    record = json.loads(manifest.read_text(encoding="utf-8"))
+    assert "expected_hash_algorithm" not in record  # the legacy shape, written by an older move
+    assert verify_transaction(manifest)[0]["verify_status"] == "VERIFIED"
+    assert restore_transaction(manifest, dry_run=False, yes=True)[0]["restore_status"] == "RESTORED"
+
+
+def test_blake3_transaction_is_verified_with_blake3(tmp_path):
+    review = tmp_path / "review" / "a.bin"
+    review.parent.mkdir(parents=True)
+    review.write_bytes(b"restore-me")
+    manifest = tmp_path / "tx.jsonl"
+    manifest.write_text(
+        json.dumps(
+            {
+                "status": "MOVED",
+                "source_path": str(tmp_path / "src" / "a.bin"),
+                "destination_path": str(review),
+                "expected_hash": compute_full_hash(review, "blake3", 8_388_608).digest,
+                "expected_hash_algorithm": "blake3",
+            }
+        )
+        + "\n",
+        encoding="utf-8",
+    )
+    assert verify_transaction(manifest)[0]["verify_status"] == "VERIFIED"

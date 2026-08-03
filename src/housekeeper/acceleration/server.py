@@ -29,6 +29,14 @@ def _handle(backend: PythonBackend, request: dict[str, Any]) -> dict[str, Any]:
             arguments.get("chunk_size", 1_048_576),
             arguments.get("middle_samples", 2),
         )
+    if operation == "identity_hash":
+        return backend.identity_hash(
+            arguments["path"],
+            arguments.get("algorithm", "blake3"),
+            arguments.get("block_size", 8_388_608),
+            arguments.get("quick_chunk_size", 1_048_576),
+            arguments.get("middle_samples", 2),
+        )
     if operation == "verify_manifest":
         return backend.verify_manifest(arguments.get("entries", []))
     if operation == "aggregate_directories":

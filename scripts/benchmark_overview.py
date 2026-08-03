@@ -1,14 +1,9 @@
 """Cold-load overview benchmark: full-scan overview vs materialized overview.
 
-Builds a synthetic inventory of N filesystem entries (no real drive touched), then measures the
-query count and wall time of the overview on both paths:
+Measures query count and wall time on a synthetic inventory for the live COUNT/SUM path
+versus serving ``DashboardService.overview()`` from cached summary rows.
 
-  * BEFORE — the old behaviour: run the metric COUNT/SUM scans and the five chart GROUP BY queries
-    live against the inventory on every page load.
-  * AFTER  — the new behaviour: refresh the materialized summaries once (what a scan/analyse or the
-    "Refresh now" button does), then serve DashboardService.overview() from those cached rows.
-
-Usage:  python scripts/benchmark_overview.py [N]   (default N=300_000)
+Usage: ``python scripts/benchmark_overview.py [N]`` (default N=300_000)
 """
 
 from __future__ import annotations

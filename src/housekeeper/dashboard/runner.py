@@ -1,9 +1,8 @@
 """Background single-worker runner for GUI-triggered operations.
 
-At most one operation (scan/analyse/classify/report) runs at a time per workspace. The worker
-thread opens its own database connection — SQLite connections must never be shared across
-threads, and WAL mode makes that one writer safe alongside the dashboard's own reader and any
-concurrent CLI reader.
+At most one scan/analyse/classify/report per workspace. The worker opens its own DB
+connection (SQLite connections are not thread-safe); WAL keeps that writer safe beside
+dashboard and CLI readers.
 """
 
 from __future__ import annotations

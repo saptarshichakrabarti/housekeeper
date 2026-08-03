@@ -1,18 +1,17 @@
-"""Configuration: every key here is read by something, and nothing else is accepted.
+"""Typed configuration: unknown keys error; every listed key is wired.
 
-Two rules make that true rather than aspirational:
-
-* **An unknown key is an error.** A knob that no longer exists used to merge through silently, so
-  an operator editing a stale config believed they had changed something. :func:`validate_config`
-  now rejects it by name.
-* **Nothing is listed that is not wired.** Keys describing behaviour the code does not have were
-  removed rather than documented, because a setting an operator reasonably believes in is worse
-  than a missing one. ``CHANGELOG.md`` records what went and why.
+Stale keys used to merge silently, so operators thought unused knobs still worked. Removed
+settings are recorded in ``CHANGELOG.md`` rather than left as dead options.
 """
 
 import copy
 import json
+import os
+import plistlib
+import subprocess
+import sys
 from dataclasses import dataclass
+from functools import lru_cache
 from hashlib import sha256
 from pathlib import Path
 from typing import Any
@@ -45,7 +44,10 @@ DEFAULTS: dict[str, Any] = {
         "cycle_guard_max_directories": 10000000,
     },
     "hashing": {
-        "algorithm": "sha256",
+        # Resolve to the persisted algorithm for a populated workspace, and to BLAKE3 for a new
+        # one. Naming an algorithm explicitly is an assertion: a conflict requires an explicit
+        # re-hash migration and is never silently ignored.
+        "algorithm": "auto",
         "quick_hash_chunk_bytes": 1048576,
         "quick_hash_middle_samples": 2,
         "full_hash_block_bytes": 8388608,
@@ -142,6 +144,10 @@ DEFAULTS: dict[str, Any] = {
         "lsh_threshold": 0.75,
         "verification_threshold": 0.80,
         "minimum_tokens": 20,
+        # Quickstart remains bounded on document-heavy archives. The explicit
+        # `analyse document-minhash` command has no automatic corpus gate.
+        "maximum_quickstart_documents": 50_000,
+        "maximum_quickstart_tokens": 2_000_000,
     },
     "binary_similarity": {
         "tlsh_enabled": False,
@@ -177,7 +183,7 @@ DEFAULTS: dict[str, Any] = {
     # the size bound belong here.
     "normalization": {
         "office": {"enabled": True},
-        "pdf": {"enabled": False},
+        "pdf": {"enabled": True},
         "images": {"decoded_pixel_hash": True, "orientation_normalized_hash": True},
         "archives": {"enabled": True, "max_content_bytes": 268435456},
     },
@@ -304,18 +310,24 @@ def validate_config(config: dict) -> None:
         if isinstance(section, dict):
             for key, value in section.items():
                 if (
-                    ("bytes" in key or "seconds" in key or key in {"max_members", "batch_size"})
+                    (
+                        "bytes" in key
+                        or "seconds" in key
+                        or key
+                        in {
+                            "max_members",
+                            "batch_size",
+                            "maximum_quickstart_documents",
+                            "maximum_quickstart_tokens",
+                        }
+                    )
                     and isinstance(value, int)
                     and value < 0
                 ):
                     raise ValueError(f"negative limit: {key}")
-    allowed_algorithms = {"sha256", "sha512", "blake2b"}
-    # BLAKE3 is optional: allowed only where its wheel is installed, so a workspace can never be
-    # configured to hash with an algorithm this machine cannot compute.
-    from .hashing import blake3_available
-
-    if blake3_available():
-        allowed_algorithms.add("blake3")
+    # ``auto`` resolves against the persisted workspace setting (BLAKE3 for a new workspace).
+    # Concrete algorithms remain valid for explicit selection and compatibility.
+    allowed_algorithms = {"auto", "blake3", "sha256", "sha512", "blake2b"}
     if config["hashing"]["algorithm"].lower() not in allowed_algorithms:
         raise ValueError("unsupported hash algorithm")
     if (
@@ -358,6 +370,10 @@ SSD_BYTES_PER_SECOND = 200_000_000
 #: leap — which is the safe direction (never more threads than a measurement has justified).
 NVME_BYTES_PER_SECOND = 1_500_000_000
 
+_NETWORK_FILESYSTEMS = frozenset(
+    {"9p", "afs", "ceph", "cifs", "glusterfs", "nfs", "nfs4", "smb3", "sshfs"}
+)
+
 
 def observed_profile(bytes_per_second: float | None) -> str | None:
     """Which profile a measured hashing throughput implies, or None if it implies nothing.
@@ -391,7 +407,15 @@ def performance_profile(
     performance = config.section("performance")
     profile = str(performance.get("storage_profile", "auto")).lower()
     if profile == "auto":
-        profile = observed_profile(measured_bytes_per_second) or _profile_from_path(source_root)
+        detected = _profile_from_path(source_root)
+        # A fast network share is still a network share: its latency and failure behavior call for
+        # the network traversal/parser profile even if sequential hashing happens to benchmark at
+        # SSD throughput. Measurements promote only otherwise-local storage.
+        profile = (
+            "network"
+            if detected == "network"
+            else observed_profile(measured_bytes_per_second) or detected
+        )
     if profile not in performance["profiles"]:
         raise ValueError(f"unknown storage profile: {profile}")
     selected: dict[str, int | str] = {
@@ -408,20 +432,115 @@ def performance_profile(
 
 
 def _profile_from_path(source_root: Path | None) -> str:
-    """Classify storage from the path alone. Never reads the drive.
+    """Classify network paths, then query cached read-only device metadata.
 
     This replaces a probe that walked the whole tree with ``rglob`` and opened files until it had
     read 8 MiB — measured at **18.6 s of a 32 s scan** on a tree of small files, because a byte
     budget is unreachable when every file is tiny. Tuning that costs more than the work it tunes
     is not tuning.
 
-    A path heuristic can only recognise network mounts, so everything else gets the conservative
-    profile. That is the honest trade: an operator on an SSD sets ``performance.storage_profile:
-    ssd`` and gets four hash workers, and one who sets nothing is merely slower, never wrong.
+    Linux sysfs and macOS ``diskutil`` can distinguish rotational and solid-state storage without
+    opening source files. Unsupported or ambiguous devices keep the conservative HDD profile.
     """
     if source_root is None:
         return "hdd"
     text = str(source_root).lower()
     if text.startswith(("//", "\\\\", "/net/", "/nfs/", "/smb/")):
         return "network"
-    return "hdd"
+    return _profile_from_device(source_root) or "hdd"
+
+
+def _mount_root(path: Path) -> Path:
+    """Nearest ancestor on the same device, used as a stable device-probe target."""
+    current = path.resolve()
+    device = current.stat().st_dev
+    while current.parent != current:
+        try:
+            if current.parent.stat().st_dev != device:
+                break
+        except OSError:
+            break
+        current = current.parent
+    return current
+
+
+def _profile_from_device(source_root: Path) -> str | None:
+    """Best-effort, read-only SSD/NVMe detection; ``None`` preserves the HDD fallback."""
+    try:
+        mount = _mount_root(source_root)
+        return _profile_for_device(sys.platform, mount.stat().st_dev, str(mount))
+    except (OSError, ValueError):
+        return None
+
+
+@lru_cache(maxsize=64)
+def _profile_for_device(platform: str, device: int, mount: str) -> str | None:
+    if platform.startswith("linux"):
+        if _linux_filesystem_type(mount) in _NETWORK_FILESYSTEMS:
+            return "network"
+        try:
+            node = Path(f"/sys/dev/block/{os.major(device)}:{os.minor(device)}").resolve()
+            rotational = (node / "queue" / "rotational").read_text(encoding="ascii").strip()
+            if rotational == "1":
+                return "hdd"
+            if rotational == "0":
+                return "nvme" if "nvme" in str(node).lower() else "ssd"
+        except OSError:
+            return None
+    elif platform == "darwin":
+        try:
+            result = subprocess.run(
+                ["diskutil", "info", "-plist", mount],
+                capture_output=True,
+                check=False,
+                timeout=2,
+            )
+            if result.returncode != 0:
+                return None
+            info = plistlib.loads(result.stdout)
+            filesystem = " ".join(
+                str(info.get(key) or "")
+                for key in ("FilesystemType", "TypeBundle", "BusProtocol", "DeviceProtocol")
+            ).lower()
+            if any(
+                token in filesystem
+                for token in ("smb", "nfs", "webdav", "afp", "network", "cifs")
+            ):
+                return "network"
+            if info.get("SolidState") is False:
+                return "hdd"
+            if info.get("SolidState") is True:
+                transport = str(
+                    info.get("BusProtocol") or info.get("DeviceProtocol") or ""
+                ).lower()
+                return "nvme" if "nvme" in transport or "pci" in transport else "ssd"
+        except (
+            AttributeError,
+            OSError,
+            plistlib.InvalidFileException,
+            subprocess.TimeoutExpired,
+        ):
+            return None
+    return None
+
+
+def _linux_filesystem_type(mount: str) -> str | None:
+    """Filesystem type for an exact Linux mount point, without opening source content."""
+    try:
+        lines = Path("/proc/self/mountinfo").read_text(encoding="utf-8").splitlines()
+    except OSError:
+        return None
+    for line in lines:
+        left, separator, right = line.partition(" - ")
+        fields = left.split()
+        if not separator or len(fields) < 5:
+            continue
+        mount_point = (
+            fields[4]
+            .replace(r"\040", " ")
+            .replace(r"\011", "\t")
+            .replace(r"\134", "\\")
+        )
+        if mount_point == mount:
+            return right.split()[0].lower() if right.split() else None
+    return None

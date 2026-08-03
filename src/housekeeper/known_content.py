@@ -1,9 +1,7 @@
 """Local, auditable known-content assertion registry.
 
-Assertions record what the user (or a local rule) knows about content — regenerable, an
-installer, an OS cache, a preservation master, a test fixture, etc. They are surfaced during
-review as additional signals but are strictly advisory: a global public hash list must never
-automatically authorize review movement.
+Advisory signals for review (regenerable, installer, OS cache, etc.). A global public hash
+list must never automatically authorize review movement.
 """
 
 from __future__ import annotations

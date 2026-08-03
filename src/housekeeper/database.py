@@ -1,4 +1,9 @@
-"""Small SQLite repository with explicit schema and parameterized queries."""
+"""SQLite repository: explicit schema, parameterized queries, current-inventory views.
+
+WAL + keyset paging keep long stages from pinning the log. Upserts preserve entry ids so
+cascaded signatures/links/classifications survive resume. Snapshot prune is inspectable and
+refuses to delete entries a review decision still references.
+"""
 
 import json
 import os
@@ -14,6 +19,7 @@ from .core import counters
 
 SCHEMA = """
 CREATE TABLE IF NOT EXISTS schema_migrations(version INTEGER PRIMARY KEY);
+CREATE TABLE IF NOT EXISTS workspace_settings(setting_key TEXT PRIMARY KEY, setting_value TEXT NOT NULL, updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP);
 CREATE TABLE IF NOT EXISTS migration_progress(migration_version INTEGER PRIMARY KEY, cursor_value INTEGER NOT NULL DEFAULT 0, status TEXT NOT NULL DEFAULT 'PENDING', updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP, detail_json TEXT NOT NULL DEFAULT '{}');
 CREATE TABLE IF NOT EXISTS scan_runs(id INTEGER PRIMARY KEY, source_root TEXT NOT NULL, source_root_fingerprint TEXT NOT NULL, started_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP, completed_at TEXT, status TEXT NOT NULL, hostname TEXT, platform TEXT, python_version TEXT, config_hash TEXT, files_seen INTEGER DEFAULT 0, directories_seen INTEGER DEFAULT 0, symlinks_seen INTEGER DEFAULT 0, errors_seen INTEGER DEFAULT 0, bytes_seen INTEGER DEFAULT 0, last_checkpoint_at TEXT, frontier_json TEXT);
 CREATE TABLE IF NOT EXISTS filesystem_entries(id INTEGER PRIMARY KEY, scan_run_id INTEGER NOT NULL REFERENCES scan_runs(id), parent_entry_id INTEGER REFERENCES filesystem_entries(id), source_root_id INTEGER REFERENCES source_roots(id), source_root TEXT NOT NULL, absolute_path TEXT NOT NULL, relative_path TEXT NOT NULL, name TEXT NOT NULL, suffix TEXT, entry_type TEXT NOT NULL, is_hidden INTEGER DEFAULT 0, is_symlink INTEGER DEFAULT 0, symlink_target TEXT, size_bytes INTEGER DEFAULT 0, device_id INTEGER, inode_or_file_id INTEGER, nlink INTEGER, mode INTEGER, owner TEXT, group_name TEXT, created_at REAL, modified_at REAL, metadata_changed_at REAL, accessed_at REAL, birth_time_available INTEGER DEFAULT 0, scan_status TEXT, read_error TEXT, first_seen_at TEXT DEFAULT CURRENT_TIMESTAMP, last_seen_at TEXT DEFAULT CURRENT_TIMESTAMP, UNIQUE(scan_run_id, relative_path));
@@ -23,7 +29,7 @@ CREATE TABLE IF NOT EXISTS analysis_jobs(id INTEGER PRIMARY KEY, job_type TEXT, 
 CREATE TABLE IF NOT EXISTS exact_duplicate_groups(id INTEGER PRIMARY KEY, content_object_id INTEGER REFERENCES content_objects(id), full_hash TEXT NOT NULL, size_bytes INTEGER NOT NULL, member_count INTEGER NOT NULL, canonical_entry_id INTEGER, canonical_selection_reason TEXT, verified INTEGER DEFAULT 0);
 CREATE TABLE IF NOT EXISTS exact_duplicate_members(group_id INTEGER REFERENCES exact_duplicate_groups(id) ON DELETE CASCADE, entry_id INTEGER REFERENCES filesystem_entries(id) ON DELETE CASCADE, is_canonical INTEGER, readable INTEGER, PRIMARY KEY(group_id,entry_id));
 CREATE TABLE IF NOT EXISTS directory_summaries(entry_id INTEGER PRIMARY KEY REFERENCES filesystem_entries(id) ON DELETE CASCADE, recursive_file_count INTEGER, recursive_directory_count INTEGER, recursive_size_bytes INTEGER, unique_full_hash_count INTEGER, duplicate_file_count INTEGER, extension_distribution_json TEXT, earliest_modified_at REAL, latest_modified_at REAL, content_signature TEXT);
-CREATE TABLE IF NOT EXISTS move_transactions(id INTEGER PRIMARY KEY, transaction_run_id TEXT, source_entry_id INTEGER, source_path TEXT, destination_path TEXT, expected_size INTEGER, expected_hash TEXT, pre_move_hash TEXT, post_move_hash TEXT, status TEXT, started_at TEXT DEFAULT CURRENT_TIMESTAMP, completed_at TEXT, error TEXT, restored_at TEXT, restore_status TEXT);
+CREATE TABLE IF NOT EXISTS move_transactions(id INTEGER PRIMARY KEY, transaction_run_id TEXT, source_entry_id INTEGER, source_path TEXT, destination_path TEXT, expected_size INTEGER, expected_hash TEXT, expected_hash_algorithm TEXT, pre_move_hash TEXT, post_move_hash TEXT, status TEXT, started_at TEXT DEFAULT CURRENT_TIMESTAMP, completed_at TEXT, error TEXT, restored_at TEXT, restore_status TEXT);
 CREATE INDEX IF NOT EXISTS idx_entries_path ON filesystem_entries(relative_path); CREATE INDEX IF NOT EXISTS idx_sig_full ON file_signatures(full_hash); CREATE INDEX IF NOT EXISTS idx_classification ON classifications(classification);
 CREATE TABLE IF NOT EXISTS source_roots(id INTEGER PRIMARY KEY, display_name TEXT NOT NULL, source_fingerprint TEXT NOT NULL UNIQUE, filesystem_uuid TEXT, volume_label TEXT, device_metadata_json TEXT NOT NULL DEFAULT '{}', first_seen_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP, last_seen_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP, last_mount_path TEXT NOT NULL, latest_complete_scan_run_id INTEGER REFERENCES scan_runs(id));
 CREATE TABLE IF NOT EXISTS content_objects(id INTEGER PRIMARY KEY, hash_algorithm TEXT NOT NULL, full_hash TEXT NOT NULL, size_bytes INTEGER NOT NULL, first_seen_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP, last_seen_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP, verification_status TEXT NOT NULL DEFAULT 'VERIFIED', readability_status TEXT NOT NULL DEFAULT 'UNKNOWN', content_kind TEXT, detected_mime TEXT, detected_type TEXT, analysis_state TEXT NOT NULL DEFAULT 'PENDING', created_by_scan_run_id INTEGER REFERENCES scan_runs(id), UNIQUE(hash_algorithm, full_hash, size_bytes));
@@ -141,17 +147,11 @@ CREATE VIEW IF NOT EXISTS image_similarity_members AS
 def _keyset_pages(execute, sql, params, key_exprs, key_of, batch_size):
     """Stream ``sql`` in keyset pages, closing the cursor between pages.
 
-    A single ``execute``+``fetchmany`` loop holds one read snapshot for its whole lifetime, and in
-    WAL that snapshot pins the log: a checkpoint cannot reclaim any frame newer than it, so on a
-    days-long stage the WAL grows to the size of everything the writer commits meanwhile. Paging by
-    a keyset — fetch a bounded page, close the cursor (releasing the snapshot), re-open past the last
-    key — lets a checkpoint advance between pages, so the WAL stays bounded.
-
-    ``sql`` must contain the literal ``{keyset}`` in its ``WHERE`` and carry no ``ORDER BY``/``LIMIT``
-    of its own (both are appended here). ``key_exprs`` are the ordering/comparison expressions and
-    ``key_of(row)`` returns the matching boundary tuple. The comparison is a row-value ``>``, so the
-    ordering must be ascending on exactly ``key_exprs``. Each page sees a *fresh* snapshot; for the
-    anti-join candidate queries this only ever removes rows already processed, which is correct.
+    A long ``fetchmany`` loop holds one WAL snapshot and pins the log for the stage's lifetime.
+    Page, close, re-open past the last key so checkpoints can advance. ``sql`` must contain
+    ``{keyset}`` and omit its own ``ORDER BY``/``LIMIT``. Ordering is ascending on exactly
+    ``key_exprs``; each page is a fresh snapshot (for anti-joins, that only drops already-
+    processed rows).
     """
     order = ",".join(key_exprs)
     cols = "(" + ",".join(key_exprs) + ")"
@@ -299,18 +299,12 @@ class Database:
     def refresh_current_inventory_views(self) -> frozenset[int]:
         """(Re)define the ``current_*`` relational layer — the drive as it is now.
 
-        Historical base rows are the audit trail and are deliberately retained. Every current-state
-        consumer reads these views instead. Scoping by *naming the right relation* rather than by
-        remembering to pass a parameter is the point: doing this only for entries/classifications
-        fixed repeated-scan double counting but still let retired duplicate groups, projects,
-        artifacts and relationships leak into reports after every current member was deleted.
+        Historical base rows stay as audit trail; consumers read these views. Scoping by
+        naming the relation (not a forgotten parameter) prevents retired groups/projects/
+        artifacts from leaking into reports.
 
-        The run ids are baked in as literals. The obvious alternative —
-        ``scan_run_id IN (SELECT latest_complete_scan_run_id FROM source_roots …)`` — plans as
-        ``SCAN filesystem_entries`` with a LIST SUBQUERY and post-filters, measured 4–15× slower
-        than this form on a 20-snapshot corpus and *slower than not scoping at all*. That is the
-        same defect the composite indexes above exist to prevent, so the view is refreshed in the
-        one transaction that moves the pointer instead.
+        Run ids are baked in as literals: a correlated subquery planned 4–15× slower on a
+        20-snapshot corpus. Refresh in the same transaction that moves the source pointer.
         """
         c = self.connect()
         # The scanner's pointer where it exists, otherwise the newest COMPLETE run of that source
@@ -533,16 +527,9 @@ class Database:
     def _rename_analyser_columns(c: sqlite3.Connection) -> None:
         """Heal a database created before the British-spelling rename.
 
-        ``analysis_artifacts.analyzer_name``/``analyzer_version`` became ``analyser_*``. A database
-        created with the old spelling keeps the old columns (``CREATE TABLE IF NOT EXISTS`` never
-        alters them), so every ``SELECT analyser_name`` fails with "no such column".
-
-        Runs before ``SCHEMA`` in :meth:`initialize`. The four ``*_metadata`` compat views read
-        these columns and are dropped first so ``RENAME COLUMN`` has no view referencing the column
-        to rewrite (and cannot trip over one that names the not-yet-existing new column); the
-        subsequent ``executescript(SCHEMA)`` recreates them with the British names. ``RENAME COLUMN``
-        updates the dependent indexes automatically. Guarded by column existence, so it is a cheap
-        no-op on a fresh or already-migrated database and safe to run on every open.
+        ``analyzer_*`` became ``analyser_*``. Old DBs keep the US columns under
+        ``CREATE TABLE IF NOT EXISTS``, so every ``SELECT analyser_name`` fails. Drop compat
+        views, ``RENAME COLUMN``, then ``SCHEMA`` recreates views. Guarded by column existence.
         """
         existing = {row[1] for row in c.execute("PRAGMA table_info(analysis_artifacts)")}
         renames = [
@@ -613,6 +600,9 @@ class Database:
                 "last_seen_at": "TEXT",
             },
         )
+        # An audit row whose digest does not say which function produced it is not auditable; rows
+        # written before this column are SHA-256 (constants.LEGACY_HASH_ALGORITHM).
+        self._ensure_columns(c, "move_transactions", {"expected_hash_algorithm": "TEXT"})
         # "Which scan is the current inventory" is a stored fact, not a subquery — see
         # _migrate_v8_to_v9 and DriveScanner.
         self._ensure_columns(
@@ -922,20 +912,11 @@ class Database:
         )
 
     def snapshot_retention_plan(self, keep_per_source: int = 3) -> dict[str, object]:
-        """Which superseded snapshots could be pruned, which are held, and by what.
+        """Which superseded snapshots could be pruned, which are held, and why.
 
-        A snapshot is the drive as it was, and a superseded snapshot's verdict is the audit trail
-        this tool exists to produce — so history is *retained by default* and this is the explicit,
-        inspectable way to bound it. Nothing is deleted by computing a plan.
-
-        ``keep_per_source`` is the number of most-recent COMPLETE runs kept per source root, on top
-        of everything held for a reason below. Incomplete and interrupted runs are prunable once
-        they fall outside that window: they are not a picture of anything.
-
-        The holds matter more than the deletions. ``review_decisions.target_id`` is a bare integer,
-        not a foreign key, so deleting an entry a human made a decision about would leave the
-        decision pointing at nothing — losing exactly the evidence the tool promises to keep. This
-        refuses instead.
+        History is retained by default; this plan is inspectable and deletes nothing.
+        ``keep_per_source`` COMPLETE runs are kept per source. ``review_decisions.target_id``
+        is not a FK — deleting a decided entry would orphan the decision, so those runs are held.
         """
         c = self.connect()
         held: dict[int, str] = {}
@@ -986,10 +967,9 @@ class Database:
     def prune_snapshots(self, keep_per_source: int = 3) -> dict[str, object]:
         """Execute :meth:`snapshot_retention_plan`. Returns the plan that was applied.
 
-        Entries cascade to their signatures, content links, classifications and lifecycle rows;
-        ``content_objects`` are deliberately **not** touched, because content identity is
-        snapshot-independent by design — that is what makes a file recognisable across drives — and
-        an artifact keyed on content stays valid however many snapshots referenced it.
+        Entries cascade to signatures, links, classifications, and lifecycle rows.
+        ``content_objects`` are not touched — content identity is snapshot-independent so
+        artifacts stay valid across drives/snapshots.
         """
         plan = self.snapshot_retention_plan(keep_per_source)
         prunable = plan["prunable"]
@@ -999,8 +979,8 @@ class Database:
             return plan
         c = self.connect()
         placeholders = ",".join("?" for _ in runs)
-        # Entries first: ON DELETE CASCADE fans out from here, and foreign keys are enabled on this
-        # connection so a hold this method failed to spot raises rather than orphaning a row.
+        # Entries first: ON DELETE CASCADE fans out from here; FKs are enabled so a missed hold
+        # raises rather than orphaning a row.
         c.execute(f"DELETE FROM filesystem_entries WHERE scan_run_id IN ({placeholders})", runs)
         c.execute(f"DELETE FROM scan_entry_changes WHERE scan_run_id IN ({placeholders})", runs)
         c.execute(f"DELETE FROM scan_runs WHERE id IN ({placeholders})", runs)
@@ -1015,12 +995,9 @@ class Database:
     def purge_runs(self, keep_job_id: int | None = None) -> dict[str, int]:
         """Delete every recorded run and everything derived from one. Returns rows deleted per table.
 
-        Rows rather than the file: the dashboard, its background runner and any CLI process may each
-        hold an open connection, and unlinking the database under them leaves them writing to a
-        deleted inode.
-
-        ``keep_job_id`` spares one ``jobs`` row: the job that is running this purge. Without it a
-        purge cannot be tracked at all, because it deletes the row recording it mid-flight.
+        Deletes rows, not the file — open dashboard/CLI connections would otherwise write to a
+        deleted inode. ``keep_job_id`` spares the purge's own jobs row so the operation stays
+        trackable.
         """
         c = self.connect()
         tables = [
@@ -1030,20 +1007,16 @@ class Database:
             )
             if str(row[0]) not in self._PURGE_KEEP
         ]
-        # One unordered DELETE per table with foreign keys *off*, rather than a dependency-ordered
-        # cascade: the entire graph is going, so ordering carries no information — and an unqualified
-        # DELETE on a table with no live foreign keys takes SQLite's truncate path instead of walking
-        # every row to check constraints. On a large inventory that is the difference between holding
-        # the single WAL write lock for minutes (past every other connection's busy_timeout, which is
-        # how a concurrent dashboard refresh got "database is locked") and holding it for moments.
+        # Unordered DELETE per table with FKs off: the whole graph is going, and truncate-path
+        # deletes hold the WAL write lock briefly instead of walking every row (which used to
+        # lock out dashboard refreshes past busy_timeout).
         c.commit()  # PRAGMA foreign_keys is a silent no-op inside a transaction
         c.execute("PRAGMA foreign_keys=OFF")
         deleted = {}
         try:
             for table in tables:
                 if table == "jobs" and keep_job_id is not None:
-                    # Row-wise instead of truncate for this one table: jobs is small (a row per
-                    # stage), so keeping the purge's own row costs nothing measurable.
+                    # Row-wise for jobs only: keep the purge's own row; the table is small.
                     count = c.execute("DELETE FROM jobs WHERE id<>?", (keep_job_id,)).rowcount
                 else:
                     count = c.execute(f"DELETE FROM {table}").rowcount
@@ -1373,17 +1346,10 @@ class Database:
     ) -> None:
         """Run one set-based statement in id-windows, committing after each.
 
-        ``template`` must contain the literal ``{window}`` where an ``AND {key} BETWEEN ? AND ?``
-        clause is spliced; ``params`` are the statement's own parameters, in order, with the two
-        window bounds appended per window. This is how the scan epilogue's O(entries) statements —
-        parent linking, change classification, signature copy-forward, missing detection — become a
-        sequence of bounded, committed, cancellable steps instead of one multi-hour transaction that
-        pins the WAL, defers Ctrl-C, and rolls back hours of work if it fails near the end. The
-        windowed statements are idempotent (a real upsert, or ``INSERT OR IGNORE`` behind a unique
-        index), so re-running a window on resume changes nothing.
-
-        ``on_window`` is invoked after each window commits — the scanner passes its cancellation
-        check, so a stop lands within one window rather than after the whole statement.
+        ``template`` must contain ``{window}`` (``AND {key} BETWEEN ? AND ?``). Bounds are
+        appended to ``params`` per window. Keeps O(entries) scan-epilogue work cancellable and
+        WAL-bounded instead of one multi-hour transaction. Statements must be idempotent so
+        resume is safe. ``on_window`` runs after each commit (scanner: cancellation check).
         """
         lo, hi = bounds
         if lo is None or hi is None:
@@ -1451,13 +1417,11 @@ class Database:
     _ENTRY_UPSERT_KEEP = frozenset({"scan_run_id", "relative_path", "first_seen_at", "last_seen_at"})
 
     def insert_entry(self, values: dict[str, Any]) -> int:
-        """Insert one entry, or refresh the existing one **in place**, returning its id.
+        """Insert one entry, or refresh the existing one in place, returning its id.
 
-        This used to be ``INSERT OR REPLACE``, which on conflict *deletes* the existing row: its
-        ``file_signatures``, ``entry_content_links`` and ``classifications`` cascade away and the
-        id is reallocated. Resuming an interrupted scan therefore destroyed verified hashes and
-        erased ``PROTECTED`` markers — resume was a pessimisation and a safety hole. A real upsert
-        preserves the id, so everything hanging off it survives.
+        Not ``INSERT OR REPLACE``: that deletes the row on conflict, cascading away
+        signatures/links/classifications and reallocating the id — resume destroyed verified
+        hashes and ``PROTECTED`` markers. Real upsert preserves the id.
         """
         keys = ",".join(values)
         marks = ",".join("?" for _ in values)

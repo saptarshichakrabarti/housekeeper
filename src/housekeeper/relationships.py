@@ -176,6 +176,16 @@ def invalidate_content_relationships(
     return cur.rowcount
 
 
+def deactivate_content_relationships(database, algorithm: str) -> int:
+    """Deactivate every relationship from an operator-disabled analyser algorithm."""
+    cur = database.connect().execute(
+        """UPDATE content_relationships SET status='INVALIDATED',invalidated_at=CURRENT_TIMESTAMP
+           WHERE algorithm=? AND status='ACTIVE'""",
+        (algorithm,),
+    )
+    return cur.rowcount
+
+
 def invalidate_relationships(
     database,
     relationship_type: str | None = None,

@@ -1,14 +1,7 @@
-"""JSONL client for an out-of-process acceleration backend.
+"""JSONL client for a persistent out-of-process acceleration backend.
 
-The backend is a **persistent request loop** — both the Rust binary and the reference Python server
-read requests from stdin until it closes. This client used to throw that away with one
-``subprocess.run`` per request: a fork, an exec, a process teardown and (for the Python server) a
-full interpreter start, for every single hash. On small files that is far more expensive than
-hashing them in-process with C-backed ``hashlib``, which makes the "accelerator" a decelerator.
-
-One process is now started on first use and reused. A request that exceeds its timeout kills the
-process rather than leaving the protocol out of step: after a timeout the pending reply may still
-arrive on the pipe and would be read as the answer to the *next* request.
+One long-lived process (not ``subprocess.run`` per hash — spawn cost dominated small-file work).
+On timeout, kill the process: a late reply would otherwise corrupt the next request on the pipe.
 """
 
 from __future__ import annotations
@@ -146,6 +139,25 @@ class SubprocessBackend:
                 "path": path,
                 "algorithm": algorithm,
                 "chunk_size": chunk_size,
+                "middle_samples": middle_samples,
+            },
+        )
+
+    def identity_hash(
+        self,
+        path: str,
+        algorithm: str = "blake3",
+        block_size: int = 8_388_608,
+        quick_chunk_size: int = 1_048_576,
+        middle_samples: int = 2,
+    ):
+        return self._request(
+            "identity_hash",
+            {
+                "path": path,
+                "algorithm": algorithm,
+                "block_size": block_size,
+                "quick_chunk_size": quick_chunk_size,
                 "middle_samples": middle_samples,
             },
         )

@@ -1,1 +1,1 @@
-{"protocol_version":"1","operations":["capabilities","scan","quick_hash","full_hash","aggregate_directories","verify_manifest","copy_and_verify"]}
+{"protocol_version":"1","operations":["capabilities","scan","quick_hash","full_hash","identity_hash","aggregate_directories","verify_manifest","copy_and_verify"]}

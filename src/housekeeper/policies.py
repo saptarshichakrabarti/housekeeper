@@ -1,17 +1,7 @@
-"""Deterministic, explicit policy engine.
+"""Deterministic policy engine: analysis facts to conservative classifications.
 
-Factual analysis results are turned into conservative classifications by evaluating a set
-of explicit rules.  Rules are declarative (loaded from ``config/cleanup_rules.yaml`` when
-present, otherwise the built-in defaults below) and each rule names a *condition* that is
-implemented in code -- there is deliberately no eval-based mini-language on the drive's data.
-
-Two safety principles are enforced:
-
-* **Conservative conflict resolution.**  When several rules match one entry, the most
-  protective classification wins (``PROTECTED`` beats ``REVIEW_SAFE``).  A lower-safety
-  classification never overrides a stronger protective one.
-* **Fail closed.**  A parser or filesystem failure is classified ``ERROR`` and never a
-  review candidate.  Files that cannot be inspected are never downgraded to "safe".
+Rules from ``cleanup_rules.yaml`` (or builtins); conditions are code, not an eval language.
+Conflicts: most protective wins. Fail closed: inspect failures become ``ERROR``, never review-safe.
 """
 
 from __future__ import annotations

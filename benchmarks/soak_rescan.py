@@ -1,18 +1,7 @@
-"""Soak the set-based rescan diff at scale and print its cost curve.
+"""Soak set-based rescan diff cost without creating real files.
 
-The multi-hour statements on a real billion-file inventory are the scan epilogue: ``_link_parents``
-and ``_record_changes`` (change classification, signature/link copy-forward, MISSING detection). This
-script measures exactly those, at whatever scale the corpus was built to, *without* creating real
-files: it stages an unchanged rescan's rows in SQL (a new scan run whose entries are a byte-for-byte
-copy of the current snapshot), then calls the scanner's own diff internals with the work counters
-recording.
-
-It is the instrument the performance plan calls for — the number that decides whether the diff needs
-to be windowed (it prints statements, commits, seconds and WAL peak per rescan), and the guard the
-soak test in ``tests/test_corpus_shapes.py`` asserts a bounded shape of at test scale.
-
-    PYTHONPATH=src python benchmarks/generate_metadata_database.py /tmp/corpus.sqlite --entries 1000000
-    PYTHONPATH=src python benchmarks/soak_rescan.py /tmp/corpus.sqlite --rescans 5
+Stages an unchanged rescan in SQL, times scanner epilogue with work counters. Pair with
+``generate_metadata_database.py``. Shape-checked by ``tests/test_corpus_shapes.py``.
 """
 
 import argparse

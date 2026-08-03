@@ -1,4 +1,4 @@
-/* drive_housekeeper dashboard — selectable themes.
+/* housekeeper dashboard — selectable themes.
  *
  * Theme is chosen via a `data-theme` attribute on <html>:
  *   data-theme="sober"   forensic default: muted palette, hairline rules, semantic colour only

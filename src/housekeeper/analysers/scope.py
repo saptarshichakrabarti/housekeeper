@@ -1,18 +1,9 @@
-"""Shared, parameterized analyser scope resolution.
+"""Analyser scope: default to the current inventory, never all history.
 
-The tool keeps a snapshot per scan, so "every row in ``filesystem_entries``" is not the drive — it
-is the drive plus every earlier version of itself. An analyser that reads all of it will relate a
-file to its own prior snapshot and conclude the current copy is a removable duplicate. That is
-guardrail **G2**, and it has already been violated once.
-
-Two things follow, and both are load-bearing:
-
-* the current inventory is a **stored fact** (``source_roots.latest_complete_scan_run_id``) that
-  resolves to literal run ids, so the predicate drives the composite index instead of being a
-  subquery the planner evaluates against the whole table;
-* :func:`resolve_scope` makes that the **default**. An analyser called without a scope now answers
-  a question about the drive; asking about history is an explicit
-  :meth:`AnalyserScope.all_history`.
+Unscoped ``filesystem_entries`` includes prior snapshots, so analysers falsely related a file to
+its own history and flagged removable duplicates. ``resolve_scope`` defaults to latest complete
+runs; ``AnalyserScope.all_history`` is explicit. Prefer embedding entry-id SQL — never materialise
+huge ``IN`` lists.
 """
 
 from __future__ import annotations

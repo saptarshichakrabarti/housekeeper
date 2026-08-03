@@ -1,5 +1,8 @@
 """Review-mover safety tests: verified movement, collisions, last-copy protection."""
 
+import json
+from dataclasses import replace
+
 import pytest
 
 from housekeeper.analysers.exact_duplicates import run_exact_duplicate_analysis
@@ -11,12 +14,13 @@ from housekeeper.scanner import DriveScanner
 
 def _entries(database, approved_ids):
     rows = database.fetch_all(
-        "SELECT e.id,e.absolute_path,e.relative_path,e.size_bytes,s.full_hash FROM filesystem_entries e JOIN file_signatures s ON s.entry_id=e.id WHERE e.entry_type='file' ORDER BY e.id"
+        "SELECT e.id,e.absolute_path,e.relative_path,e.size_bytes,s.full_hash,s.hash_algorithm FROM filesystem_entries e JOIN file_signatures s ON s.entry_id=e.id WHERE e.entry_type='file' ORDER BY e.id"
     )
     return [
         ManifestEntry(
             row["id"] in approved_ids, row["id"], row["absolute_path"], row["relative_path"],
             row["size_bytes"], row["full_hash"], "REVIEW_SAFE", 1.0, [], "",
+            None, "", row["hash_algorithm"],
         )
         for row in rows
     ]
@@ -111,3 +115,41 @@ def test_destination_collision_is_not_overwritten(config, database, tmp_path):
     # The pre-existing file must remain, and the move must be recorded as FAILED.
     assert collision.read_bytes() == b"pre-existing different content"
     assert database.fetch_one("SELECT status FROM move_transactions WHERE status='FAILED'")
+
+
+def test_a_sha256_workspace_still_moves_after_the_default_changed(config, database, tmp_path):
+    """The migration's whole point: an existing SHA-256 workspace keeps working end to end.
+
+    The workspace is inventoried under SHA-256, the manifest declares SHA-256, and every
+    verification — preflight, pre-move re-hash, destination check — must use SHA-256 even though
+    the configured default is now BLAKE3.
+    """
+    config.data["hashing"]["algorithm"] = "sha256"
+    _triplicate(config, database, tmp_path)
+    assert database.fetch_one("SELECT hash_algorithm FROM file_signatures LIMIT 1")["hash_algorithm"] == "sha256"
+
+    config.data["hashing"]["algorithm"] = "auto"  # the default preserves the live workspace
+    member = database.fetch_one(
+        "SELECT entry_id FROM exact_duplicate_members WHERE is_canonical=0 LIMIT 1"
+    )
+    entries = _entries(database, {member["entry_id"]})
+    assert [e.expected_hash_algorithm for e in entries if e.approved] == ["sha256"]
+    transaction = move_approved_entries(entries, tmp_path / "review", database, dry_run=False, yes=True)
+    record = json.loads(transaction.read_text(encoding="utf-8").splitlines()[0])
+    assert record["status"] == "MOVED"
+    assert record["expected_hash_algorithm"] == "sha256"
+    assert record["pre_move_hash"] == record["post_move_hash"] == record["expected_hash"]
+
+
+def test_a_manifest_from_the_wrong_algorithm_is_refused(config, database, tmp_path):
+    """A digest that came from another function is not weaker evidence — it is no evidence."""
+    _triplicate(config, database, tmp_path)
+    member = database.fetch_one(
+        "SELECT entry_id FROM exact_duplicate_members WHERE is_canonical=0 LIMIT 1"
+    )
+    entries = _entries(database, {member["entry_id"]})
+    mislabelled = [
+        replace(e, expected_hash_algorithm="sha256") if e.approved else e for e in entries
+    ]
+    with pytest.raises(ValueError, match="hash algorithm"):
+        move_approved_entries(mislabelled, tmp_path / "review", database, dry_run=True, yes=True)

@@ -41,13 +41,16 @@ fn read_up_to(file: &mut File, buf: &mut [u8], want: usize) -> Result<usize, Str
 }
 
 enum Hasher {
+    B3(blake3::Hasher),
     S256(Sha256),
     S512(Sha512),
 }
 
 impl Hasher {
     fn new(algorithm: &str) -> Result<Self, String> {
-        if algorithm.eq_ignore_ascii_case("sha256") {
+        if algorithm.eq_ignore_ascii_case("blake3") {
+            Ok(Hasher::B3(blake3::Hasher::new()))
+        } else if algorithm.eq_ignore_ascii_case("sha256") {
             Ok(Hasher::S256(Sha256::new()))
         } else if algorithm.eq_ignore_ascii_case("sha512") {
             Ok(Hasher::S512(Sha512::new()))
@@ -57,12 +60,18 @@ impl Hasher {
     }
     fn update(&mut self, data: &[u8]) {
         match self {
+            Hasher::B3(h) => {
+                h.update(data);
+            }
             Hasher::S256(h) => h.update(data),
             Hasher::S512(h) => h.update(data),
         }
     }
     fn finish(self) -> String {
         match self {
+            // 32 bytes of the extendable output — the same 64 hex characters the Python
+            // `blake3.blake3().hexdigest()` produces, so the two backends stay interchangeable.
+            Hasher::B3(h) => hex(h.finalize().as_bytes()),
             Hasher::S256(h) => hex(&h.finalize()),
             Hasher::S512(h) => hex(&h.finalize()),
         }
@@ -93,7 +102,7 @@ fn unchanged(before: &std::fs::Metadata, after: &std::fs::Metadata) -> bool {
 
 fn hash_whole_file(file: &mut File, algorithm: &str, block_size: usize) -> Result<String, String> {
     let mut hasher = Hasher::new(algorithm)?;
-    let mut buf = vec![0u8; block_size.max(4096)];
+    let mut buf = vec![0u8; block_size.max(1)];
     loop {
         let want = buf.len();
         let n = read_up_to(file, &mut buf, want)?;
@@ -125,7 +134,7 @@ fn quick_hash(
 ) -> Result<(String, u64, bool), String> {
     let before = std::fs::metadata(path).map_err(|e| e.to_string())?;
     let size = before.len();
-    let chunk = chunk_size.max(4096);
+    let chunk = chunk_size.max(1);
     let mut file = File::open(path).map_err(|e| e.to_string())?;
     // A file the samples would cover anyway is read once, and its quick digest *is* its full
     // digest — exactly as Python does it, so the two agree on every small file.
@@ -146,6 +155,68 @@ fn quick_hash(
     Ok((digest, after.len(), unchanged(&before, &after)))
 }
 
+/// Full and sampled digests from one sequential read, matching Python's `compute_identity`.
+fn identity_hash(
+    path: &Path,
+    algorithm: &str,
+    block_size: usize,
+    quick_chunk_size: usize,
+    samples: usize,
+) -> Result<(String, String, u64, bool), String> {
+    let before = std::fs::metadata(path).map_err(|e| e.to_string())?;
+    let size = before.len();
+    let block = block_size.max(1);
+    let quick_chunk = quick_chunk_size.max(1);
+    let offsets = if samples_whole_file(size, quick_chunk as u64, samples as u64) {
+        Vec::new()
+    } else {
+        quick_offsets(size, quick_chunk as u64, samples as u64)
+    };
+    let mut captured: Vec<Vec<u8>> = offsets
+        .iter()
+        .map(|_| Vec::with_capacity(quick_chunk))
+        .collect();
+    let mut full = Hasher::new(algorithm)?;
+    let mut file = File::open(path).map_err(|e| e.to_string())?;
+    let mut buf = vec![0u8; block];
+    let mut position = 0u64;
+    loop {
+        let want = buf.len();
+        let n = read_up_to(&mut file, &mut buf, want)?;
+        if n == 0 {
+            break;
+        }
+        full.update(&buf[..n]);
+        let end = position.saturating_add(n as u64);
+        for (index, offset) in offsets.iter().copied().enumerate() {
+            let low = offset.max(position);
+            let high = offset.saturating_add(quick_chunk as u64).min(end);
+            if low < high {
+                captured[index]
+                    .extend_from_slice(&buf[(low - position) as usize..(high - position) as usize]);
+            }
+        }
+        position = end;
+    }
+    let full_digest = full.finish();
+    let quick_digest = if offsets.is_empty() {
+        full_digest.clone()
+    } else {
+        let mut quick = Hasher::new(algorithm)?;
+        for sample in captured {
+            quick.update(&sample);
+        }
+        quick.finish()
+    };
+    let after = std::fs::metadata(path).map_err(|e| e.to_string())?;
+    Ok((
+        full_digest,
+        quick_digest,
+        after.len(),
+        unchanged(&before, &after),
+    ))
+}
+
 /// Shape the reply exactly as the Python backend does, including on an unstable read.
 fn hash_reply(field: &str, result: (String, u64, bool)) -> Value {
     let (digest, size, ok) = result;
@@ -153,6 +224,19 @@ fn hash_reply(field: &str, result: (String, u64, bool)) -> Value {
         "status": if ok { "ok" } else { "error" },
         field: if ok { Value::from(digest) } else { Value::Null },
         "size_bytes": size,
+        "stable": ok,
+        "error": if ok { Value::Null } else { Value::from("file changed during hashing") },
+    })
+}
+
+fn identity_reply(result: (String, String, u64, bool)) -> Value {
+    let (full, quick, size, ok) = result;
+    json!({
+        "status": if ok { "ok" } else { "error" },
+        "full_hash": if ok { Value::from(full) } else { Value::Null },
+        "quick_hash": if ok { Value::from(quick) } else { Value::Null },
+        "size_bytes": size,
+        "bytes_read": size,
         "stable": ok,
         "error": if ok { Value::Null } else { Value::from("file changed during hashing") },
     })
@@ -192,7 +276,7 @@ fn main() {
         match request["operation"].as_str().unwrap_or("") {
             "capabilities" => respond(
                 request_id,
-                json!({"status":"ok","capabilities":{"backend":"rust","protocol_version":"1","operations":["capabilities","full_hash","quick_hash"]}}),
+                json!({"status":"ok","capabilities":{"backend":"rust","protocol_version":"1","operations":["capabilities","full_hash","quick_hash","identity_hash"]}}),
             ),
             "full_hash" => {
                 let path = args["path"].as_str().unwrap_or("");
@@ -210,6 +294,17 @@ fn main() {
                 let samples = args["middle_samples"].as_u64().unwrap_or(2) as usize;
                 match quick_hash(Path::new(path), algorithm, chunk, samples) {
                     Ok(result) => respond(request_id, hash_reply("quick_hash", result)),
+                    Err(error) => respond(request_id, json!({"status":"error","error":error})),
+                }
+            }
+            "identity_hash" => {
+                let path = args["path"].as_str().unwrap_or("");
+                let algorithm = args["algorithm"].as_str().unwrap_or("blake3");
+                let block = args["block_size"].as_u64().unwrap_or(8_388_608) as usize;
+                let chunk = args["quick_chunk_size"].as_u64().unwrap_or(1_048_576) as usize;
+                let samples = args["middle_samples"].as_u64().unwrap_or(2) as usize;
+                match identity_hash(Path::new(path), algorithm, block, chunk, samples) {
+                    Ok(result) => respond(request_id, identity_reply(result)),
                     Err(error) => respond(request_id, json!({"status":"error","error":error})),
                 }
             }

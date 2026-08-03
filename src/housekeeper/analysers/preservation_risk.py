@@ -1,8 +1,7 @@
 """Preservation-risk analysis: a workflow separate from clutter review.
 
-Flags format obsolescence, parser failure, encryption, unknown containers, and missing context.
-A preservation risk NEVER lowers retention value or becomes a deletion candidate — it increases
-caution. Recommended actions are migration/documentation/integrity, not removal.
+Flags obsolescence, parser failure, encryption, unknown containers, missing context. Never
+lowers retention or becomes a deletion candidate — recommended actions are migration/docs.
 """
 
 from __future__ import annotations

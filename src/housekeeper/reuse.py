@@ -1,17 +1,8 @@
-"""Input fingerprints: work whose inputs are provably identical is not redone.
+"""Input fingerprints so identical inputs skip recomputation.
 
-Three things decide whether a completed stage's output still stands: the *content* of the snapshot
-it read, the configuration, and the code. All three go into one digest, and a stage or report whose
-digest matches a completed one is reused instead of recomputed.
-
-The subtle input is the snapshot. A rescan writes a whole new set of ``filesystem_entries`` rows, so
-the run id is useless as an identity — it changes even when nothing on disk did. The token here
-names the *content* instead: the newest run of the source that actually recorded a change. Two scans
-of an unchanged tree therefore agree, and a chain of unchanged rescans keeps agreeing.
-
-What this does NOT make reusable is anything keyed to entry ids. A rescan's entries are new rows, so
-classifications, duplicate members, projects and canonical roles must be re-derived for the new
-snapshot or the ``current_*`` views come back empty — see ``quickstart.REUSABLE_STAGES``.
+Digest = snapshot content token + config + code. Snapshot identity is the newest run that
+recorded a change (not the run id — rescans allocate new ids even when disk is unchanged).
+Entry-id-keyed outputs are not reusable across rescans; see ``quickstart.REUSABLE_STAGES``.
 """
 
 from __future__ import annotations
@@ -23,14 +14,11 @@ from pathlib import Path
 
 @lru_cache(maxsize=1)
 def code_fingerprint() -> str:
-    """Digest of the code that produces analysis output and reports.
+    """Digest of package code and report templates that affect analysis output.
 
-    A digest of the package beats a hand-maintained version constant per analyser: a constant has to
-    be remembered on every semantic change, and a stage's output also depends on the shared helpers
-    it calls. Report templates count as code — a report changes when its template does.
-
-    ponytail: whole-package digest, so any source edit re-runs every stage once. That is the safe
-    direction; narrow it to per-analyser dependency sets only if re-running after an edit ever hurts.
+    Prefer a package digest over per-analyser version constants (easy to forget; helpers matter too).
+    Whole-package scope is deliberate: any source edit re-runs stages once — safe default; narrow
+    only if re-running after unrelated edits becomes costly.
     """
     root = Path(__file__).resolve().parent
     digest = hashlib.sha256()
@@ -72,16 +60,15 @@ def inventory_token(database) -> str:
 
 
 def derived_state_token(database) -> str:
-    """Identity of the analysis derived from the snapshot, for work that reads it (reports).
+    """Identity of analysis derived from the snapshot, for work that reads it (reports).
 
-    The tool's own record of finished work: the newest and the number of completed jobs, ignoring
-    report generation itself (a report job must not invalidate the next report). An ``analyse`` or
-    ``classify`` run therefore refreshes reports even without a rescan.
+    Newest completed job id and count, ignoring report generation itself (a report must not
+    invalidate the next report). An ``analyse``/``classify`` run therefore refreshes reports
+    even without a rescan.
 
-    ponytail: the jobs table rather than a digest of the derived rows — two O(1) aggregates instead
-    of a scan per analysis table. The trade-off is real and bounded: analysis performed *outside* a
-    tracked job (a library caller invoking an analyser directly) is invisible here, so such a caller
-    passes ``reuse=False``. Every CLI, dashboard and quickstart path records a job.
+    Uses the jobs table (two O(1) aggregates) rather than a digest of derived rows. Trade-off:
+    analysis outside a tracked job is invisible here — such callers pass ``reuse=False``.
+    Every CLI, dashboard, and quickstart path records a job.
     """
     row = database.fetch_one(
         "SELECT COALESCE(MAX(id),0) newest, COUNT(*) n FROM jobs "

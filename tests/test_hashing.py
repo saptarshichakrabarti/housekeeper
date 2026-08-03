@@ -1,6 +1,8 @@
 """Hashing tests: quick/full hashes, empty files, duplicates, byte comparison, verification."""
 
+import copy
 import hashlib
+from pathlib import Path
 
 import pytest
 
@@ -11,6 +13,55 @@ from housekeeper.hashing import (
     compute_quick_hash,
     verify_file_against_manifest,
 )
+
+
+def test_hashing_prefers_a_compatible_rust_backend(monkeypatch, tmp_path):
+    """Normal hashing uses Rust when capability detection has selected it."""
+    from housekeeper import hashing
+
+    class RustBackend:
+        def full_hash(self, path, algorithm, block_size):
+            assert Path(path).is_file()
+            return {"full_hash": "native-full", "size_bytes": 3, "stable": True, "error": None}
+
+        def quick_hash(self, path, algorithm, chunk_size, middle_samples):
+            assert Path(path).is_file()
+            return {"quick_hash": "native-quick", "size_bytes": 3, "stable": True, "error": None}
+
+        def identity_hash(self, path, algorithm, block_size, chunk_size, middle_samples):
+            assert Path(path).is_file()
+            return {
+                "full_hash": "native-full",
+                "quick_hash": "native-quick",
+                "size_bytes": 3,
+                "bytes_read": 3,
+                "stable": True,
+                "error": None,
+            }
+
+    target = tmp_path / "native.bin"
+    target.write_bytes(b"abc")
+    monkeypatch.setattr(hashing._native_backends, "backend", RustBackend(), raising=False)
+    assert compute_full_hash(target, "sha256", 4096).digest == "native-full"
+    assert compute_quick_hash(target, 1024, 2, "sha256").digest == "native-quick"
+    full, quick = compute_identity(target, "sha256", 4096, 1024, 2)
+    assert (full.digest, quick.digest) == ("native-full", "native-quick")
+
+
+def test_hashing_falls_back_after_a_rust_failure(monkeypatch, tmp_path):
+    from housekeeper import hashing
+
+    class BrokenRustBackend:
+        def full_hash(self, *_args):
+            raise RuntimeError("backend exited")
+
+        def close(self):
+            pass
+
+    target = tmp_path / "fallback.bin"
+    target.write_bytes(b"abc")
+    monkeypatch.setattr(hashing._native_backends, "backend", BrokenRustBackend(), raising=False)
+    assert compute_full_hash(target, "sha256", 4096).digest == hashlib.sha256(b"abc").hexdigest()
 
 
 def test_cache_hygiene_never_changes_the_digest(tmp_path):
@@ -38,22 +89,99 @@ def test_hash_cpu_io_split_is_recorded(tmp_path):
     assert "stage_ms:hash_cpu" in counts
 
 
-def test_blake3_is_gated_on_availability(tmp_path):
-    """blake3 is allowed only where its wheel is installed; otherwise it is rejected, not attempted."""
+def test_blake3_is_the_default_and_the_sha_family_stays_supported():
+    """blake3 is a required dependency now, so the default must always be computable."""
     from housekeeper.config import DEFAULTS, merge_configs, validate_config
-    from housekeeper.hashing import blake3_available, new_hasher
+    from housekeeper.hashing import new_hasher
 
-    config = merge_configs(DEFAULTS, {"hashing": {"algorithm": "blake3"}})
-    if blake3_available():
-        validate_config(config)  # no raise
-        digest = new_hasher("blake3")
-        digest.update(b"abc")
-        assert len(digest.hexdigest()) == 64  # 256-bit, schema-compatible width
-    else:
-        with pytest.raises(ValueError, match="unsupported hash algorithm"):
-            validate_config(config)
-        with pytest.raises(ImportError):
-            new_hasher("blake3")
+    assert DEFAULTS["hashing"]["algorithm"] == "auto"
+    validate_config(copy.deepcopy(DEFAULTS))  # no raise
+    digest = new_hasher("blake3")
+    digest.update(b"abc")
+    assert len(digest.hexdigest()) == 64  # 256-bit, schema-compatible width
+    for compatible in ("sha256", "sha512", "blake2b"):
+        validate_config(merge_configs(DEFAULTS, {"hashing": {"algorithm": compatible}}))
+    with pytest.raises(ValueError, match="unsupported hash algorithm"):
+        validate_config(merge_configs(DEFAULTS, {"hashing": {"algorithm": "md5"}}))
+
+
+def test_new_workspace_persists_blake3_for_auto(database):
+    from housekeeper.hashing import workspace_hash_algorithm
+
+    assert workspace_hash_algorithm(database, "auto") == "blake3"
+    row = database.fetch_one(
+        "SELECT setting_value FROM workspace_settings WHERE setting_key='hash_algorithm'"
+    )
+    assert row["setting_value"] == "blake3"
+
+
+def test_existing_workspace_keeps_and_persists_its_own_algorithm(database):
+    """A workspace already holding SHA-256 digests must not start writing BLAKE3 ones."""
+    from housekeeper.hashing import workspace_hash_algorithm
+
+    database.connect().execute(
+        "INSERT INTO scan_runs(id,source_root,source_root_fingerprint,status) VALUES(1,'/r','f','COMPLETE')"
+    )
+    database.connect().execute(
+        "INSERT INTO filesystem_entries(id,scan_run_id,source_root,absolute_path,relative_path,name,entry_type)"
+        " VALUES(1,1,'/r','/r/a','a','a','file')"
+    )
+    database.connect().execute(
+        "INSERT INTO file_signatures(entry_id,full_hash,hash_algorithm,hash_status) VALUES(1,'ab','sha256','OK')"
+    )
+    assert workspace_hash_algorithm(database, "auto") == "sha256"
+    database.connect().execute("DELETE FROM file_signatures")
+    database.connect().commit()
+    assert workspace_hash_algorithm(database, "auto") == "sha256"
+
+
+def test_explicit_algorithm_conflict_requires_migration(database):
+    from housekeeper.hashing import workspace_hash_algorithm
+
+    assert workspace_hash_algorithm(database, "sha256") == "sha256"
+    with pytest.raises(ValueError, match="explicit re-hash migration is required"):
+        workspace_hash_algorithm(database, "blake3")
+
+
+def test_mixed_workspace_algorithms_fail_closed(database):
+    from housekeeper.hashing import workspace_hash_algorithm
+
+    database.connect().execute(
+        "INSERT INTO content_objects(hash_algorithm,full_hash,size_bytes) VALUES"
+        "('sha256','a',1),('blake3','b',2)"
+    )
+    with pytest.raises(ValueError, match="mixed hash algorithms"):
+        workspace_hash_algorithm(database, "auto")
+
+
+def test_legacy_unnamed_digest_is_migrated_as_sha256(database):
+    from housekeeper.hashing import workspace_hash_algorithm
+
+    database.connect().execute(
+        "INSERT INTO scan_runs(id,source_root,source_root_fingerprint,status) VALUES(1,'/r','f','COMPLETE')"
+    )
+    database.connect().execute(
+        "INSERT INTO filesystem_entries(id,scan_run_id,source_root,absolute_path,relative_path,name,entry_type)"
+        " VALUES(1,1,'/r','/r/a','a','a','file')"
+    )
+    database.connect().execute(
+        "INSERT INTO file_signatures(entry_id,full_hash,hash_algorithm,hash_status)"
+        " VALUES(1,'legacy',NULL,'OK')"
+    )
+    assert workspace_hash_algorithm(database, "auto") == "sha256"
+
+
+def test_persisted_algorithm_must_match_recorded_digests(database):
+    from housekeeper.hashing import workspace_hash_algorithm
+
+    database.execute(
+        "INSERT INTO workspace_settings(setting_key,setting_value) VALUES('hash_algorithm','blake3')"
+    )
+    database.execute(
+        "INSERT INTO content_objects(hash_algorithm,full_hash,size_bytes) VALUES('sha256','a',1)"
+    )
+    with pytest.raises(ValueError, match="persisted workspace hash algorithm"):
+        workspace_hash_algorithm(database, "auto")
 
 
 def test_hashing_survives_a_platform_without_fadvise(tmp_path, monkeypatch):
@@ -175,8 +303,20 @@ def test_verify_file_against_manifest_returns_on_match(tmp_path):
     target = tmp_path / "f"
     target.write_bytes(b"payload")
     digest = hashlib.sha256(b"payload").hexdigest()
-    result = verify_file_against_manifest(target, len(b"payload"), digest)
+    result = verify_file_against_manifest(target, len(b"payload"), digest, "sha256")
     assert result.digest == digest
+
+
+def test_verify_file_against_manifest_uses_the_declared_algorithm(tmp_path):
+    """A BLAKE3 manifest is verified with BLAKE3; checking it with SHA-256 would reject the file."""
+    import blake3
+
+    target = tmp_path / "f"
+    target.write_bytes(b"payload")
+    digest = blake3.blake3(b"payload").hexdigest()
+    assert verify_file_against_manifest(target, 7, digest, "blake3").digest == digest
+    with pytest.raises(ValueError, match="mismatch"):
+        verify_file_against_manifest(target, 7, digest, "sha256")
 
 
 @pytest.mark.parametrize(
@@ -189,4 +329,4 @@ def test_verify_file_against_manifest_raises_on_mismatch(tmp_path, size, digest)
     target = tmp_path / "f"
     target.write_bytes(b"payload")
     with pytest.raises(ValueError, match="mismatch"):
-        verify_file_against_manifest(target, size, digest)
+        verify_file_against_manifest(target, size, digest, "sha256")

@@ -1,22 +1,10 @@
-"""Bulk duplicate review: rules that *propose* decisions, evaluated server-side, always previewable.
+"""Bulk duplicate review: server-side rule proposals, always previewable.
 
-A rule is a filter over duplicate groups — "keep the canonical", "keep the newest", "keep the copy
-under this folder" — that picks one keeper per group. Applying it writes ordinary
-``review_decisions`` rows: ``MARK_KEEP`` for the keeper, ``APPROVE_FOR_REVIEW`` for the redundant
-copies. That is all it does.
+Rules pick one keeper per group and write ``review_decisions`` only (``MARK_KEEP`` /
+``APPROVE_FOR_REVIEW``). Nothing here moves or deletes files.
 
-Nothing here can move or delete a file. Everything downstream is unchanged: ``review validate``,
-``review export``, ``validate-manifest``, ``move-to-review --dry-run``. The wizard adds no new
-mutation capability, only a faster way to record the same decisions.
-
-Two safety properties are deliberate:
-
-* **The client never supplies the entry list.** Apply takes a rule and a scope and re-derives the
-  keeper from the database, so a stale or tampered preview cannot approve a file the rule would not
-  have chosen.
-* **A group is all-or-nothing.** If any member of a group fails the approval preconditions (no
-  verified hash, protected, unreadable), the whole group is skipped with a reason rather than
-  half-approved.
+* Apply re-derives keepers from the database — the client never supplies entry lists.
+* Groups are all-or-nothing: if any member fails approval preconditions, the group is skipped.
 """
 
 from __future__ import annotations

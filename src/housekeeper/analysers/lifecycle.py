@@ -1,8 +1,7 @@
 """Advisory lifecycle-state assignment (non-binary clutter decisions).
 
-States go beyond keep/delete: ACTIVE, ARCHIVE, COLD_ARCHIVE, MANUAL_REVIEW, PROTECTED, DEFERRED.
-Recommendations are advisory only; nothing here moves or deletes files, and no active or
-archival collection is reorganized.
+States beyond keep/delete (ACTIVE, ARCHIVE, COLD_ARCHIVE, …). Advisory only — never moves
+or deletes files.
 """
 
 from __future__ import annotations

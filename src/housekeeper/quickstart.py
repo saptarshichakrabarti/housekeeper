@@ -1,17 +1,8 @@
-"""One-command pipeline: scan, analyse, classify, and report in a single invocation.
+"""One-command read-only pipeline: scan, analyse, classify, and report.
 
-``housekeeper quickstart <source>`` (or ``make quickstart SOURCE=<source>``) runs the complete
-*read-only* pipeline a new user would otherwise assemble from six commands. It follows the same
-safety rules as the individual commands:
-
-* nothing is ever moved, deleted, or modified — the pipeline only reads the source tree and writes
-  the workspace inventory/reports;
-* every step runs inside a durable job (pause/cancel-able, visible in ``jobs``/dashboard);
-* optional-dependency analysers degrade to honest "unavailable" results instead of failing;
-* re-running is safe and incremental — the scan reuses unchanged entries.
-
-The strongest action the tool ever takes (moving approved files into a review folder) remains a
-separate, explicit, manifest-verified command and is intentionally NOT part of quickstart.
+Durable ``QUICKSTART`` job with per-stage children; pause/cancel escalate to the root. Does not
+move or delete files. Incremental reuse unless ``full=True``. Movement remains a separate
+manifest-verified command.
 """
 
 from __future__ import annotations
@@ -29,7 +20,9 @@ from .reuse import input_fingerprint, snapshot_token
 # ``filesystem_entries`` rows, and anything keyed to an entry id (classifications, duplicate
 # members, projects, canonical roles, directory overlap) would leave the ``current_*`` views empty
 # if it were skipped. Content identity is global and copied forward by the scanner, so these stand.
-REUSABLE_STAGES = frozenset({"content-analysis", "document-versions", "image-similarity"})
+REUSABLE_STAGES = frozenset(
+    {"content-analysis", "document-versions", "document-minhash", "image-similarity"}
+)
 
 
 def _step(
@@ -178,6 +171,7 @@ def _run_pipeline(
     from .analysers.contact_sheets import run_contact_sheet_generation
     from .analysers.cross_format_derivation import run_cross_format_derivation_analysis
     from .analysers.directory_overlap import run_directory_overlap_analysis
+    from .analysers.document_minhash import run_document_minhash_analysis
     from .analysers.document_versions import run_document_version_analysis
     from .analysers.exact_duplicates import run_exact_duplicate_analysis
     from .analysers.images import run_image_analysis
@@ -195,11 +189,28 @@ def _run_pipeline(
     from .reporting import generate_all_reports
     from .scanner import DriveScanner
 
+    def run_bounded_document_minhash(database, config, scope=None, job_id=None):
+        maximum = int(
+            config.section("document_similarity")["maximum_quickstart_documents"]
+        )
+        maximum_tokens = int(
+            config.section("document_similarity")["maximum_quickstart_tokens"]
+        )
+        return run_document_minhash_analysis(
+            database,
+            config,
+            scope,
+            job_id,
+            maximum_documents=maximum,
+            maximum_tokens=maximum_tokens,
+        )
+
     # Named (rather than left as inline loop literals) so the stage count below is derived from
     # their length instead of a hand-maintained magic number.
     STRUCTURAL_ANALYSERS = (
         ("directory-overlap", "DIRECTORY_OVERLAP", run_directory_overlap_analysis),
         ("document-versions", "VERSION_ANALYSIS", run_document_version_analysis),
+        ("document-minhash", "DOCUMENT_SIMILARITY", run_bounded_document_minhash),
         ("image-similarity", "IMAGE_ANALYSIS", run_image_analysis),
         ("projects", "PROJECT_ANALYSIS", run_project_analysis),
         ("backup-lineage", "DIRECTORY_SUMMARY", run_backup_lineage_analysis),
@@ -304,7 +315,7 @@ def _run_pipeline(
     # previous run still owed is invisible in the change record, and narrowing to changed entries
     # would skip it forever. That one does require a cleanly completed previous pipeline.
     #
-    # ponytail: no "changed is small relative to inventory" threshold — a knob nobody could set
+    # No "changed is small relative to inventory" threshold — a knob nobody could set
     # meaningfully. Narrowing is right whatever the ratio.
     changed_entries = _changed_entry_count(database, scan_run_id)
     reuse_enabled = (

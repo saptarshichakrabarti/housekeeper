@@ -1,27 +1,11 @@
-"""Image metadata extraction and perceptual-similarity grouping.
+"""Image metadata and perceptual grouping via a 64-bit DCT hash (16 hex chars).
 
-The descriptor is a 64-bit **DCT** hash, stored as 16 hex characters: the image is reduced to
-32x32 grayscale, transformed, and the low-frequency 8x8 block is thresholded at its median. It
-replaced an 8x8 average hash, which downsampled to 64 pixels and compared each to the mean — that
-describes coarse brightness layout and nothing else, so it called two different photographs of the
-same scene similar and missed the same photograph after a gamma change.
+Replaced average-hash: correlated bits made band buckets non-selective, and gamma shifts flipped
+too many bits near the similarity threshold. DCT coefficients are near-decorrelated, so 9-band
+pigeonhole indexing stays selective; Hamming distance ≤8 cannot miss a band match.
 
-Banding selectivity was the visible symptom: with an average hash, ~7 bits per band left buckets
-of ~156 members at 20,000 descriptors, because the bits were strongly correlated with each other.
-DCT coefficients are close to decorrelated, which is the property the pigeonhole index needs to be
-selective rather than merely complete.
-
-Two things follow from the 64-bit width, unchanged by the descriptor swap:
-
-* **Distance is one instruction.** ``(a ^ b).bit_count()`` replaces a character-by-character
-  comparison of a 64-character string.
-* **The candidate index is complete.** The hash is split into 9 bands (one of 8 bits, eight of 7);
-  by the pigeonhole principle two hashes within Hamming distance 8 must agree exactly on at least
-  one band, so an equality join over bands cannot miss a true match. The previous 8-bit *prefix*
-  bucket could miss a pair differing in a single bit, and compared all pairs within each bucket.
-
-**G3**: bands and distance are a candidate funnel. Every emitted relationship is still gated on the
-exact distance, and a perceptual match is never an exact-duplicate claim.
+Bands and distance are a candidate funnel only. Every relationship is gated on exact distance; a
+perceptual match is never an exact-duplicate claim.
 """
 
 from __future__ import annotations
@@ -81,18 +65,11 @@ _DCT_BASIS = _dct_basis()
 def _rank_transform(samples: bytes) -> list[int]:
     """Replace each sample by its rank among all samples.
 
-    This is what makes the descriptor invariant to *any* strictly monotone tone curve — exposure,
-    gamma, contrast, a camera's film simulation — by construction rather than by luck: a monotone
-    curve cannot reorder pixels, so it cannot change a single rank.
-
-    It is not a refinement. Measured on the validation corpus in ``tests/test_images.py``, without
-    it a gamma of 0.7 moved **20 of 64 bits** while the closest pair of genuinely different images
-    sat at **8** — exactly the similarity threshold, so the descriptor was one JPEG artefact away
-    from calling two unrelated photographs the same. With it, the worst benign transformation costs
-    6 bits and the closest distinct pair is 22.
-
-    Ties take consecutive ranks in position order. ``sorted`` is stable, so equal samples resolve
-    identically every time, and a monotone curve keeps equal samples equal — the invariant holds.
+    Makes the descriptor invariant to any strictly monotone tone curve (a monotone map cannot
+    reorder pixels). Without ranking, gamma 0.7 moved 20 of 64 bits while distinct images sat at
+    Hamming 8 — the similarity threshold. With ranking: worst benign transform ≤6 bits; closest
+    distinct pair ≥22 (``tests/test_images.py``). Ties take consecutive ranks in position order;
+    stable sort keeps equal samples deterministic.
     """
     order = sorted(range(len(samples)), key=lambda index: samples[index])
     ranks = [0] * len(samples)
@@ -277,19 +254,12 @@ def refresh_phash_index(database, scope) -> int:
 
 
 def confirmed_pairs(database, scope) -> tuple[dict[tuple[int, int], int], dict[int, str]]:
-    """Every pair within the threshold, plus the descriptor of each object involved.
+    """Pairs within the Hamming threshold, plus each object's descriptor.
 
-    Candidates come from the band buckets and are verified against the exact distance here. The
-    buckets are streamed and compared in Python rather than joined in SQL: a self-join emits one
-    row per shared band per candidate pair, which on a 20,000-descriptor corpus is 13.7M rows to
-    hand back and de-duplicate. Scanning the 180,000 band rows in bucket order and comparing in
-    place produces the same answer — measured 68 s against 4.9 s.
-
-    Comparing per *distinct descriptor* rather than per object was tried here and reverted: it does
-    cut the comparison count (1.9M to 0.1M on a corpus of 5,000 objects sharing 100 descriptors),
-    but comparisons are not the cost. Emitting k(k-1)/2 pairs for k identical images is, and that
-    is inherent to pairwise output. Measured 1.2x faster at best and 0.7x at worst.
-    See docs/performance.md.
+    Band buckets are streamed and compared in Python — a SQL self-join returned 13.7M rows on
+    20k descriptors (68 s); in-place bucket scan: 4.9 s. Collapsing identical descriptors before
+    compare was tried and reverted: emit cost of k(k-1)/2 identical pairs dominates (see
+    ``docs/performance.md``).
     """
     content_sql, params = scope.content_object_id_sql()
     rows = database.reader().iter_rows(

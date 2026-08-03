@@ -1,8 +1,6 @@
 """Bounded, cacheable graph projections over the relationship store.
 
-The graph is intentionally a projection: authoritative detail remains available through
-the structured explorer APIs.  This keeps an accidental million-node rendering from
-turning into a browser or database denial of service.
+Projection only — detail stays on explorer APIs. Caps accidental million-node renders.
 """
 
 import hashlib

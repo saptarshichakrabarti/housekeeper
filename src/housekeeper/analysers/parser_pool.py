@@ -1,24 +1,10 @@
-"""A persistent, isolated parser pool.
+"""Persistent out-of-process parser pool for untrusted files.
 
-Parsers run out of process because they read untrusted files. They used to get a *new* process
-each time, which measured at 8–11 ms of pure process creation per parse — around fifty minutes of
-it across a 272,000-object inventory, before any file was read.
+Workers persist (~0.3 ms overhead vs 8–11 ms per-process spawn). Prefer ``forkserver`` so children
+do not inherit locks from a threaded parent (dashboard). Tasks cross the boundary as
+``(spec_name, path)`` — no pickled closures.
 
-Two things change here:
-
-* **Workers persist.** Pooled, the same work costs ~0.3 ms of process overhead per parse.
-* **``forkserver``, not ``fork``.** The dashboard runs a thread pool, and forking a multi-threaded
-  process can leave the child deadlocked on a lock held by a thread that does not exist on its side
-  of the fork. Python warns about exactly this. ``forkserver`` forks from a clean single-threaded
-  template instead.
-
-``forkserver`` cannot pickle a closure, which is the reason the old code used ``fork`` and passed
-one. It does not need to: what crosses the boundary is ``(spec_name, path)``, and the worker looks
-the runner up in the registry it has already imported.
-
-The isolation guarantee is unchanged: a parse that exceeds its timeout is reported as an error and
-its worker is destroyed, so a hostile file cannot stall the run. A task that was merely unlucky
-enough to share the pool with one gets exactly one retry.
+A timed-out parse destroys its worker; tasks that shared that pool get one retry.
 """
 
 from __future__ import annotations
@@ -46,20 +32,12 @@ def _forkserver_is_usable() -> bool:
 
 
 def _start_method() -> str | None:
-    """The best available isolation, in descending order of safety.
+    """Best available process isolation, safest first.
 
-    ``forkserver`` first: it forks from a clean single-threaded template, so a parser cannot
-    inherit a lock held by a thread that does not exist on its side of the fork.
-
-    Plain ``fork`` only from a **single-threaded** parent. Measured on macOS: with the dashboard's
-    thread pool alive, forked workers die during startup with
-    ``+[NSString initialize] may have been in progress in another thread when fork() was called.
-    Crashing instead.`` The pool's retry hides it, so the symptom is a slow, noisy run rather than
-    a failure — which is worse. That is precisely the hazard ``forkserver`` exists to avoid, so
-    reaching for ``fork`` from a threaded process trades the hazard back for nothing.
-
-    ``None`` means no process isolation is available and the caller must use the bounded
-    in-process path: weaker isolation, but it runs.
+    Prefer ``forkserver`` (clean single-threaded template). Allow plain ``fork`` only from a
+    single-threaded parent — forking under the dashboard thread pool fails on macOS during ObjC
+    init, and pool retries hide it as a slow noisy run. ``None`` falls back to bounded in-process
+    parsing.
     """
     if _forkserver_is_usable():
         return "forkserver"

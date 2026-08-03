@@ -27,6 +27,32 @@ def test_validate_rejects_negative_limit():
         validate_config(config)
 
 
+def test_validate_rejects_negative_quickstart_document_limit():
+    config = load_config().data.copy()
+    config = {
+        **config,
+        "document_similarity": {
+            **config["document_similarity"],
+            "maximum_quickstart_documents": -1,
+        },
+    }
+    with pytest.raises(ValueError, match="negative limit"):
+        validate_config(config)
+
+
+def test_validate_rejects_negative_quickstart_token_limit():
+    config = load_config().data.copy()
+    config = {
+        **config,
+        "document_similarity": {
+            **config["document_similarity"],
+            "maximum_quickstart_tokens": -1,
+        },
+    }
+    with pytest.raises(ValueError, match="negative limit"):
+        validate_config(config)
+
+
 def test_validate_rejects_an_unknown_key():
     """A key nothing reads is an error, not a silent no-op — the whole point of Phase 6."""
     config = load_config().data.copy()
@@ -114,10 +140,17 @@ def test_network_path_selects_network_profile(tmp_path):
     assert profile["profile_name"] == "network"
 
 
+def test_fast_network_measurement_does_not_reclassify_the_mount_as_local(tmp_path):
+    from housekeeper.config import NVME_BYTES_PER_SECOND
+
+    config = load_config(workspace_override=tmp_path)
+    profile = performance_profile(config, Path("//server/share"), NVME_BYTES_PER_SECOND * 2)
+    assert profile["profile_name"] == "network"
+
+
 # --- storage_profile: auto, from measurement ------------------------------------------------------
-# The plan offered three ways to pick a profile. The probe that walked the tree and read 8 MiB was
-# deleted (18.6 s of a 32 s scan). The path heuristic recognises network mounts and nothing else.
-# This is the third: use what the drive actually achieved last time.
+# The old probe walked the tree and read 8 MiB (18.6 s of a 32 s scan). First-run selection now
+# uses cached OS device metadata; a later measured throughput observation takes precedence.
 
 
 def test_auto_prefers_a_measured_throughput_over_the_path_heuristic():
@@ -147,6 +180,50 @@ def test_auto_promotes_to_nvme_on_a_fast_enough_measurement():
     fast = performance_profile(config, local, NVME_BYTES_PER_SECOND * 1.2)
     assert fast["profile_name"] == "nvme"
     assert int(fast["full_hash_workers"]) == 16
+
+
+def test_auto_uses_first_run_device_detection(monkeypatch, tmp_path):
+    from housekeeper import config as config_module
+
+    config = load_config()
+    monkeypatch.setattr(config_module, "_profile_from_device", lambda _path: "nvme")
+    profile = performance_profile(config, tmp_path)
+    assert profile["profile_name"] == "nvme"
+    assert profile["traversal_workers"] == 8
+
+
+def test_device_detection_failure_keeps_conservative_fallback(monkeypatch, tmp_path):
+    from housekeeper import config as config_module
+
+    config = load_config()
+    monkeypatch.setattr(config_module, "_profile_from_device", lambda _path: None)
+    assert performance_profile(config, tmp_path)["profile_name"] == "hdd"
+
+
+def test_linux_network_mount_uses_network_profile(monkeypatch):
+    from housekeeper import config as config_module
+
+    config_module._profile_for_device.cache_clear()
+    monkeypatch.setattr(config_module, "_linux_filesystem_type", lambda _mount: "nfs4")
+    assert config_module._profile_for_device("linux", 1, "/mnt/share") == "network"
+    config_module._profile_for_device.cache_clear()
+
+
+def test_macos_network_mount_uses_network_profile(monkeypatch):
+    import plistlib
+    from types import SimpleNamespace
+
+    from housekeeper import config as config_module
+
+    payload = plistlib.dumps({"FilesystemType": "smbfs", "MountPoint": "/Volumes/share"})
+    monkeypatch.setattr(
+        config_module.subprocess,
+        "run",
+        lambda *_args, **_kwargs: SimpleNamespace(returncode=0, stdout=payload),
+    )
+    config_module._profile_for_device.cache_clear()
+    assert config_module._profile_for_device("darwin", 1, "/Volumes/share") == "network"
+    config_module._profile_for_device.cache_clear()
 
 
 def test_a_measurement_does_not_override_an_explicit_profile():

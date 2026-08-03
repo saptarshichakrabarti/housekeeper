@@ -1,10 +1,7 @@
 """Archive content normalization (ZIP / TAR family).
 
-The normalized hash is the multiset of ``(normalized member path, member content SHA-256)``
-computed by *streaming* member content — archives are never extracted to disk. This makes two
-archives that differ only in compression, member ordering, or timestamps compare equal, while
-any change to member content still differs. Oversized archives are reported UNSUPPORTED rather
-than doing unbounded work.
+Normalized hash is the multiset of ``(path, member SHA-256)`` streamed from members — never
+extracted to disk. Equal under compression/order/timestamp changes; oversized → UNSUPPORTED.
 """
 
 from __future__ import annotations

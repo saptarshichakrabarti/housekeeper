@@ -3,7 +3,18 @@ import os
 import shutil
 from pathlib import Path
 
+from .constants import LEGACY_HASH_ALGORITHM
 from .hashing import compute_full_hash
+
+
+def _algorithm(record: dict) -> str:
+    """The function that produced this record's ``expected_hash``.
+
+    Transactions written before the field existed used SHA-256, so re-hashing them under today's
+    default would report every intact review copy as HASH_MISMATCH — a false alarm on exactly the
+    files a restore is meant to rescue.
+    """
+    return str(record.get("expected_hash_algorithm") or LEGACY_HASH_ALGORITHM)
 
 
 def verify_transaction(manifest: Path) -> list[dict]:
@@ -24,7 +35,7 @@ def verify_transaction(manifest: Path) -> list[dict]:
             if not destination.is_file():
                 record["verify_status"] = "MISSING_DESTINATION"
             elif (
-                compute_full_hash(destination, "sha256", 8_388_608).digest
+                compute_full_hash(destination, _algorithm(record), 8_388_608).digest
                 != record.get("expected_hash")
             ):
                 record["verify_status"] = "HASH_MISMATCH"
@@ -41,14 +52,15 @@ def restore_transaction(manifest: Path, dry_run=False, yes=False):
         if r.get("status") != "MOVED":
             continue
         src, dst = Path(r["destination_path"]), Path(r["source_path"])
+        algorithm = _algorithm(r)
         if not src.is_file():
             r["restore_status"] = "MISSING_REVIEW_COPY"
-        elif compute_full_hash(src, "sha256", 8_388_608).digest != r["expected_hash"]:
+        elif compute_full_hash(src, algorithm, 8_388_608).digest != r["expected_hash"]:
             r["restore_status"] = "HASH_MISMATCH"
         elif dst.exists():
             r["restore_status"] = (
                 "DESTINATION_EXISTS"
-                if compute_full_hash(dst, "sha256", 8_388_608).digest != r["expected_hash"]
+                if compute_full_hash(dst, algorithm, 8_388_608).digest != r["expected_hash"]
                 else "ALREADY_SATISFIED"
             )
         elif not dry_run and not yes:
@@ -57,7 +69,7 @@ def restore_transaction(manifest: Path, dry_run=False, yes=False):
             dst.parent.mkdir(parents=True, exist_ok=True)
             # Copy, verify, then remove the review copy; never replace an existing path.
             shutil.copy2(src, dst)
-            restored = compute_full_hash(dst, "sha256", 8_388_608)
+            restored = compute_full_hash(dst, algorithm, 8_388_608)
             if restored.digest != r["expected_hash"]:
                 dst.unlink(missing_ok=True)
                 r["restore_status"] = "DESTINATION_VERIFICATION_FAILED"

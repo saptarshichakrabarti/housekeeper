@@ -1,3 +1,9 @@
+"""Durable job tracking, cooperative pause/cancel, and orphan reconciliation.
+
+Control requests use a side-channel file when SQLite's single writer is busy, so a UI click
+is never lost mid-transaction. Workers poll lineage (pipeline root + stage) at checkpoints.
+"""
+
 import json
 import os
 import platform
@@ -51,13 +57,11 @@ def control_path(database: Database, job_id: int) -> Path:
 
 
 def pending_control(database: Database, job_id: int) -> str:
-    """The stop request recorded out-of-band for this job — ``CANCELLING``, ``PAUSING`` or ``""``.
+    """Out-of-band stop request for this job: ``CANCELLING``, ``PAUSING``, or ``""``.
 
-    A stop request is a *write* to the jobs table, and SQLite has exactly one writer: a stage
-    holding its transaction open (a scan batch, a whole analyser) blocks that write past
-    ``busy_timeout``, so the request used to be lost entirely and the button did nothing at all.
-    The request is therefore written to a file first, which needs no lock, and the worker — which
-    already owns the write lock — performs the durable transition itself at its next checkpoint.
+    Written to a file first because SQLite has one writer — a mid-stage transaction used to
+    block the UI write past ``busy_timeout`` and drop the click. The worker owns the lock and
+    applies the durable transition at its next checkpoint.
     """
     try:
         return control_path(database, job_id).read_text(encoding="utf-8").strip()
@@ -187,11 +191,10 @@ _MAX_LINEAGE_DEPTH = 16
 
 
 def pipeline_root(database: Database, job_id: int) -> dict[str, Any] | None:
-    """The topmost job of the pipeline ``job_id`` belongs to (itself, if standalone).
+    """Topmost job of the pipeline ``job_id`` belongs to (itself if standalone).
 
-    A multi-stage run (quickstart, analyse-all) is one pipeline job with a child job per stage.
-    The child rows are what a user sees progressing, but pause/cancel is a decision about the
-    *run*, so control requests resolve to the root before they are applied.
+    Pause/cancel targets the run, not the current stage — otherwise the pipeline continues
+    or the click lands on an already-finished stage and does nothing.
     """
     current = job_id
     row = None
@@ -209,22 +212,11 @@ def pipeline_root(database: Database, job_id: int) -> dict[str, Any] | None:
 
 
 def request_cancel(database: Database, job_id: int) -> None:
-    """Ask a worker to stop and leave the job in a durable, cancelled state.
+    """Ask the pipeline root's worker to stop; leave a durable cancelled state.
 
-    A request against any stage of a multi-stage pipeline escalates to the pipeline's root job:
-    cancelling "the thing that is running" means the whole run, not the current stage — otherwise
-    the pipeline simply continues with its next stage (or the click races a stage boundary and
-    lands on an already-finished job, doing nothing at all). Workers poll their whole lineage, so
-    the running stage observes the root's ``CANCELLING`` at its next checkpoint.
-
-    Cancellation, like pause, is expressed through the status column so a restarted worker sees
-    the same request. The transition is validated so a stray click on an already-finished job is a
-    harmless no-op rather than a row that gets stuck in ``CANCELLING`` forever:
-
-    * a terminal job is left untouched (there is nothing to cancel);
-    * a ``PAUSED`` job has no live worker to observe the request, so it is finalized to
-      ``CANCELLED`` directly instead of waiting at ``CANCELLING`` for a worker that never runs;
-    * an active job is asked to cancel and settles at its next cooperative checkpoint.
+    Escalates to the root so one click cancels the whole run. Status is the control plane
+    (survives restart). Terminal jobs are no-ops; ``PAUSED`` (no live worker) is finalized to
+    ``CANCELLED`` directly; active jobs settle at the next checkpoint.
     """
     root = pipeline_root(database, job_id)
     if not root:
@@ -239,12 +231,10 @@ def request_cancel(database: Database, job_id: int) -> None:
 
 
 def request_pause(database: Database, job_id: int) -> None:
-    """Ask a worker to stop at its next durable checkpoint.
+    """Ask the pipeline root's worker to stop at its next durable checkpoint.
 
-    Like cancellation, a pause against a pipeline stage escalates to the pipeline's root job so
-    the whole run parks, instead of only the stage that happened to be running when the user
-    clicked. A pause is deliberately not an in-memory primitive: the status is the control
-    plane, so a worker that is restarted will observe the same request.
+    Escalates to the root so the whole run parks. Status (not an in-memory flag) is the
+    control plane so a restarted worker sees the same request.
     """
     root = pipeline_root(database, job_id)
     if not root or root["status"] not in {"PENDING", "RUNNING"}:
@@ -274,10 +264,10 @@ SELECT id, status FROM lineage
 
 
 def _lineage_statuses(database: Database, job_id: int) -> set[str]:
-    """Every state that applies to this job, its own row and its ancestors' — requests included.
+    """Statuses for this job and its ancestors, including out-of-band file requests.
 
-    A request that could not take the write lock lives only in a file (see ``pending_control``), so
-    the file counts as a state here: that is what makes one poll answer both channels.
+    A request that missed the write lock lives only in a file (see ``pending_control``); one
+    poll must answer both channels.
     """
     statuses = set()
     for row in database.fetch_all(_LINEAGE_STATUS_SQL, (job_id,)):
@@ -287,12 +277,10 @@ def _lineage_statuses(database: Database, job_id: int) -> set[str]:
 
 
 def stop_requested(database: Database, job_id: int) -> str:
-    """The stop this job is under, its own or an ancestor's: ``CANCELLING``, ``PAUSING`` or ``""``.
+    """Stop this job is under (own or ancestor): ``CANCELLING``, ``PAUSING``, or ``""``.
 
-    Control requests escalate to the pipeline root (see ``request_pause``), so a stage's own row and
-    file say nothing about a pause the whole run is under. This is what lets the UI show a stage as
-    stopping the moment the run is asked to stop, instead of leaving its buttons looking untouched.
-    Cancel wins over pause, as it does at the checkpoint.
+    Requests escalate to the pipeline root, so lineage — not the stage row alone — drives the
+    UI. Cancel wins over pause, as at the checkpoint.
     """
     statuses = _lineage_statuses(database, job_id)
     if statuses & {"CANCELLING", "CANCELLED"}:
@@ -313,10 +301,9 @@ def pause_requested(database: Database, job_id: int) -> bool:
 # Cancellation is a human-scale event: polling faster than this buys nothing and costs a query.
 CANCELLATION_POLL_SECONDS = 0.25
 # Last poll time per job. Pipelines interleave checks between a stage's per-entry checkpoints and
-# tracked_job's own entry/exit checks, and a single slot would flip on every call, defeating the
-# throttle. Keyed by database as well as job id: job ids restart at 1 in every new workspace, and
-# the two are not the same job.
-# ponytail: plain dict, oldest-first eviction at 8 entries — a pipeline touches ~2 jobs at once.
+# tracked_job's own entry/exit checks; a single slot would flip on every call and defeat the
+# throttle. Keyed by (database, job id): job ids restart at 1 per workspace.
+# Plain dict, oldest-first eviction at 8 — a pipeline touches ~2 jobs at once.
 _POLL_CACHE_SIZE = 8
 _last_poll: dict[tuple[str, int], float] = {}
 
@@ -327,16 +314,10 @@ _last_progress_commit = 0.0
 
 
 def check_cancelled(database: Database, job_id: int) -> None:
-    """Honour a pending pause/cancel request. Called per entry, so it must stay nearly free.
+    """Honour a pending pause/cancel. Called per entry, so nearly free.
 
-    It used to issue up to four statements *per entry* — two SELECTs plus, on the settle path, an
-    UPDATE — which on a million-entry scan is millions of queries asking a question whose answer
-    changes at most once. Now it is one SELECT, and only when at least
-    ``CANCELLATION_POLL_SECONDS`` have passed since the last one for this job.
-
-    The poll covers the job's whole lineage, not just its own row: a stage of a pipeline stops
-    when the *pipeline* is asked to pause or cancel, which is how one button controls a whole
-    quickstart/analyse-all run. Cancel wins over pause when both appear in the lineage.
+    One throttled lineage SELECT (was up to four statements per entry). A stage stops when the
+    *pipeline* is asked to pause/cancel. Cancel wins over pause.
     """
     key = (str(database.path), job_id)
     now = time.monotonic()
@@ -361,13 +342,10 @@ def checkpoint(
     current_item: str | None = None,
     state: dict[str, Any] | None = None,
 ) -> None:
-    """One cooperative checkpoint for an analyser loop.
+    """Cooperative analyser checkpoint: honour stop requests, then record progress.
 
-    Honors any pending pause/cancel request (raising ``JobPaused`` / ``JobCancelled`` so the
-    tracked job settles into a resumable terminal state), then records progress telemetry. A no-op
-    when ``job_id`` is ``None`` so every analyser remains directly callable outside a job. Resume is
-    idempotent re-run rather than seek-to-offset, so the recorded ``state`` is progress telemetry,
-    not a mandatory resume cursor.
+    No-op when ``job_id`` is ``None`` (analysers stay callable outside a job). Resume is
+    idempotent re-run, so ``state`` is telemetry, not a seek cursor.
     """
     global _last_progress_commit
     if job_id is None:
@@ -419,12 +397,10 @@ def tracked_job(
     parent_job_id: int | None = None,
     existing_job_id: int | None = None,
 ) -> Iterator[int]:
-    """Durably track an operation and turn Ctrl-C into a recoverable cancellation request.
+    """Durably track an operation; turn Ctrl-C into a recoverable cancellation request.
 
-    This is the stage boundary, so it is also the transaction boundary: the write primitives no
-    longer commit per row, and whatever the stage left uncommitted is committed here on success and
-    rolled back on failure. The cached graph projections a relationship-writing stage invalidated
-    are cleared once, here, instead of once per relationship.
+    Stage = transaction boundary: commit on success, rollback on failure. Graph-cache
+    invalidation for relationship writers runs once here, not per relationship.
     """
     from .relationships import invalidate_graph_cache
 
@@ -493,11 +469,9 @@ def threading_main_thread() -> bool:
 
 
 def _worker_process_alive(pid: int | None, host: str | None, this_host: str) -> bool | None:
-    """Best-effort liveness of the process that owns a job.
+    """Best-effort liveness of the job's owning process.
 
-    Returns ``True``/``False`` only when the answer is trustworthy — the job was recorded on this
-    same host and we can probe the pid. For a job from another host (a shared database on a
-    different machine) the pid is meaningless here, so we return ``None`` ("undecidable") and the
+    ``True``/``False`` only when pid was recorded on this host; otherwise ``None`` so the
     caller falls back to the heartbeat timeout.
     """
     if not pid or not host or host != this_host:
@@ -517,22 +491,11 @@ def _worker_process_alive(pid: int | None, host: str | None, this_host: str) -> 
 def reconcile_stale_jobs(
     database: Database, heartbeat_timeout_seconds: float = 120.0
 ) -> list[tuple[int, str]]:
-    """Settle jobs whose worker has died, so the UI never shows a phantom "running" operation.
+    """Settle jobs whose worker has died so the UI never shows a phantom active operation.
 
-    Cooperative pause/cancel only works while a live worker is polling its checkpoints. If that
-    worker's process disappears (the dashboard is restarted, the machine reboots, the CLI run is
-    ``kill -9``'d) the row is stranded in ``RUNNING``/``PAUSING``/``CANCELLING`` forever — exactly
-    the "these were stopped long ago but the web UI still shows them active" symptom.
-
-    This detects an orphan two independent ways and needs only one to fire:
-
-    * **process liveness** — the job was recorded on this host and its pid is no longer running;
-    * **heartbeat** — no checkpoint has touched ``updated_at`` within ``heartbeat_timeout_seconds``
-      (covers a dead worker on another host sharing the database).
-
-    An orphaned job becomes ``INTERRUPTED`` (a terminal, honest state: "stopped without
-    finishing"). ``PENDING`` (queued, no worker yet) and ``PAUSED`` (deliberately parked at a
-    durable checkpoint) are never reaped. Returns the ``(job_id, new_status)`` pairs it changed.
+    Orphans are detected by process liveness (same-host pid) or heartbeat timeout (covers a
+    dead worker on another host). Settled to ``INTERRUPTED``. ``PENDING`` and ``PAUSED`` are
+    never reaped. Returns ``(job_id, new_status)`` pairs changed.
     """
     from .core.progress import seconds_since  # local import keeps jobs.py import-cycle free
 

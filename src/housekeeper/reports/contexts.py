@@ -206,18 +206,11 @@ _CHANGE_BUCKETS = ("NEW", "CONTENT_POSSIBLY_CHANGED", "METADATA_CHANGED", "MISSI
 
 
 def _run_totals(database, scan_run_id: int) -> dict:
-    """The figures a digest compares between runs, for one snapshot.
+    """Digest figures for one snapshot, comparable across runs.
 
-    Duplicate groups are counted from that snapshot's own **content links**, not from
-    ``exact_duplicate_members``: the analyser replaces a group's membership with the members of the
-    snapshot it last ran over, so counting stored members would report an older run as having none and
-    invent a change nobody made. Verified links, by contrast, are copied forward per entry and stay
-    with the snapshot that recorded them — which makes the two runs genuinely comparable, and uses the
-    same definition of "a duplicate group within this scope" as the analyser itself: one content object
-    reachable from two or more verified files of the run.
-
-    ``identity_available`` is the one honest escape hatch: a snapshot nobody ever hashed has no groups
-    to count, and that is not the same as having none.
+    Duplicate groups come from that snapshot's verified content links, not
+    ``exact_duplicate_members`` (analyser rewrites membership to the last run).
+    ``identity_available`` distinguishes "never hashed" from "hashed, no groups".
     """
     groups = database.fetch_one(
         "SELECT COUNT(*) n FROM (SELECT l.content_object_id FROM entry_content_links l "

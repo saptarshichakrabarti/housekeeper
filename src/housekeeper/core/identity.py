@@ -1,33 +1,9 @@
-"""One shared, parallel content-identity service.
+"""Parallel content-identity: hash candidates once; link and sign on the caller thread.
 
-Establishing a file's identity — its full digest, its quick digest, its content-object link and
-signature row — used to be written out in six different loops, five of them serial on the main
-thread with :func:`compute_full_hash`, one file at a time. The worst of them ran *before* the one
-loop that had a worker pool, so on a first scan of a media drive the pool inherited only the
-leftovers. This is that work in one place: fed a stream of candidate rows, it hashes them across
-``full_hash_workers`` threads (``hashlib`` releases the GIL, so this scales), and does every database
-write on the caller thread in completion order.
-
-Two digests come from **one** sequential read (:func:`compute_identity`) — the quick digest is a
-by-product of the bytes the full hash already went past, never a second pass — which is why the
-serial ``compute_full_hash`` sites gain a quick hash for free by moving here.
-
-The write shape matches what each caller wrote before:
-
-* ``record_errors=False`` (the content-analysis path): a stable digest is linked and signed; an
-  unstable read or an ``OSError`` is counted and skipped, no signature row.
-* ``record_errors=True`` (the duplicate-candidate path): the same, plus a ``hash_status='ERROR'``
-  signature row carrying the error, so a file that could not be read is recorded as tried, not
-  silently absent from the funnel.
-
-**The service streams.** It never materialises the candidate list, so a first scan of a
-hundred-million-file drive holds only ``queue_size`` reads in flight, exactly as the loop it
-replaces did. Hard-link identity reuse rides that stream: inode-mates that are *adjacent* in it —
-which the caller arranges by ordering on ``(device_id, inode_or_file_id)`` — are read once and the
-result written for the whole run, so a snapshot-style backup drive never reads the same physical
-bytes twice. Reuse is gated on ``nlink > 1`` (the filesystem's own assertion that the paths share
-storage). A hard link that is *not* adjacent is simply hashed again and linked to the same content
-object: reuse is an optimisation with no correctness stake, so best-effort adjacency is enough.
+One sequential read yields full and quick digests. Workers hash across ``full_hash_workers``;
+DB writes stay on the caller thread. ``record_errors`` controls whether failed reads get ERROR
+signature rows. Streams candidates (bounded queue). Hard-link reuse when ``nlink > 1`` and
+inode-mates are adjacent — best-effort, not required for correctness.
 """
 
 from __future__ import annotations
@@ -39,7 +15,7 @@ from typing import Any
 
 from ..config import AppConfig, performance_profile
 from ..database import Database
-from ..hashing import compute_identity
+from ..hashing import compute_identity, workspace_hash_algorithm
 from ..jobs import check_cancelled, update_job
 from .worker_pool import bounded_map
 
@@ -167,7 +143,7 @@ def ensure_content_identity(
     stream so inode-mates are adjacent (``ORDER BY device_id, inode_or_file_id``).
     """
     hashing = config.section("hashing")
-    algorithm = hashing["algorithm"]
+    algorithm = workspace_hash_algorithm(database, hashing["algorithm"])
     if workers is None:
         workers = int(performance_profile(config)["full_hash_workers"])
     queue_size = min(

@@ -79,3 +79,52 @@ def test_unverified_candidate_produces_no_relationship(config, database, tmp_pat
     run_document_minhash_analysis(database, config)
     # Shared boilerplate must not merge them into a version family.
     assert database.fetch_all("SELECT * FROM content_relationships WHERE relationship_type='NEAR_DUPLICATE_DOCUMENT'") == []
+
+
+def test_threshold_change_invalidates_relationships_no_longer_supported(
+    config, database, tmp_path
+):
+    root = tmp_path / "src"
+    root.mkdir()
+    base = " ".join(f"shared document token {index}" for index in range(80))
+    (root / "a.txt").write_text(base, encoding="utf-8")
+    (root / "b.txt").write_text(base.replace("token 20", "changed 20"), encoding="utf-8")
+    config.section("document_similarity")["minimum_tokens"] = 5
+    DriveScanner(database, config).scan(root, incremental=False)
+    run_document_minhash_analysis(database, config)
+    assert database.fetch_one(
+        "SELECT COUNT(*) AS n FROM content_relationships WHERE status='ACTIVE'"
+    )["n"] == 1
+
+    config.section("document_similarity")["verification_threshold"] = 1.0
+    run_document_minhash_analysis(database, config)
+    assert database.fetch_one(
+        "SELECT COUNT(*) AS n FROM content_relationships WHERE status='ACTIVE'"
+    )["n"] == 0
+
+
+def test_quickstart_document_cost_gate_is_explicit(config, database, tmp_path):
+    root = tmp_path / "src"
+    root.mkdir()
+    (root / "a.txt").write_text("one document with enough words to analyse", encoding="utf-8")
+    (root / "b.txt").write_text("another document with enough words to analyse", encoding="utf-8")
+    DriveScanner(database, config).scan(root, incremental=False)
+    result = run_document_minhash_analysis(database, config, maximum_documents=1)
+    assert result["status"] == "skipped"
+    assert result["reason"] == "quickstart_document_cost_gate"
+    assert result["documents"] == 2
+    assert database.fetch_one("SELECT COUNT(*) AS n FROM content_objects")["n"] == 0
+
+
+def test_quickstart_document_token_gate_bounds_retained_shingles(config, database, tmp_path):
+    root = tmp_path / "src"
+    root.mkdir()
+    (root / "a.txt").write_text("one two three four five six", encoding="utf-8")
+    DriveScanner(database, config).scan(root, incremental=False)
+    config.section("document_similarity")["minimum_tokens"] = 1
+    result = run_document_minhash_analysis(database, config, maximum_tokens=3)
+    assert result["status"] == "skipped"
+    assert result["reason"] == "quickstart_token_cost_gate"
+    assert database.fetch_one(
+        "SELECT COUNT(*) AS n FROM similarity_signatures WHERE signature_type='TEXT_MINHASH'"
+    )["n"] == 0

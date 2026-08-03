@@ -2,7 +2,7 @@
 
 `housekeeper` creates a factual, resumable SQLite inventory of a messy backup drive and produces conservative review recommendations. It never permanently deletes files. The only mutating operation is moving individually approved manifest rows into an external review folder; every move is hashed, recorded, and restorable.
 
-Scanning is read-only, does not follow symbolic links by default, never executes content, and treats errors and unsupported formats conservatively. Exact duplicates require verified SHA-256 hashes and retain a deterministic canonical copy. Similarity is never proof of disposability. Movement requires an explicit edited manifest, revalidates size and hash immediately beforehand, refuses collisions and nested source/review roots, verifies the destination, then removes the source only after a verified copy. There is no delete or purge command.
+Scanning is read-only, does not follow symbolic links by default, never executes content, and treats errors and unsupported formats conservatively. Exact duplicates require verified cryptographic hashes — BLAKE3 for new workspaces, SHA-256 for ones already inventoried with it — and retain a deterministic canonical copy. Similarity is never proof of disposability. Movement requires an explicit edited manifest, revalidates size and hash immediately beforehand, refuses collisions and nested source/review roots, verifies the destination, then removes the source only after a verified copy. There is no delete or purge command.
 
 Primarily vibe-coded. Improvements are welcome.
 
@@ -20,10 +20,14 @@ make dashboard                     # browse results locally (loopback only)
 Without `make`, the same thing:
 
 ```bash
-pip install -e '.[analysis,dashboard]'
+pip install -e '.[dashboard]'
 housekeeper quickstart /mnt/drive        # add --no-reports to skip HTML, --json for machine output
 housekeeper dashboard
 ```
+
+Published platform wheels include the Rust hashing core. Source installs build it when Cargo is
+available and otherwise install the Python fallback, so acceleration is never an installation
+requirement.
 
 `quickstart` runs every step inside a durable, pausable job and is safe to re-run — each run reports
 the current snapshot of the drive. A re-run is **incremental**: stages whose inputs (snapshot
@@ -102,4 +106,4 @@ housekeeper dashboard --no-open-browser
 
 Install the optional local dashboard with `pip install -e '.[dashboard]'`. It binds to loopback, serves local assets only, escapes filenames, enforces bounded pagination/graph requests, and requires CSRF tokens for state-changing decisions. It never exposes arbitrary SQL, paths, file contents, or movement endpoints. See `docs/architecture.md`, `docs/dashboard.md`, `docs/graph_model.md`, `docs/performance.md`, and — for pointing the tool at terabyte drives and multi-day scans — `docs/long_runs.md`.
 
-The dashboard graph is rendered solely with the vendored Cytoscape.js distribution at `/static/vendor/cytoscape.min.js`; no CDN or Node.js runtime is required. Local declarative fragment refreshes keep job tables current without exposing a remote dependency. The optional analysis extra enables conservative DOCX, XLSX, PPTX, PDF, image, and archive metadata/text extraction. Parser failures and unavailable optional parsers remain protected artifacts.
+The dashboard graph is rendered solely with the vendored Cytoscape.js distribution at `/static/vendor/cytoscape.min.js`; no CDN or Node.js runtime is required. Local declarative fragment refreshes keep job tables current without exposing a remote dependency. The standard installation includes conservative DOCX, XLSX, PPTX, PDF, image, and archive metadata/text extraction. Parser failures remain protected artifacts.

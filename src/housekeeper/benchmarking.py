@@ -1,19 +1,7 @@
-"""Benchmark baseline recording and relative-regression comparison.
+"""Benchmark baselines: count drift always fails; timings only on matching runner fingerprint.
 
-Wall-clock numbers are not portable across machines, so a committed baseline separates two kinds
-of measurement:
-
-* **Counts** (files, directories, content objects, duplicate groups) are deterministic and
-  machine-independent. Any drift between a run and the baseline is a *correctness* regression and
-  always fails a comparison.
-* **Timings** are machine-dependent. They are compared only when the current environment
-  fingerprint matches the one recorded in the baseline (per ``benchmarks/README.md``: "compare
-  against an explicitly recorded baseline on the same runner ... fail only on an agreed relative
-  regression, not a fixed wall-clock value"). On a different runner, timing checks are reported as
-  skipped rather than failed.
-
-The corpus is generated deterministically here (not via the richer synthetic fixture, whose shape
-may evolve) so the recorded counts are stable across time and platform.
+Corpus is generated here for stable counts. Timing checks skip on environment mismatch
+(see ``benchmarks/README.md``).
 """
 
 from __future__ import annotations

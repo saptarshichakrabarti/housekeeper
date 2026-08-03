@@ -1,19 +1,8 @@
-"""Deterministic contact-sheet (montage) generation for image-similarity groups.
+"""Deterministic contact sheets for IMAGE_SIMILARITY groups.
 
-A contact sheet composites the already-generated thumbnails of an ``IMAGE_SIMILARITY`` group into a
-single bounded grid image, so a reviewer can eyeball a whole near-duplicate cluster at once.
-
-Safety properties:
-
-* Built **only from existing thumbnails** (small, already-decoded, size-bounded) — never from
-  original files — so it cannot trigger a decompression bomb and never re-reads originals.
-* **Deterministic**: members are sorted, the grid layout and neutral background are fixed, and no
-  timestamps are embedded, so the same group always yields byte-comparable output.
-* **Non-destructive**: writes derived JPEGs under the workspace and nothing else; regenerating is
-  always safe and the sheets can be cleared without touching source data or review decisions.
-
-Opt-in via ``images.create_contact_sheets``. Capability-gated on Pillow: if Pillow is missing it
-reports unavailable and produces nothing (never an error).
+Built only from existing thumbnails (never originals). Fixed layout for byte-comparable output;
+workspace-only JPEGs. Opt-in via ``images.create_contact_sheets``; Pillow-gated (unavailable is
+not an error).
 """
 
 from __future__ import annotations

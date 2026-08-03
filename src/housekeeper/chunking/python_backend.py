@@ -1,9 +1,7 @@
 """Pure-Python FastCDC-style content-defined chunker (correctness reference backend).
 
-A gear hash rolls over the byte stream; a boundary is cut when the fingerprint matches a mask.
-Normalized chunking (two masks around the average size) keeps chunk sizes stable. Only one
-chunk is buffered at a time, so memory stays bounded regardless of file size. This is the
-deterministic reference; an optional acceleration backend can replace it later.
+Gear-hash boundaries with normalized masks; one chunk buffered at a time. Deterministic
+reference; an optional acceleration backend can replace it later.
 """
 
 from __future__ import annotations

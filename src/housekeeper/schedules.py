@@ -1,11 +1,7 @@
-"""Emit the scheduler text for a recurring scan. Housekeeper itself stays daemon-free.
+"""Emit scheduler text for recurring scans; housekeeper stays daemon-free.
 
-The tool does not run resident and does not talk to the network. A recurring scan is therefore the
-platform's job: this module prints a systemd user timer, a crontab line, or a Windows Task Scheduler
-task, all of which invoke the ordinary read-only ``quickstart`` and then the ``changes`` digest.
-
-Nothing here writes to a system directory. The text goes to stdout for the operator to place — a
-scheduler unit is theirs to install, and printing it keeps the tool's "never surprises you" contract.
+Prints systemd / cron / Windows Task Scheduler units that run read-only ``quickstart`` plus the
+``changes`` digest. Output only — the operator installs. Paths are shell-quoted (trust boundary).
 """
 
 from __future__ import annotations

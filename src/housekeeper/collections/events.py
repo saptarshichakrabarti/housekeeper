@@ -1,11 +1,7 @@
 """Event and collection clustering (photo events, work sessions).
 
-Photos and work products are reviewed as collections, not isolated files. Clustering uses time
-gaps (EXIF capture time when available, else file modification time). Precise GPS is never
-stored or displayed by default — only time/sequence signals are used.
-
-Capture time is read from the image artifact recorded at parse time, not from the file: this used
-to open every photograph with PIL on every run, once per snapshot of it.
+Clusters by time gaps (EXIF capture when available, else mtime). Precise GPS is never stored
+or displayed by default. Capture time comes from the image artifact, not a per-run PIL open.
 """
 
 from __future__ import annotations

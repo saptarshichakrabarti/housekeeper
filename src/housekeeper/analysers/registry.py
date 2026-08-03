@@ -99,23 +99,15 @@ def _work_plan(
     pending_only: bool = True,
     maximum_size: int | None = None,
 ) -> tuple[str, tuple]:
-    """The content objects this analyser still owes an artifact for — one query for the stage.
+    """Content objects this analyser still owes an artifact for — one query for the stage.
 
-    Everything that used to be a question asked once per object per spec is a predicate here: the
-    suffix filter, the changed-only filter, the whole of ``scope``, and above all the "is this
-    artifact already current" anti-join, which on an all-cache-hit rerun was one query per object
-    purely to discover there was nothing to do.
+    Suffix, changed-only, scope, and the "artifact already current" anti-join are predicates
+    here (was one query per object on a cache-hit rerun). ``pending_only=False`` drops the
+    anti-join so the same shape counts eligibility vs skipped.
 
-    ``pending_only=False`` drops the anti-join, so the same shape counts what was *eligible* and
-    the difference reports how much was skipped.
-
-    **The scope belongs here, not in a Python filter after the fact.** This query used to select
-    non-aggregated entry columns under ``GROUP BY co.id``, so SQLite picked an arbitrary row from
-    whichever snapshot it liked, and the caller then discarded objects whose representative did not
-    match the requested run. After a rescan that silently skipped work the analyser genuinely owed:
-    the content object was still present, still unanalysed, and reachable from a current entry —
-    but the row the planner happened to hand back came from the old snapshot. The membership test
-    is now an ``EXISTS`` over the scope, and the representative is chosen deterministically.
+    Scope must be an ``EXISTS`` over current membership, not a Python post-filter: the old
+    ``GROUP BY co.id`` picked an arbitrary historical representative, so after a rescan the
+    planner could hand back an old snapshot row and silently skip work still owed.
     """
     clauses = [
         "l.link_status='VERIFIED'",
@@ -353,12 +345,10 @@ def _run_content_analysis(
             )
 
             def eligible_work(plan_sql=plan_sql, plan_params=plan_params):
-                """The work plan, streamed, with each object's representatives already decoded.
+                """Work plan streamed on a read-only connection; representatives already decoded.
 
-                Read it on an independent read-only connection: the loop writes artifacts on the
-                writer connection while this cursor is still streaming. Everything the parser
-                threads touch is plain data — no SQLite connection crosses a thread, and no row is
-                re-filtered here, because the plan already resolved the whole scope in SQL.
+                Writer commits artifacts while this cursor streams. Parser threads see plain data
+                only — no SQLite across threads; scope was resolved in SQL.
                 """
                 for row in database.reader().iter_rows(plan_sql, plan_params):
                     if job_id:
@@ -370,11 +360,10 @@ def _run_content_analysis(
                     yield row, representatives
 
             def parse_one(item, spec=spec, timeout=timeout):
-                """One content object, start to finish, on a submitter thread. Touches no database.
+                """One content object end-to-end on a submitter thread; touches no database.
 
-                A content object can have several readable paths, and a parser error on one is
-                retried through the next before a content-level failure is recorded — so the unit
-                of concurrency is the object, not the path, and that fallback order is preserved.
+                Tries readable paths in order; a path-level parser error falls through to the
+                next before recording a content-level failure.
                 """
                 row, representatives = item
                 result: dict[str, Any] | None = None

@@ -2,6 +2,8 @@ from dataclasses import asdict, dataclass
 from pathlib import Path
 from typing import Any
 
+from .constants import LEGACY_HASH_ALGORITHM
+
 
 @dataclass(frozen=True)
 class HashResult:
@@ -42,13 +44,16 @@ class ManifestEntry:
     source_path: str
     relative_path: str
     size_bytes: int
-    expected_sha256: str
+    expected_hash: str
     classification: str
     confidence: float
     reason_codes: list[str]
     explanation: str
     canonical_surviving_path: str | None = None
     reviewer_notes: str = ""
+    #: Which function produced ``expected_hash``. Trailing with a default so a manifest written
+    #: before this field existed — where the digest was always SHA-256 — still loads unchanged.
+    expected_hash_algorithm: str = LEGACY_HASH_ALGORITHM
 
     def to_dict(self) -> dict[str, Any]:
         return asdict(self)

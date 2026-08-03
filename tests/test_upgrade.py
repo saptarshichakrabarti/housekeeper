@@ -187,7 +187,7 @@ def test_duplicate_movement_refuses_last_verified_copy(tmp_path):
     DriveScanner(db, config).scan(source)
     run_exact_duplicate_analysis(db, config)
     rows = db.fetch_all(
-        "SELECT e.id,e.absolute_path,e.relative_path,e.size_bytes,s.full_hash FROM filesystem_entries e JOIN file_signatures s ON s.entry_id=e.id WHERE e.entry_type='file' ORDER BY e.id"
+        "SELECT e.id,e.absolute_path,e.relative_path,e.size_bytes,s.full_hash,s.hash_algorithm FROM filesystem_entries e JOIN file_signatures s ON s.entry_id=e.id WHERE e.entry_type='file' ORDER BY e.id"
     )
     manifest = [
         ManifestEntry(
@@ -203,6 +203,7 @@ def test_duplicate_movement_refuses_last_verified_copy(tmp_path):
             "",
             None,
             "",
+            row["hash_algorithm"],
         )
         for row in rows
     ]

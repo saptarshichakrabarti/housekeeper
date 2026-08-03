@@ -1,15 +1,7 @@
-// Obsidian-style graph explorer for the housekeeper dashboard.
-// External file (CSP is script-src 'self'; inline scripts are blocked).
-//
-// Two modes share one canvas:
-//   explore     — lazy folder graph: only source roots at first; clicking a folder fetches and
-//                 reveals its children (/api/graph/children), clicking again folds them away.
-//   projections — the bounded relationship projections (/api/graph/projection), unchanged
-//                 semantics, restyled to match.
-//
-// The Obsidian feel: force-directed layout that resettles organically on every expansion, node
-// size driven by connectivity, labels that appear as you zoom in, and hover lighting up a node's
-// neighborhood while everything else fades.
+// Dashboard graph: explore (lazy folders) and projections on one canvas.
+// External script (CSP: script-src 'self').
+// Explore starts at source roots; folder click fetches children. Projections use /api/graph/projection.
+// Force layout; node size by connectivity; labels on zoom; hover highlights neighborhood.
 (() => {
   'use strict';
 
@@ -85,8 +77,7 @@
 
   const runLayout = () => { graph.layout(forceLayout()).run(); };
 
-  // Obsidian sizes nodes by connectivity. Collapsed folders count their hidden children as
-  // potential connectivity so a heavy folder reads as heavy before it is opened.
+  // Size by connectivity; collapsed folders count hidden children so heavy folders read heavy closed.
   const resize = () => {
     graph.nodes().forEach((node) => {
       const potential = node.data('kind') === 'overflow' ? 0 : (node.data('childCount') || 0);

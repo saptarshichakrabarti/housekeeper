@@ -1,11 +1,7 @@
-"""Machine-independent work counters.
+"""Machine-independent work counters for tests and soak runs.
 
-Wall clock is noise in CI; units of work are not.  Hot paths increment a counter here so a test can
-assert "an unchanged rescan reads zero source bytes" instead of "it finished in under five seconds".
-
-Nothing is recorded outside a :func:`recording` block: :func:`count` returns immediately and the
-SQLite trace callback is installed on entry and removed on exit, so instrumented code pays nothing
-in production.
+Hot paths increment counters so CI can assert work done (e.g. unchanged rescan reads zero source
+bytes) instead of wall clock. Recording is opt-in via ``recording``; production pays nothing.
 """
 
 from __future__ import annotations

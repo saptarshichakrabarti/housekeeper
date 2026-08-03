@@ -37,6 +37,8 @@ def _normalize(text: str) -> str:
 
 
 def normalize_pdf(path: Path, config) -> NormalizedArtifact:
+    if not config.section("normalization")["pdf"].get("enabled", True):
+        return NormalizedArtifact("UNSUPPORTED", error_code="disabled")
     try:
         import fitz  # type: ignore[import-untyped, import-not-found]
     except ImportError as exc:

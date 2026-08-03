@@ -82,11 +82,52 @@ def test_database_validation_flags_source_drift(config, database, tmp_path):
 def test_database_validation_flags_hash_mismatch(config, database, tmp_path):
     _dup_db(config, database, tmp_path)
     row = database.fetch_one(
-        "SELECT e.id,e.absolute_path,e.relative_path,e.size_bytes FROM filesystem_entries e WHERE e.entry_type='file' LIMIT 1"
+        "SELECT e.id,e.absolute_path,e.relative_path,e.size_bytes,s.hash_algorithm FROM filesystem_entries e"
+        " JOIN file_signatures s ON s.entry_id=e.id WHERE e.entry_type='file' LIMIT 1"
     )
     bad = ManifestEntry(
         True, row["id"], row["absolute_path"], row["relative_path"], row["size_bytes"],
-        "0" * 64, "REVIEW_SAFE", 1.0, [], "",
+        "0" * 64, "REVIEW_SAFE", 1.0, [], "", None, "", row["hash_algorithm"],
     )
     errors = validate_manifest_against_database([bad], database)
     assert any("unverified" in e for e in errors)
+
+
+def test_database_validation_flags_a_manifest_from_another_algorithm(config, database, tmp_path):
+    """A digest is only evidence about the file if both sides used the same function."""
+    _dup_db(config, database, tmp_path)
+    row = database.fetch_one(
+        "SELECT e.id,e.absolute_path,e.relative_path,e.size_bytes,s.full_hash,s.hash_algorithm"
+        " FROM filesystem_entries e JOIN file_signatures s ON s.entry_id=e.id"
+        " WHERE e.entry_type='file' AND s.full_hash IS NOT NULL LIMIT 1"
+    )
+    assert row["hash_algorithm"] == "blake3"  # auto resolves new workspaces to BLAKE3
+    stale = ManifestEntry(
+        True, row["id"], row["absolute_path"], row["relative_path"], row["size_bytes"],
+        row["full_hash"], "REVIEW_SAFE", 1.0, [], "", None, "", "sha256",
+    )
+    errors = validate_manifest_against_database([stale], database)
+    assert any("algorithm mismatch" in e for e in errors)
+
+
+def test_a_legacy_manifest_loads_as_sha256_and_a_new_one_declares_its_algorithm(tmp_path):
+    """Old manifests carry ``expected_sha256`` and no algorithm; that digest really was SHA-256."""
+    legacy = tmp_path / "legacy.jsonl"
+    legacy.write_text(
+        '{"approved": true, "entry_id": 1, "source_path": "/x/a", "relative_path": "a",'
+        ' "size_bytes": 3, "expected_sha256": "abc", "classification": "REVIEW_SAFE",'
+        ' "confidence": 1.0, "reason_codes": [], "explanation": ""}\n',
+        encoding="utf-8",
+    )
+    entry = load_manifest(legacy)[0]
+    assert (entry.expected_hash, entry.expected_hash_algorithm) == ("abc", "sha256")
+
+    current = tmp_path / "current.jsonl"
+    current.write_text(
+        '{"approved": true, "entry_id": 1, "source_path": "/x/a", "relative_path": "a",'
+        ' "size_bytes": 3, "expected_hash": "def", "expected_hash_algorithm": "blake3",'
+        ' "classification": "REVIEW_SAFE", "confidence": 1.0, "reason_codes": [], "explanation": ""}\n',
+        encoding="utf-8",
+    )
+    entry = load_manifest(current)[0]
+    assert (entry.expected_hash, entry.expected_hash_algorithm) == ("def", "blake3")
