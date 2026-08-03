@@ -103,6 +103,38 @@ def test_threshold_change_invalidates_relationships_no_longer_supported(
     )["n"] == 0
 
 
+def test_minhash_reuses_stored_text_without_reparsing(config, database, tmp_path, monkeypatch):
+    """When the documents analyser has already stored normalized text, MinHash reuses it.
+
+    Re-parsing every document to shingle it is the dominant cost of this stage; the text is already
+    persisted in ``content_text_blobs``. After a content-analysis pass, running the MinHash stage
+    with the parser made to explode proves the stored blob is what feeds shingling.
+    """
+    from housekeeper.analysers.registry import run_content_analysis
+
+    root = tmp_path / "src"
+    root.mkdir()
+    base = " ".join(f"the quick brown fox number {i} jumps over the lazy dog" for i in range(40))
+    (root / "a.txt").write_text(base, encoding="utf-8")
+    (root / "b.txt").write_text(base.replace("lazy dog", "sleepy cat", 1), encoding="utf-8")
+    config.section("document_similarity")["minimum_tokens"] = 5
+    DriveScanner(database, config).scan(root, incremental=False)
+    run_content_analysis(database, config, "documents")  # persists normalized text blobs
+    assert database.fetch_one("SELECT COUNT(*) n FROM content_text_blobs")["n"] >= 2
+
+    import housekeeper.analysers.documents as documents_module
+
+    def _explode(*_args, **_kwargs):
+        raise AssertionError("MinHash must not re-parse a document whose text is already stored")
+
+    monkeypatch.setattr(documents_module, "extract_document", _explode)
+    result = run_document_minhash_analysis(database, config)
+    assert result["signatures"] == 2
+    assert database.fetch_one(
+        "SELECT COUNT(*) n FROM content_relationships WHERE status='ACTIVE'"
+    )["n"] == 1
+
+
 def test_quickstart_document_cost_gate_is_explicit(config, database, tmp_path):
     root = tmp_path / "src"
     root.mkdir()

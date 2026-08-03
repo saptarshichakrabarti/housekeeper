@@ -58,6 +58,56 @@ def test_insertion_resilient_overlap(config, database, tmp_path):
     assert database.fetch_one("SELECT COUNT(*) n FROM exact_duplicate_groups")["n"] == 0
 
 
+def test_occurrence_counts_and_index_bytes_are_exact_and_stable(config, database, tmp_path):
+    """Batched writes must keep occurrence_count authoritative and the covered-byte total drift-free.
+
+    Two files share a common body, so at least one chunk occurs more than once. The recount runs
+    once per affected chunk now, not per chunk in the file, so this asserts it still equals the true
+    row count — and that re-running the (idempotent) stage neither doubles counts nor grows the index.
+    """
+    _small_chunks(config)
+    root = tmp_path / "src"
+    root.mkdir()
+    rng = random.Random(11)
+    shared = bytes(rng.getrandbits(8) for _ in range(120_000))
+    (root / "a.bin").write_bytes(shared)
+    (root / "b.bin").write_bytes(bytes(rng.getrandbits(8) for _ in range(6000)) + shared)
+    DriveScanner(database, config).scan(root, incremental=False)
+    run_chunk_analysis(database, config)
+
+    def occurrence_snapshot():
+        return {
+            int(r["id"]): int(r["occurrence_count"])
+            for r in database.fetch_all("SELECT id,occurrence_count FROM content_chunks")
+        }
+
+    def true_counts():
+        return {
+            int(r["chunk_id"]): int(r["n"])
+            for r in database.fetch_all(
+                "SELECT chunk_id,COUNT(*) n FROM chunk_occurrences GROUP BY chunk_id"
+            )
+        }
+
+    stored = occurrence_snapshot()
+    assert stored == true_counts()  # occurrence_count equals the real number of occurrences
+    assert max(stored.values()) >= 2  # the shared body really does produce a repeated chunk
+
+    # The covered-byte identity the index-full gate relies on: SUM(size*count) == SUM(occurrence bytes).
+    weighted = database.fetch_one(
+        "SELECT COALESCE(SUM(size_bytes*occurrence_count),0) n FROM content_chunks"
+    )["n"]
+    occ_bytes = database.fetch_one(
+        "SELECT COALESCE(SUM(size_bytes),0) n FROM chunk_occurrences"
+    )["n"]
+    assert weighted == occ_bytes
+
+    # Idempotent re-run: identical counts, no doubling, no phantom index growth.
+    run_chunk_analysis(database, config)
+    assert occurrence_snapshot() == stored
+    assert occurrence_snapshot() == true_counts()
+
+
 def test_estimate_and_clear_are_derived_only(config, database, tmp_path):
     _small_chunks(config)
     root = tmp_path / "src"

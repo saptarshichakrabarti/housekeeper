@@ -9,6 +9,8 @@ from __future__ import annotations
 from collections import defaultdict
 from pathlib import Path
 
+from ..config import performance_profile
+from ..core.worker_pool import bounded_map
 from ..relationships import upsert_content_relationship
 from ..similarity.fuzzy_hashes import capabilities, tlsh_digest, tlsh_distance
 
@@ -38,24 +40,38 @@ def run_binary_similarity_analysis(database, config, job_id=None) -> dict:
         }
     minimum = int(section["minimum_file_size_bytes"])
     maximum = int(section["maximum_file_size_bytes"])
-    # One representative entry per content object, bucketed by (suffix, size band).
-    buckets: dict[tuple[str, int], list[tuple[int, str]]] = defaultdict(list)
-    for row in database.iter_rows(
-        """SELECT co.id AS cid, co.size_bytes, e.absolute_path, e.suffix FROM content_objects co
-           JOIN entry_content_links l ON l.content_object_id=co.id
-           JOIN filesystem_entries e ON e.id=l.entry_id
-           WHERE co.size_bytes BETWEEN ? AND ? GROUP BY co.id""",
-        (minimum, maximum),
-    ):
-        path = Path(row["absolute_path"])
+    workers = int(performance_profile(config)["full_hash_workers"])
+
+    def _digest(item: tuple[int, int, str, str]) -> tuple[tuple[str, int], int, str] | None:
+        """Digest one representative off the caller thread. Reads and TLSH both release the GIL,
+        so this is where the wall-clock is, and it parallelises cleanly; no database is touched."""
+        cid, size, path_str, suffix = item
+        path = Path(path_str)
         if not path.is_file() or path.is_symlink():
-            continue
+            return None
         digest = tlsh_digest(path)
         if digest is None:
-            continue
-        buckets[((row["suffix"] or "").lower(), _size_band(int(row["size_bytes"])))].append(
-            (int(row["cid"]), digest)
+            return None
+        return ((suffix, _size_band(size)), cid, digest)
+
+    # Plain tuples cross the thread boundary — never a sqlite Row. The read streams on this thread.
+    candidates = (
+        (int(row["cid"]), int(row["size_bytes"]), row["absolute_path"], (row["suffix"] or "").lower())
+        for row in database.iter_rows(
+            """SELECT co.id AS cid, co.size_bytes, e.absolute_path, e.suffix FROM content_objects co
+               JOIN entry_content_links l ON l.content_object_id=co.id
+               JOIN filesystem_entries e ON e.id=l.entry_id
+               WHERE co.size_bytes BETWEEN ? AND ? GROUP BY co.id""",
+            (minimum, maximum),
         )
+    )
+    # One representative entry per content object, bucketed by (suffix, size band).
+    buckets: dict[tuple[str, int], list[tuple[int, str]]] = defaultdict(list)
+    for result in bounded_map(_digest, candidates, workers, max(1, workers) * 4):
+        if result is None:
+            continue
+        key, cid, digest = result
+        buckets[key].append((cid, digest))
     from ..jobs import checkpoint
 
     signatures = 0
@@ -63,6 +79,9 @@ def run_binary_similarity_analysis(database, config, job_id=None) -> dict:
     for bucket_index, members in enumerate(buckets.values(), 1):
         checkpoint(database, job_id, processed_count=bucket_index, state={"buckets_done": bucket_index})
         signatures += len(members)
+        # Sorted so the pairwise (a_id, b_id) orientation and write order are identical regardless of
+        # the order digests completed in the pool — the stage's output stays byte-for-byte determinate.
+        members = sorted(members)
         for i, (a_id, a_digest) in enumerate(members):
             for b_id, b_digest in members[i + 1 :]:
                 distance = tlsh_distance(a_digest, b_digest)
