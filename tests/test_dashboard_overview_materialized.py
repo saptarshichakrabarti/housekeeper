@@ -95,7 +95,7 @@ def test_active_runs_counts_a_pipeline_once_and_excludes_paused_runs(database):
     metrics = {metric.label: metric for metric in DashboardService(database.reader()).overview().metrics}
     assert "Active jobs" not in metrics
     assert metrics["Active runs"].value == 1
-    assert metrics["Active runs"].href == "/jobs?view=runs"
+    assert metrics["Active runs"].href == "/activity?view=runs"
 
 
 def test_overview_view_model_is_ttl_cached(database, config, fixture_root):

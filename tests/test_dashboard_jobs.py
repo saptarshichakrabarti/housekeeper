@@ -186,7 +186,7 @@ def test_default_runs_view_does_not_repeat_stage_rows(client, database):
     html = client.get("/fragments/jobs").text.split("<tbody>", 1)[1]
     assert f"id='run-{parent}'" in html
     assert f"id='stage-{child}'" not in html
-    assert f"/jobs?view=stages&amp;run_id={parent}" in html
+    assert f"/activity?view=stages&amp;run_id={parent}" in html
 
 
 def test_pipeline_run_shows_current_stage_and_stage_count_progress(client, database):
@@ -233,25 +233,30 @@ def test_jobs_fragment_reaps_orphan_on_poll(client, database):
     assert database.fetch_one("SELECT status FROM jobs WHERE id=?", (job_id,))["status"] == "INTERRUPTED"
 
 
-def test_operational_jobs_page_has_a_launcher(client):
-    # With the runner active, the Jobs page embeds the control panel so work can be started here.
-    html = client.get("/jobs").text
-    assert "id='control-panel'" in html or 'id="control-panel"' in html
-    assert "folder-picker.js" in html
-    # The panel's four operations are served by /fragments/control.
+def test_activity_page_is_separate_from_run_controls(client):
+    html = client.get("/activity").text
+    assert "control-panel" not in html
+    assert "folder-picker.js" not in html
+    assert "<h1>Activity</h1>" in html
+
+    # Starting work remains exclusively on the Run page.
+    run_page = client.get("/control").text
+    assert 'id="control-panel"' in run_page
+    assert "folder-picker.js" in run_page
     fragment = client.get("/fragments/control").text
     for action in ("/control/scan", "/control/analyse", "/control/classify", "/control/report"):
         assert action in fragment
 
 
-def test_plain_jobs_page_has_no_launcher(database):
-    # A viewer dashboard (no runner) shows the jobs list only — no way to start work.
+def test_legacy_jobs_url_opens_activity_without_a_launcher(database):
+    # Old bookmarks remain useful, but /jobs is now only an alias for the dedicated activity page.
     from fastapi.testclient import TestClient
 
     from housekeeper.dashboard.app import create_app
 
     viewer = TestClient(create_app(database))
     html = viewer.get("/jobs").text
+    assert "<h1>Activity</h1>" in html
     assert "control-panel" not in html
     assert "folder-picker.js" not in html
 
@@ -409,27 +414,34 @@ def test_stages_view_is_flat_and_links_back_to_its_run(client, database):
     rows = stages.split("<tbody>", 1)[1]
     assert f"id='stage-{child}'" in rows
     assert f"id='run-{parent}'" not in rows
-    assert f"/jobs?view=runs&amp;run_id={parent}#run-{parent}" in rows
+    assert f"/activity?view=runs&amp;run_id={parent}#run-{parent}" in rows
     assert "Scan" in rows
     assert "action=pause" not in rows and "action=cancel" not in rows
 
 
 def test_jobs_tabs_and_filters_are_url_backed(client, database):
     parent, _child = _pipeline(database)
-    page = client.get(f"/jobs?view=stages&run_id={parent}").text
+    page = client.get(f"/activity?view=stages&run_id={parent}").text
     assert "hx-get='/fragments/jobs?" in page
     assert "view%3Dstages" not in page  # query pairs, not one encoded opaque value
     assert "view=stages" in page and f"run_id={parent}" in page
 
     fragment = client.get(f"/fragments/jobs?view=stages&run_id={parent}").text
-    assert "<a href='/jobs?view=stages' aria-current='page'>Stages</a>" in fragment
-    assert "<form class='jobs-filter' action='/jobs' method='get'>" in fragment
+    assert "<a href='/activity?view=stages' aria-current='page'>Stages</a>" in fragment
+    assert "<form class='jobs-filter' action='/activity' method='get'>" in fragment
     assert "name='view' value='stages'" in fragment
     assert f"name='run_id' min='1' value='{parent}'" in fragment
 
     # Browsers submit an untouched number input as an empty value; that means "no filter".
-    assert client.get("/jobs?view=runs&run_id=").status_code == 200
-    assert client.get("/jobs?view=runs&run_id=not-a-number").status_code == 422
+    assert client.get("/activity?view=runs&run_id=").status_code == 200
+    assert client.get("/activity?view=runs&run_id=not-a-number").status_code == 422
+
+
+def test_activity_tabs_override_the_vertical_site_navigation(client):
+    css = client.get("/static/app.css").text
+    tabs_rule = css.split(".jobs-tabs {", 1)[1].split("}", 1)[0]
+    assert "display: flex" in tabs_rule
+    assert "flex-direction: row" in tabs_rule
 
 
 def test_stages_view_excludes_standalone_runs(client, database):

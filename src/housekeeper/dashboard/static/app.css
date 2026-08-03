@@ -433,6 +433,9 @@ kbd { background: var(--hk-surface); border: 1px solid var(--hk-border-strong); 
 .jobs-filter input[name="run_id"] { width: 7rem; }
 .jobs-tabs {
   display: flex;
+  flex-direction: row;
+  flex-wrap: wrap;
+  align-items: flex-end;
   gap: .35rem;
   border-bottom: var(--hk-border-w) solid var(--hk-border);
   margin: 0 0 .45rem;

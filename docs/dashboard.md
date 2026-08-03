@@ -49,9 +49,13 @@ All three respect read-only mode (they are read-only by construction) and the st
   so approvals can never land on entries nobody looked at. Pages are capped at 500 groups, and the
   preview's **Next** button carries the keyset cursor so a later page applies as the page it shows.
 
-## Jobs
+## Activity
 
-The Jobs page separates two levels of activity instead of listing the same work twice:
+The dedicated `/activity` page contains execution history only. Starting work remains on `/control`
+(**Run** in the navigation), so following a stage link never lands among operational controls. The
+legacy `/jobs` URL renders the same activity page for existing bookmarks.
+
+Activity separates two levels of work instead of listing the same records twice:
 
 - **Runs** is the default and contains top-level operations only (`parent_job_id IS NULL`). A Quick
   start is one row, its progress is reported as completed/planned stages, and its current stage is

@@ -54,6 +54,6 @@ def test_scan_control_wires_the_picker(client):
     assert 'hx-preserve="true"' in fragment  # the 2s status poll no longer wipes the chosen path
 
 
-def test_pages_include_the_folder_modal(client):
-    assert "folder-browser-body" in client.get("/jobs").text
+def test_only_the_run_page_includes_the_folder_modal(client):
+    assert "folder-browser-body" not in client.get("/activity").text
     assert "folder-browser-body" in client.get("/control").text

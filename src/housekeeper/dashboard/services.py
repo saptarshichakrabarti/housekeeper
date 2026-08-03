@@ -142,13 +142,13 @@ class DashboardService:
             Metric(
                 "Artifacts",
                 int(overview.get("analysis_artifacts", 0)),
-                href="/jobs",
+                href="/activity?view=stages",
                 description="Stored analysis results",
             ),
             Metric(
                 "Active runs",
                 active_runs,
-                href="/jobs?view=runs",
+                href="/activity?view=runs",
                 description="Top-level operations queued or in progress",
             ),
         )

@@ -36,9 +36,9 @@ def test_active_jobs_fragment_keeps_polling(client, database):
     assert "every 3s" in html
 
 
-def test_jobs_page_only_loads_once(client):
+def test_activity_page_only_loads_once(client):
     # The page no longer hard-codes a forever poll; the fragment decides the cadence.
-    assert "every 3s" not in client.get("/jobs").text
+    assert "every 3s" not in client.get("/activity").text
 
 
 def test_control_scan_emits_job_started_header(client, tmp_path):

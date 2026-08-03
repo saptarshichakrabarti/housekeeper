@@ -138,7 +138,7 @@ def create_app(
             {
                 "label": "System",
                 "items": [
-                    ("jobs", "Jobs"),
+                    ("activity", "Activity"),
                     ("graph", "Graph"),
                     ("learning", "Learning"),
                     ("manifests", "Manifests"),
@@ -518,7 +518,7 @@ def create_app(
                         f" {escape(str(job_type_label(parent['job_type'])))}" if parent else ""
                     )
                     cells += (
-                        f"<td><a href='/jobs?view=runs&amp;run_id={parent_id}#run-{parent_id}'>"
+                        f"<td><a href='/activity?view=runs&amp;run_id={parent_id}#run-{parent_id}'>"
                         f"#{parent_id}{parent_type}</a></td>"
                     )
                 elif heading == "job_type":
@@ -535,7 +535,7 @@ def create_app(
                     count = len(stages)
                     noun = "stage" if count == 1 else "stages"
                     stages_link = (
-                        f"<a class='table-action' href='/jobs?view=stages&amp;run_id={job_id}'>"
+                        f"<a class='table-action' href='/activity?view=stages&amp;run_id={job_id}'>"
                         f"View {count} {noun}</a>"
                     )
                     controls = f"{controls} {stages_link}".strip()
@@ -1377,8 +1377,9 @@ def create_app(
             raise HTTPException(422, "run_id must be a positive integer")
         return run_id
 
-    @app.get("/jobs", response_class=HTMLResponse)
-    def jobs(
+    @app.get("/activity", response_class=HTMLResponse)
+    @app.get("/jobs", response_class=HTMLResponse, include_in_schema=False)
+    def activity(
         limit: int = Query(page_size, ge=1, le=maximum_page_size),
         view: str = "runs",
         job_type: str | None = None,
@@ -1388,25 +1389,6 @@ def create_app(
         selected_run_id = validated_run_id(run_id)
         if view not in {"runs", "stages"}:
             raise HTTPException(422, "view must be runs or stages")
-        # When the runner is active (gui/app, not the read-only viewer) let users start work right
-        # here: reuse the Run page's control panel (`#control-panel` + /fragments/control) above the
-        # list. It shares the /control/* endpoints, so starting a job also fires HX-Trigger:
-        # job-started, which re-arms the self-suspending jobs poll below on this same page.
-        launcher = ""
-        scripts = ""
-        if runner is not None:
-            launcher = (
-                "<h2>Start a job</h2>"
-                "<section id='control-panel' hx-get='/fragments/control' "
-                "hx-trigger='load, every 2s' hx-swap='innerHTML'>Loading…</section>"
-                # Folder-picker modal lives outside #control-panel so the 2s status poll never wipes
-                # it mid-browse.
-                "<div id='folder-browser' class='folder-browser' hidden>"
-                "<div class='folder-browser__panel'><div id='folder-browser-body'>Loading…</div></div></div>"
-                "<h2>Activity</h2>"
-            )
-            folder_picker_version = (static_dir / "folder-picker.js").stat().st_mtime_ns
-            scripts = f"<script defer src='/static/folder-picker.js?v={folder_picker_version}'></script>"
         query: dict[str, str | int] = {"limit": limit, "view": view}
         if job_type:
             query["job_type"] = job_type
@@ -1417,10 +1399,9 @@ def create_app(
         fragment_url = f"/fragments/jobs?{escape(urlencode(query), quote=True)}"
         # Only a one-shot load: the fragment itself decides whether to keep polling (see below).
         return page(
-            "Jobs",
-            f"{launcher}<section hx-get='{fragment_url}' hx-trigger='load'>Loading…</section>",
-            scripts=scripts,
-            active_path="jobs",
+            "Activity",
+            f"<section hx-get='{fragment_url}' hx-trigger='load'>Loading…</section>",
+            active_path="activity",
         )
 
     ACTIVE_JOB_STATES = {"PENDING", "RUNNING", "PAUSING", "CANCELLING"}
@@ -1499,7 +1480,7 @@ def create_app(
     def jobs_tabs(view: str) -> str:
         def tab(name: str, label: str) -> str:
             current = " aria-current='page'" if view == name else ""
-            return f"<a href='/jobs?view={name}'{current}>{label}</a>"
+            return f"<a href='/activity?view={name}'{current}>{label}</a>"
 
         description = (
             "One row per operation. Pipeline details are available in Stages."
@@ -1532,7 +1513,7 @@ def create_app(
         type_label = "run type" if view == "runs" else "stage type"
         run_value = escape(str(query.get("run_id", "")), quote=True)
         return (
-            "<form class='jobs-filter' action='/jobs' method='get'>"
+            "<form class='jobs-filter' action='/activity' method='get'>"
             f"<input type='hidden' name='view' value='{view}'>"
             f"<input type='hidden' name='limit' value='{int(query['limit'])}'>"
             f"<label>Run ID <input type='number' name='run_id' min='1' value='{run_value}' "
@@ -1542,7 +1523,7 @@ def create_app(
             + "</select></label> <label>Status <select name='status'>"
             + options("status", sorted(JOB_STATES), query.get("status"))
             + "</select></label> <button type='submit'>Filter</button> "
-            f"<a href='/jobs?view={view}'>Clear</a></form>"
+            f"<a href='/activity?view={view}'>Clear</a></form>"
         )
 
     @app.get("/fragments/jobs", response_class=HTMLResponse)
