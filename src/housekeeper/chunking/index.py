@@ -4,7 +4,6 @@ from __future__ import annotations
 
 from .model import ChunkProfile, ChunkRecord
 
-
 #: Bound-parameter windows. SQLite's default variable limit is 999 on older builds, so IN-lists and
 #: value batches are split well under it.
 _PARAM_WINDOW = 400
@@ -55,12 +54,12 @@ def store_chunks(
     distinct_hashes = sorted({r.chunk_hash for r in records})
     ids: dict[tuple[str, int], int] = {}
     for start in range(0, len(distinct_hashes), _PARAM_WINDOW):
-        window = distinct_hashes[start : start + _PARAM_WINDOW]
-        marks = ",".join("?" for _ in window)
+        hash_window = distinct_hashes[start : start + _PARAM_WINDOW]
+        marks = ",".join("?" for _ in hash_window)
         for row in conn.execute(
             f"SELECT id,chunk_hash,size_bytes FROM content_chunks "
             f"WHERE chunking_profile_id=? AND chunk_hash_algorithm=? AND chunk_hash IN ({marks})",
-            (profile_id, algorithm, *window),
+            (profile_id, algorithm, *hash_window),
         ):
             ids[(row["chunk_hash"], int(row["size_bytes"]))] = int(row["id"])
     # 3. Insert this object's occurrences in one batch.
@@ -75,13 +74,13 @@ def store_chunks(
     #    per-chunk UPDATE used, but batched instead of run for every chunk in the file.
     affected = sorted(set(ids.values()))
     for start in range(0, len(affected), _PARAM_WINDOW):
-        window = affected[start : start + _PARAM_WINDOW]
-        marks = ",".join("?" for _ in window)
+        id_window = affected[start : start + _PARAM_WINDOW]
+        marks = ",".join("?" for _ in id_window)
         conn.execute(
             f"UPDATE content_chunks SET occurrence_count="
             f"(SELECT COUNT(*) FROM chunk_occurrences WHERE chunk_id=content_chunks.id) "
             f"WHERE id IN ({marks})",
-            window,
+            id_window,
         )
     conn.commit()
     new_bytes = sum(r.size_bytes for r in records)
