@@ -159,6 +159,54 @@ Parallel structural stages are still **not built**: SQLite WAL allows one writer
 gate is a measurement — a full quickstart still spending >50% of wall-clock in structural stages
 *after* incremental re-runs land.
 
+## Further data-plane acceleration
+
+A later pass targeted the analysis kernels the earlier work had not touched. Each is guarded by
+`tests/test_acceleration.py`, `tests/test_chunking.py`, `tests/test_document_minhash.py`, or
+`tests/test_binary_similarity.py`.
+
+* **Native content-defined chunking.** The pure-Python FastCDC gear-hash chunker ran at ~7 MB/s — a
+  per-byte interpreter loop, and the worst kernel in the pipeline because chunking only applies to
+  large files. A `chunk_file` operation was added to the acceleration protocol: the Rust core carries
+  the 256-entry gear table as constants generated from `python_backend._gear_table()` and SHA-256s
+  each chunk, so its boundaries and digests are byte-identical to the reference (proven across the
+  min/avg/max boundary sizes). `chunking/backend.py` prefers it through the same per-thread backend
+  the hashing path uses and falls back to Python on any failure. Measured **6.6 → 450 MB/s (68×)** on
+  a 16 MiB sample including the JSON round-trip.
+* **Multithreaded memory-mapped BLAKE3.** `full_hash` and `identity_hash` take a `update_mmap_rayon`
+  path for BLAKE3 files at/above 2 MiB — identical output (BLAKE3 is a tree hash), the identity op
+  sampling its quick hash from the offsets separately. To avoid the two parallelism layers
+  oversubscribing, `bound_native_parallelism(workers)` sets `RAYON_NUM_THREADS = cores // workers`
+  before the identity stage spawns its core processes: many small files hash one-per-core with
+  intra-file threading off, a few very large files spread across all cores. Measured **2990 → 17405
+  MB/s (5.8×)** on a 256 MiB hash on a 4-core box; the win grows with core count.
+* **MinHash reuses stored document text.** `document-minhash` re-parsed every PDF/DOCX/XLSX/PPTX to
+  shingle it. The normalized text is already persisted in `content_text_blobs` by the documents
+  analyser, so the stage now reads the blob and re-extracts only when none exists — removing a whole
+  document re-parse pass, while staying self-sufficient after a bare scan.
+* **Batched chunk index writes.** `store_chunks` issued four statements plus a correlated `COUNT(*)`
+  per chunk (~40k statements for a 500 MB file). It now batches to one insert of the distinct chunks,
+  one of the occurrences, and one authoritative `occurrence_count` refresh, and returns the net
+  index-size delta so `run_chunk_analysis` keeps a running covered-byte total instead of
+  re-aggregating the whole index between every object.
+* **Parallel TLSH digestion.** The binary-similarity analyser digested representatives serially; reads
+  and TLSH both release the GIL, so digestion now fans out through `bounded_map`, with bucket members
+  sorted before comparison to keep the output byte-for-byte deterministic under out-of-order
+  completion.
+
+### Deferred by measurement in this pass
+
+* **No `draft()` shrink-decode for the perceptual descriptor.** JPEG draft-mode decoding is **4.5×**
+  faster (104 → 23 ms on a 4000×3000 image), but it changes the persisted perceptual descriptor by
+  **30 bits** against a similarity threshold of 8 — the same photo would stop matching itself across
+  drives — and the scaled IDCT is build- and source-size-dependent, degrading the scale-invariance
+  `tests/test_images.py` guards. The one safe target, the thumbnail, already drafts (`Image.thumbnail`
+  calls `draft` internally). Left unbuilt: the descriptor's cross-machine stability is a correctness
+  property, not a tuning knob.
+* **No native MinHash kernel.** The per-file subprocess protocol is a poor fit for shingle-set input,
+  and reusing the stored text (above) already removes the stage's dominant cost. A native path would
+  be revisited only if signature time dominates after the re-parse is gone.
+
 ## Decisions taken and not revisited
 
 These were measured and closed. Each records the number that decided it, so reopening one means
