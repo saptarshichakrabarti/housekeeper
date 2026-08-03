@@ -9,10 +9,10 @@ from __future__ import annotations
 
 from pathlib import Path
 
+from ..chunking.backend import chunk_file
 from ..chunking.index import store_chunks
 from ..chunking.overlap import compute_overlap, generate_overlap_candidates
 from ..chunking.profiles import get_or_create_chunk_profile_id, profile_from_config
-from ..chunking.python_backend import chunk_file
 from ..relationships import upsert_content_relationship
 
 ALGORITHM = "fastcdc_gear"
@@ -76,10 +76,13 @@ def run_chunk_analysis(database, config, scope=None, job_id=None) -> dict[str, i
         f"SELECT id FROM content_objects WHERE size_bytes>=? AND id IN ({content_sql}) ORDER BY id",
         (minimum_file, *content_params),
     )
+    # Seed the covered-byte total once and maintain it by the net delta each store returns, instead
+    # of re-aggregating the whole chunk index between every object (an O(index) query per object).
+    index_bytes = _index_bytes(database, profile_id)
     for index, obj in enumerate(objects, start=1):
         if job_id:
             check_cancelled(database, job_id)
-        if _index_bytes(database, profile_id) >= maximum_index:
+        if index_bytes >= maximum_index:
             counts["index_full"] = 1
             counts["skipped"] += len(objects) - index + 1
             break
@@ -88,7 +91,7 @@ def run_chunk_analysis(database, config, scope=None, job_id=None) -> dict[str, i
             counts["skipped"] += 1
             continue
         records = list(chunk_file(path, profile))
-        store_chunks(database, int(obj["id"]), profile_id, profile, records)
+        index_bytes += store_chunks(database, int(obj["id"]), profile_id, profile, records)
         counts["chunked"] += 1
         counts["chunks"] += len(records)
         checkpoint(database, job_id, processed_count=index)

@@ -226,6 +226,20 @@ def _compute_full_hash_python(path: Path, algorithm: str, block_size: int) -> Ha
     return _hash(path, algorithm, block_size)
 
 
+def bound_native_parallelism(workers: int) -> None:
+    """Cap the native core's intra-file BLAKE3 threads against the file-level worker count.
+
+    The identity stage hashes ``workers`` files at once, each in its own core process. If every one
+    of those also spread a single file across all cores, the two layers would oversubscribe and run
+    slower than either alone. Setting ``RAYON_NUM_THREADS = cores // workers`` keeps their product
+    near the core count: a scan already saturating the cores with one file per core hashes each file
+    single-threaded, while a source hashed by one worker (a few very large files) gets all cores per
+    file. Core processes spawned after this inherit the value; rayon reads it when it builds its pool.
+    """
+    cpu = os.cpu_count() or 1
+    os.environ["RAYON_NUM_THREADS"] = str(max(1, cpu // max(1, workers)))
+
+
 _native_backends = threading.local()
 
 

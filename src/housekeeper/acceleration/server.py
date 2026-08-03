@@ -37,6 +37,14 @@ def _handle(backend: PythonBackend, request: dict[str, Any]) -> dict[str, Any]:
             arguments.get("quick_chunk_size", 1_048_576),
             arguments.get("middle_samples", 2),
         )
+    if operation == "chunk_file":
+        return backend.chunk_file(
+            arguments["path"],
+            arguments.get("minimum_chunk_size", 16_384),
+            arguments.get("average_chunk_size", 65_536),
+            arguments.get("maximum_chunk_size", 262_144),
+            arguments.get("hash_algorithm", "sha256"),
+        )
     if operation == "verify_manifest":
         return backend.verify_manifest(arguments.get("entries", []))
     if operation == "aggregate_directories":

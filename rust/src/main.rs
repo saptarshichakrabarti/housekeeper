@@ -100,6 +100,61 @@ fn unchanged(before: &std::fs::Metadata, after: &std::fs::Metadata) -> bool {
     before.len() == after.len() && before.modified().ok() == after.modified().ok()
 }
 
+/// Files at or above this size take the memory-mapped multithreaded BLAKE3 path when parallelism
+/// is available; below it the sequential read loop wins (mmap setup and thread hand-off dominate).
+const MMAP_MIN_BYTES: u64 = 2 * 1024 * 1024;
+
+/// Whether the multithreaded BLAKE3 path should be used for a file of `size` bytes under `algorithm`.
+///
+/// Only BLAKE3 parallelises (the SHA crates do not), only for large files, and only when there is
+/// more than one thread to use. The thread count comes from `RAYON_NUM_THREADS`, which the Python
+/// caller sets so that file-level workers times intra-file threads stays near the core count — so a
+/// scan already saturating the cores with one file per core runs this path single-threaded (i.e.
+/// takes the sequential branch) instead of oversubscribing.
+fn use_parallel_blake3(algorithm: &str, size: u64) -> bool {
+    if size < MMAP_MIN_BYTES || !algorithm.eq_ignore_ascii_case("blake3") {
+        return false;
+    }
+    match std::env::var("RAYON_NUM_THREADS") {
+        // A set value is authoritative: 1 means the caller wants file-level parallelism only.
+        Ok(value) => value.trim().parse::<usize>().map(|n| n > 1).unwrap_or(true),
+        // Unset: rayon would use every core. The only concurrent hashing (the identity stage) always
+        // sets the cap, so an unset value means a lone caller that should use all cores.
+        Err(_) => true,
+    }
+}
+
+/// Multithreaded BLAKE3 over a memory-mapped file. Byte-identical to the sequential digest — BLAKE3
+/// is a tree hash, so threading changes only speed. mmap can fault (SIGBUS) if the file is truncated
+/// mid-hash; on a static source that does not happen, and if it did the core would die and the
+/// Python caller falls back to its reference implementation.
+fn blake3_mmap_rayon(path: &Path) -> Result<String, String> {
+    let mut hasher = blake3::Hasher::new();
+    hasher.update_mmap_rayon(path).map_err(|e| e.to_string())?;
+    Ok(hex(hasher.finalize().as_bytes()))
+}
+
+/// Sampled quick digest by seeking to each offset — used by the mmap identity path, which computes
+/// the full digest separately. Identical bytes to the streaming capture: `read` at `offset` returns
+/// `[offset, min(offset+chunk, size))`, exactly the range the streaming path accumulates.
+fn quick_from_offsets(
+    path: &Path,
+    algorithm: &str,
+    offsets: &[u64],
+    quick_chunk: usize,
+) -> Result<String, String> {
+    let mut hasher = Hasher::new(algorithm)?;
+    let mut file = File::open(path).map_err(|e| e.to_string())?;
+    let mut buf = vec![0u8; quick_chunk];
+    for &offset in offsets {
+        file.seek(io::SeekFrom::Start(offset))
+            .map_err(|e| e.to_string())?;
+        let n = read_up_to(&mut file, &mut buf, quick_chunk)?;
+        hasher.update(&buf[..n]);
+    }
+    Ok(hasher.finish())
+}
+
 fn hash_whole_file(file: &mut File, algorithm: &str, block_size: usize) -> Result<String, String> {
     let mut hasher = Hasher::new(algorithm)?;
     let mut buf = vec![0u8; block_size.max(1)];
@@ -120,8 +175,12 @@ fn full_hash(
     block_size: usize,
 ) -> Result<(String, u64, bool), String> {
     let before = std::fs::metadata(path).map_err(|e| e.to_string())?;
-    let mut file = File::open(path).map_err(|e| e.to_string())?;
-    let digest = hash_whole_file(&mut file, algorithm, block_size)?;
+    let digest = if use_parallel_blake3(algorithm, before.len()) {
+        blake3_mmap_rayon(path)?
+    } else {
+        let mut file = File::open(path).map_err(|e| e.to_string())?;
+        hash_whole_file(&mut file, algorithm, block_size)?
+    };
     let after = std::fs::metadata(path).map_err(|e| e.to_string())?;
     Ok((digest, after.len(), unchanged(&before, &after)))
 }
@@ -172,6 +231,23 @@ fn identity_hash(
     } else {
         quick_offsets(size, quick_chunk as u64, samples as u64)
     };
+    // Large-file BLAKE3: hash the whole file in parallel off the mmap, then take the samples from
+    // their offsets. Same two digests as the streaming path, one of them multithreaded.
+    if use_parallel_blake3(algorithm, size) {
+        let full_digest = blake3_mmap_rayon(path)?;
+        let quick_digest = if offsets.is_empty() {
+            full_digest.clone()
+        } else {
+            quick_from_offsets(path, algorithm, &offsets, quick_chunk)?
+        };
+        let after = std::fs::metadata(path).map_err(|e| e.to_string())?;
+        return Ok((
+            full_digest,
+            quick_digest,
+            after.len(),
+            unchanged(&before, &after),
+        ));
+    }
     let mut captured: Vec<Vec<u8>> = offsets
         .iter()
         .map(|_| Vec::with_capacity(quick_chunk))
@@ -215,6 +291,331 @@ fn identity_hash(
         after.len(),
         unchanged(&before, &after),
     ))
+}
+
+/// Gear table: byte-identical to housekeeper.chunking.python_backend._gear_table()
+/// (Python `random.Random(0xC0FFEE).getrandbits(64)` x256). The parity test is the guarantee.
+const GEAR: [u64; 256] = [
+    0x950e87d7f5606615,
+    0x2c61275c9e6b6cf8,
+    0x1f00bca0042db923,
+    0x6dbca290a9eab706,
+    0x4c10a4fe30cffdda,
+    0xf26fff4cc4fd394d,
+    0x6814a2bc786a6d2d,
+    0xa26b351e6c8042c5,
+    0x54760e7fbc051c6c,
+    0xd4c08880a5a4666d,
+    0x29610ae0eed8f1e7,
+    0xc34bd8e2fe5213e5,
+    0x6c50afb6e9fb123d,
+    0x6f28d015a2aa0b9d,
+    0x4e385994ebac94af,
+    0x194f9545adba52ce,
+    0xc675ce05588f882f,
+    0x57de8c051d4b7ef2,
+    0xd998efd82733e933,
+    0x6df216c33f8f3201,
+    0x11dc6f3fcb57d5d8,
+    0x8860a84722025e05,
+    0x33176469aa6ef630,
+    0x607507ebc5b864d7,
+    0x7a2f11088d29b146,
+    0xda10faaa6fc24b83,
+    0x2de288f12fcb9940,
+    0xb98937dfef041066,
+    0xdd4b712ed355871e,
+    0xc5b790314a2e3224,
+    0x07fdc889fa017ed7,
+    0x81eeadd71198bf15,
+    0x3a46305c425a7de1,
+    0xaaabc8d366e0440d,
+    0x3371364fc51d1a5e,
+    0x4763dd191ac44b70,
+    0x016590c55646e6d0,
+    0x0b7a6e1d81e4b9e7,
+    0xe5a2a8bef16e981a,
+    0x1167fba4a2927979,
+    0x3d01ac0f1b534b87,
+    0xd27a5f0f5532c867,
+    0xee26cbc0358b24d3,
+    0x9bdb39b2ca3c6a00,
+    0x8de06fbe1a741555,
+    0xd6257b492186c8b5,
+    0xdee7539c539445f3,
+    0x4307513f1ec1b0b1,
+    0x1d790bcaeffd4d2d,
+    0xde18f50a43cf423a,
+    0xd36c78ab3537a844,
+    0x64b5e3f81a293b3b,
+    0xe8eef3d67646f8a9,
+    0xa88d379db047719d,
+    0xf177d49f03ddc3bf,
+    0xa745fdd552965bca,
+    0xd0b6a46a7048daca,
+    0xfce79398852e0400,
+    0x760c9b756320dbe3,
+    0x4e52b41980271e94,
+    0x293f65848aa18f43,
+    0x520e015e444ed0f2,
+    0x793ff51bb0baf029,
+    0x7ad955568f86a26a,
+    0x1c720603ec8602d9,
+    0xd08e7565d487d342,
+    0x310288290b43dbfb,
+    0xd50ca99e8e59ea07,
+    0x6c24e82c6dbbac73,
+    0xb7a13dce8e4595df,
+    0xe91b8ec1f011e633,
+    0x9293bf4aed9a76b9,
+    0x75c33f8fcb8031fe,
+    0x1e7c31d385989296,
+    0x5574e314ddfc20fe,
+    0xd17dad339930e76e,
+    0xacfbba2a3f8666ee,
+    0xa4e307830deef007,
+    0x8fcd110ce94f47b0,
+    0xe1660a4195d74835,
+    0xd6d91d39227d512d,
+    0x2abb018969cbe6eb,
+    0x09cea2a86a921843,
+    0x3fe9e76493a8b5d8,
+    0x602f8e87d16bc8be,
+    0xe376bd78d7304cb6,
+    0x748781c961ef7dfc,
+    0xff5e243c496a590b,
+    0x089934a93d71d058,
+    0x3deadc7d1d2e1a2e,
+    0xe443e6031233f1e0,
+    0x5ab59d10b4a20569,
+    0x658141e73ede6f12,
+    0xf5d46d8127762b7b,
+    0xad1dd1408b87cfcb,
+    0xf9afa64760083c7d,
+    0xb7a68aa8611b9b59,
+    0xd828056ea86fc09c,
+    0x1c0ae9a87893032b,
+    0x34c8a05ca34be96a,
+    0xc966aed65a10eeaf,
+    0x6b7e21f0921082df,
+    0x6e5d9a3007c331a3,
+    0x3a0806a754f57983,
+    0x0a07a198f7767fd6,
+    0xf0723a8383f43dc4,
+    0xfb65e62582414d3f,
+    0x504516f2106025b5,
+    0xa0d72f15feb859eb,
+    0x115600523ea6fb4d,
+    0x1be3ae0c3b97b6c9,
+    0x5fe2b11364b97756,
+    0x5a8a944097dea5e8,
+    0xc330642bbf1317f8,
+    0xf0b02956ff594f79,
+    0xa4002d902b1b1e58,
+    0xba351d1d2912ab9f,
+    0x56761e8879073c59,
+    0x3912a0fca373e01b,
+    0xec004af1d0efd4ff,
+    0x8919551203d33d87,
+    0x64f85da91a44dfa0,
+    0x21d287d8efb4cad1,
+    0x1732b75d08d75496,
+    0x27623245c6251a5c,
+    0x987abb69ec5093da,
+    0xea45cdaf628e21c8,
+    0x0272834f4d8a9084,
+    0xab699ad2c231185b,
+    0x6ff327f4119ee914,
+    0x6b06b34098ca4c3f,
+    0x725461191d5d7302,
+    0x511173b251af8015,
+    0xebbfbb2bc3846ece,
+    0xed8b79ed1d74a080,
+    0x9736b29f0b03d0e1,
+    0xceaf0df42de3540c,
+    0x576c473aecbeb26f,
+    0x6782e42f80a0f27d,
+    0xf39f015e2cafb91c,
+    0x293c27e425e74da2,
+    0x1a18b9b1c2c8b502,
+    0x731535ecb7b2a53b,
+    0x4f7d9b08c0f76e59,
+    0x3e115e3e75118be1,
+    0x689db40cdd801db4,
+    0x399246294d8fc042,
+    0xc018ee73ff8f5cff,
+    0xa364f1b057f4865e,
+    0xbd5993b1f9f2dce0,
+    0x1fb37062a68f65c1,
+    0x2a5f2d8aca707a92,
+    0x3ff1295c1d296c14,
+    0x4ea7feaa1455fcad,
+    0xb484b8d3f354db28,
+    0xdef5e3507a2ee034,
+    0x1a46b9e3a2663f03,
+    0x5665aca3177d70d6,
+    0x36a208e01b1b4ee3,
+    0x00822ed4e33a0336,
+    0x9d3bd30e22749e54,
+    0x703666d165265fe5,
+    0xebe4418c6286ef71,
+    0xe07f915527fcb0f2,
+    0xcfedc87950868c9c,
+    0x95825097784ecbbb,
+    0x106572c92038d12e,
+    0x79b713272176822e,
+    0x810287a90cffae31,
+    0x7c8f5a44b03c1008,
+    0x113167635255aa79,
+    0x9f0600356aab79e5,
+    0x559ccfb8c80ce420,
+    0x33fc57dd263695f9,
+    0xc2299345df0b305d,
+    0x3519cb88dac97abb,
+    0xed1137eb3e5e1046,
+    0x22b6ce988e5e8733,
+    0xe3bd76bf57cec991,
+    0x402117a53e2681d1,
+    0xeee4852d330c2394,
+    0x854773512f3334bf,
+    0xcfe680854c95ea72,
+    0xe3aab3ddc209f79d,
+    0xa2842cb2fb44c6a2,
+    0x32442b01a0f4dd5a,
+    0xe5fbc6d02bd667d6,
+    0x343c5382621d123a,
+    0x6cb5b7d2782a1890,
+    0xef04a4a598411feb,
+    0x31afaa01fdc2dbd7,
+    0x5762032f27aa949b,
+    0x332508b2d1c97795,
+    0xb93ad7dfcba7ddcd,
+    0x4930986a215c9b8b,
+    0x3caf648a3fe36a17,
+    0x4e1309a0fc447a7f,
+    0x019d6ac5fe7f773e,
+    0x637118bb0b0e773c,
+    0xba17e7bd0a7a8b0c,
+    0x20b9122fca694c79,
+    0xb0773e1b8ea50117,
+    0xa544b6d2cf823377,
+    0x3e2e21041529057c,
+    0x01d6aedaa22e88e8,
+    0x673bb9153bc7eead,
+    0xf332dec5058c062b,
+    0x802df2eef9537531,
+    0x26dd7c451562a836,
+    0x0c72e5f1f03cde37,
+    0xeae27c2bcf28335a,
+    0x9482faca03ac665d,
+    0x6774a90031d2ba09,
+    0xe6b37c203fbd6d30,
+    0xc958935b157304b1,
+    0x9ef80467a8e636c6,
+    0xa7d73426f0aee715,
+    0x4ac05557bdca343f,
+    0x65c2195389de9f30,
+    0x7b4afcc0a8108c27,
+    0x938f35b2dc04bbfc,
+    0x642e484600cdfa67,
+    0x890c62927989d7e6,
+    0x11d0bc174b47a18b,
+    0xd0ae2b468f227e2f,
+    0xb9f409d40d3832c1,
+    0xa37579c44c86abf9,
+    0xcc69f35beecff786,
+    0x3cd64d14ac521437,
+    0xb860c5a45b4be237,
+    0x3d1791cf2b9550bc,
+    0x4c5b4726a89a476e,
+    0x12e2992b24380fb6,
+    0x0fb88164ccc14927,
+    0x9dca0bdcdd3a68c5,
+    0xeb0e37f4d6290f03,
+    0x0e8936d8133fee34,
+    0x2e778e78671eaa35,
+    0x616eb2a9fb09b28d,
+    0xaac0c22e5d235cab,
+    0xad4cf62c94a4f317,
+    0xcf3b5ee99ca944bb,
+    0xc1f007cd2413872a,
+    0x18fde7a7091e9247,
+    0xe8ed59599a0e9c30,
+    0xb036bade9e716b3d,
+    0x92852160c8b912b1,
+    0x59ad98498ff5b11b,
+    0xd41339c948a6e7cb,
+    0x3c79a0009f140b4e,
+    0x34186cdd3c3c5140,
+    0x919b6a673343fd70,
+    0xbab5120ef942a0f6,
+    0x3c8016d006c1ec71,
+    0x28e208906796f59f,
+    0xfbd9efbb76c9773a,
+];
+
+/// FastCDC-style gear-hash chunker — byte-identical to
+/// `housekeeper.chunking.python_backend.chunk_file`. Returns `(sequence, offset, size, sha256_hex)`
+/// per chunk. The chunk digest is always SHA-256, matching the reference (which ignores the
+/// profile's hash-algorithm label for the chunk hash itself).
+fn chunk_file_cdc(
+    path: &Path,
+    minimum: u64,
+    average: u64,
+    maximum: u64,
+) -> Result<Vec<(u64, u64, u64, String)>, String> {
+    let average = average.max(2);
+    let bits = average.ilog2(); // == Python average.bit_length() - 1 for average >= 1
+    let mask_s = (1u64 << (bits + 2).min(63)) - 1; // harder to cut below the average
+    let mask_l = (1u64 << bits.saturating_sub(2).max(1)) - 1; // easier to cut above it
+    let mut file = File::open(path).map_err(|e| e.to_string())?;
+    let mut fingerprint: u64 = 0;
+    let mut buffer: Vec<u8> = Vec::new();
+    let mut offset: u64 = 0;
+    let mut sequence: u64 = 0;
+    let mut records: Vec<(u64, u64, u64, String)> = Vec::new();
+    let mut block = vec![0u8; 1 << 20];
+    let emit = |buffer: &[u8], sequence: u64, offset: u64| -> (u64, u64, u64, String) {
+        let mut hasher = Sha256::new();
+        hasher.update(buffer);
+        (
+            sequence,
+            offset,
+            buffer.len() as u64,
+            hex(&hasher.finalize()),
+        )
+    };
+    loop {
+        let want = block.len();
+        let n = read_up_to(&mut file, &mut block, want)?;
+        if n == 0 {
+            break;
+        }
+        for &byte in &block[..n] {
+            buffer.push(byte);
+            // Python: ((fingerprint << 1) + GEAR[byte]) & (2^64 - 1). u64 shift drops the top bit
+            // and wrapping_add stays mod 2^64, so the two agree exactly.
+            fingerprint = (fingerprint << 1).wrapping_add(GEAR[byte as usize]);
+            let size = buffer.len() as u64;
+            if size < minimum {
+                continue;
+            }
+            let cut = size >= maximum
+                || (size <= average && (fingerprint & mask_s) == 0)
+                || (size > average && (fingerprint & mask_l) == 0);
+            if cut {
+                records.push(emit(&buffer, sequence, offset));
+                offset += size;
+                sequence += 1;
+                buffer.clear();
+                fingerprint = 0;
+            }
+        }
+    }
+    if !buffer.is_empty() {
+        records.push(emit(&buffer, sequence, offset));
+    }
+    Ok(records)
 }
 
 /// Shape the reply exactly as the Python backend does, including on an unstable read.
@@ -276,7 +677,7 @@ fn main() {
         match request["operation"].as_str().unwrap_or("") {
             "capabilities" => respond(
                 request_id,
-                json!({"status":"ok","capabilities":{"backend":"rust","protocol_version":"1","operations":["capabilities","full_hash","quick_hash","identity_hash"]}}),
+                json!({"status":"ok","capabilities":{"backend":"rust","protocol_version":"1","operations":["capabilities","full_hash","quick_hash","identity_hash","chunk_file"]}}),
             ),
             "full_hash" => {
                 let path = args["path"].as_str().unwrap_or("");
@@ -305,6 +706,32 @@ fn main() {
                 let samples = args["middle_samples"].as_u64().unwrap_or(2) as usize;
                 match identity_hash(Path::new(path), algorithm, block, chunk, samples) {
                     Ok(result) => respond(request_id, identity_reply(result)),
+                    Err(error) => respond(request_id, json!({"status":"error","error":error})),
+                }
+            }
+            "chunk_file" => {
+                let path = args["path"].as_str().unwrap_or("");
+                let minimum = args["minimum_chunk_size"].as_u64().unwrap_or(16_384);
+                let average = args["average_chunk_size"].as_u64().unwrap_or(65_536);
+                let maximum = args["maximum_chunk_size"].as_u64().unwrap_or(262_144);
+                match chunk_file_cdc(Path::new(path), minimum, average, maximum) {
+                    Ok(records) => {
+                        let chunks: Vec<Value> = records
+                            .into_iter()
+                            .map(|(sequence, offset, size, digest)| {
+                                json!({
+                                    "sequence_index": sequence,
+                                    "byte_offset": offset,
+                                    "size_bytes": size,
+                                    "chunk_hash": digest,
+                                })
+                            })
+                            .collect();
+                        respond(
+                            request_id,
+                            json!({"status":"ok","count": chunks.len(), "chunks": chunks}),
+                        );
+                    }
                     Err(error) => respond(request_id, json!({"status":"error","error":error})),
                 }
             }

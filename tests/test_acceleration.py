@@ -130,6 +130,87 @@ def test_native_backend_is_byte_identical_to_python(tmp_path, size, algorithm):
         native.close()
 
 
+def test_chunk_file_python_contract(tmp_path):
+    """The in-process reference produces a sane chunk sequence with full, gapless coverage."""
+    path = tmp_path / "data.bin"
+    path.write_bytes(bytes((index * 131 + 7) % 251 for index in range(200_003)))
+    reply = PythonBackend().chunk_file(str(path), 1024, 4096, 16384)
+    assert reply["status"] == "ok"
+    chunks = reply["chunks"]
+    assert reply["count"] == len(chunks) >= 2
+    assert chunks[0]["byte_offset"] == 0
+    # Contiguous, gapless, and covering every byte exactly once.
+    running = 0
+    for index, chunk in enumerate(chunks):
+        assert chunk["sequence_index"] == index
+        assert chunk["byte_offset"] == running
+        running += chunk["size_bytes"]
+    assert running == 200_003
+
+
+def test_subprocess_chunk_file_matches_python_backend(tmp_path):
+    """The JSONL subprocess backend must chunk identically to the in-process backend."""
+    path = tmp_path / "data.bin"
+    path.write_bytes(bytes((index * 97 + 3) % 253 for index in range(150_000)))
+    reference = PythonBackend().chunk_file(str(path), 1024, 4096, 16384)
+    remote = SubprocessBackend(_SERVER).chunk_file(str(path), 1024, 4096, 16384)
+    assert remote["chunks"] == reference["chunks"]
+
+
+@pytest.mark.parametrize("size", [0, 1, 1023, 1024, 5000, 16384, 16385, 60000, 200003])
+def test_native_chunker_is_byte_identical_to_python(tmp_path, size):
+    """The native CDC chunker must reproduce the reference boundaries and SHA-256 digests exactly.
+
+    A "faster" chunker that cut even one boundary differently would fabricate a different chunk
+    index and silently break every partial-overlap relationship built on it — the same failure the
+    hash parity test guards against, at the chunk layer.
+    """
+    binary = Path(__file__).resolve().parents[1] / "rust" / "target" / "release" / "housekeeper-core"
+    if not binary.is_file():
+        pytest.skip("native backend not built (make rust)")
+    path = tmp_path / "data.bin"
+    path.write_bytes(bytes((index * 131 + 7) % 251 for index in range(size)))
+    native = SubprocessBackend([str(binary)])
+    try:
+        assert native.capabilities()["backend"] == "rust"
+        assert "chunk_file" in native.capabilities()["operations"]
+        native_chunks = native.chunk_file(str(path), 1024, 4096, 16384)["chunks"]
+    finally:
+        native.close()
+    python_chunks = PythonBackend().chunk_file(str(path), 1024, 4096, 16384)["chunks"]
+    assert native_chunks == python_chunks
+
+
+def test_native_mmap_blake3_is_byte_identical_to_python(tmp_path, monkeypatch):
+    """The multithreaded memory-mapped BLAKE3 path must match the sequential Python digest.
+
+    Above the 2 MiB threshold and with more than one rayon thread, the core hashes off an mmap in
+    parallel. BLAKE3 is a tree hash, so the result must equal the byte-by-byte digest exactly — for
+    the full hash and for the identity operation's separately-sampled quick hash.
+    """
+    binary = Path(__file__).resolve().parents[1] / "rust" / "target" / "release" / "housekeeper-core"
+    if not binary.is_file():
+        pytest.skip("native backend not built (make rust)")
+    monkeypatch.setenv("RAYON_NUM_THREADS", "4")  # force the parallel path (subprocess inherits env)
+    size = 2 * 1024 * 1024 + 4096  # just over the mmap threshold
+    path = tmp_path / "big.bin"
+    path.write_bytes(bytes((index * 131 + 7) % 251 for index in range(size)))
+    native = SubprocessBackend([str(binary)])
+    try:
+        assert native.capabilities()["backend"] == "rust"
+        native_full = native.full_hash(str(path), "blake3", 8_388_608)
+        native_identity = native.identity_hash(str(path), "blake3", 8_388_608, 1_048_576, 2)
+    finally:
+        native.close()
+    python_full = PythonBackend().full_hash(str(path), "blake3", 8_388_608)
+    python_identity = PythonBackend().identity_hash(str(path), "blake3", 8_388_608, 1_048_576, 2)
+    assert native_full["full_hash"] == python_full["full_hash"]
+    assert native_identity["full_hash"] == python_identity["full_hash"]
+    assert native_identity["quick_hash"] == python_identity["quick_hash"]
+    # The full digest must also equal the identity op's full digest (same bytes, two code paths).
+    assert native_full["full_hash"] == native_identity["full_hash"]
+
+
 def test_manifest_verification_equivalence(tmp_path):
     import hashlib
 

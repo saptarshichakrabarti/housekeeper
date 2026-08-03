@@ -7,6 +7,7 @@ shingle-Jaccard verification, so MinHash alone never authorizes a claim. Results
 
 from __future__ import annotations
 
+import gzip
 import json
 from pathlib import Path
 
@@ -38,8 +39,37 @@ def _config_fingerprint(config) -> str:
     )
 
 
-def _document_text(database, config, content_object_id: int) -> tuple[str, int] | None:
-    """Extract normalized text for a content object via a readable representative document."""
+def _stored_normalized_text(database, content_object_id: int) -> str | None:
+    """The normalized text the ``documents`` analyser already extracted for this object, or None.
+
+    The content-analysis stage stores each document's normalized text in ``content_text_blobs``
+    (``registry._store_text``) under exactly the whitespace/NFKC normalization and length bound this
+    stage would re-derive. Reading it back skips a full PDF/DOCX/XLSX/PPTX re-parse per document —
+    the dominant cost of this stage on a document-heavy corpus. Absent (e.g. ``analyse
+    document-minhash`` run without a prior content-analysis pass), the caller re-extracts.
+    """
+    row = database.fetch_one(
+        "SELECT compression,data FROM content_text_blobs "
+        "WHERE content_object_id=? AND text_kind='normalized' LIMIT 1",
+        (content_object_id,),
+    )
+    if not row:
+        return None
+    data = bytes(row["data"])
+    if row["compression"] == "gzip":
+        data = gzip.decompress(data)
+    return data.decode("utf-8", errors="replace")
+
+
+def _document_text(database, config, content_object_id: int) -> str | None:
+    """Normalized text for a content object, from the stored blob or a fresh parse.
+
+    Prefers the text the documents analyser already persisted; falls back to parsing a readable
+    representative only when no blob exists, so the stage is still self-sufficient after a bare scan.
+    """
+    stored = _stored_normalized_text(database, content_object_id)
+    if stored is not None:
+        return stored
     from .documents import extract_document
 
     for row in database.iter_rows(
@@ -55,7 +85,7 @@ def _document_text(database, config, content_object_id: int) -> tuple[str, int] 
             continue
         result = extract_document(path, suffix, config)
         if result.get("extraction_status") == "OK":
-            return result.get("normalized_text", ""), int(row["id"])
+            return result.get("normalized_text", "")
     return None
 
 
@@ -147,7 +177,7 @@ def run_document_minhash_analysis(
         text = _document_text(database, config, cid)
         if text is None:
             continue
-        tokens = tokenize(text[0])
+        tokens = tokenize(text)
         if len(tokens) < minimum_tokens:
             continue
         total_tokens += len(tokens)

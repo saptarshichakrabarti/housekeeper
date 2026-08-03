@@ -162,5 +162,24 @@ class SubprocessBackend:
             },
         )
 
+    def chunk_file(
+        self,
+        path: str,
+        minimum_chunk_size: int = 16_384,
+        average_chunk_size: int = 65_536,
+        maximum_chunk_size: int = 262_144,
+        hash_algorithm: str = "sha256",
+    ):
+        return self._request(
+            "chunk_file",
+            {
+                "path": path,
+                "minimum_chunk_size": minimum_chunk_size,
+                "average_chunk_size": average_chunk_size,
+                "maximum_chunk_size": maximum_chunk_size,
+                "hash_algorithm": hash_algorithm,
+            },
+        )
+
     def request(self, operation: str, arguments: dict):
         return self._request(operation, arguments)
